@@ -90,6 +90,7 @@ export const Config: z<InternalConfig> = z.object({
 const AUTH_PREFIX = '/dsh-auth-tunnel'
 const LOGIN_PATH = `${AUTH_PREFIX}/login`
 const LOGOUT_PATH = `${AUTH_PREFIX}/logout`
+const PUBLIC_MANIFEST_PATH = '/manifest.webmanifest'
 const AUTH_COOKIE = 'dsh_auth_tunnel'
 const MAX_LOGIN_BODY_BYTES = 16 * 1024
 const OUTPUT_TAIL_CHARS = 8192
@@ -152,6 +153,11 @@ function isNavigation(req: IncomingMessage): boolean {
   if (req.method !== 'GET' && req.method !== 'HEAD') return false
   if (req.headers['sec-fetch-dest'] === 'document') return true
   return req.headers.accept?.includes('text/html') === true
+}
+
+/** Whether this read is browser metadata whose fetch mode omits credentials. */
+function isPublicManifestRequest(url: URL, req: IncomingMessage): boolean {
+  return url.pathname === PUBLIC_MANIFEST_PATH && (req.method === 'GET' || req.method === 'HEAD')
 }
 
 /** Whether an HTTP(S) Origin names the incoming request authority. */
@@ -257,9 +263,10 @@ async function readForm(req: IncomingMessage, res: ServerResponse): Promise<URLS
 
 /**
  * The loopback gate: everything under {@link AUTH_PREFIX} is the login
- * handshake, everything else passes the cookie check before it is proxied to
- * the upstream webserver. This server speaks plain HTTP on loopback only —
- * the public client is always cloudflared, never a browser.
+ * handshake, the Web App Manifest is public metadata, and everything else
+ * passes the cookie check before it is proxied to the upstream webserver. This
+ * server speaks plain HTTP on loopback only — the public client is always
+ * cloudflared, never a browser.
  */
 class PasswordGate {
   private readonly ref: string
@@ -327,6 +334,10 @@ class PasswordGate {
     const url = new URL(req.url ?? '/', 'http://x')
     if (url.pathname === LOGIN_PATH || url.pathname === LOGOUT_PATH) {
       await this.handleHandshake(url, req, res)
+      return
+    }
+    if (isPublicManifestRequest(url, req)) {
+      this.proxy(req, res)
       return
     }
     if (!await this.authenticated(req)) {
@@ -399,7 +410,13 @@ class PasswordGate {
       res.writeHead(upstream.statusCode ?? 502, upstream.headers)
       upstream.pipe(res)
     })
+    const cancelUpstream = (): void => {
+      if (!res.writableFinished) outgoing.destroy()
+    }
+    res.once('close', cancelUpstream)
+    outgoing.once('close', () => { res.off('close', cancelUpstream) })
     outgoing.on('error', (error: Error) => {
+      if (res.destroyed) return
       this.ctx.logger.warn(`auth-tunnel: upstream HTTP error: ${error.message}`)
       /* v8 ignore start -- the accepted flow only forwards request bodies, so
       an upstream error always lands before upstream response headers; the

@@ -1,7 +1,16 @@
 # Bundle patch for the auth-tunnel plugin: inserting this row mounts a loopback
 # password gate in front of the Web GUI and publishes it through a Cloudflare
-# Tunnel. Defaults are the quick mode: no extra keys needed; override by id in
-# a later layer (profile cordis.patch.yml) for token mode or tuning.
+# Tunnel. A public browser cannot operate a native dialog on the Host display,
+# so the bundle pins the in-app browser interaction while the tunnel is mounted.
+# Defaults are the quick mode: no extra keys needed; override by id in a later
+# layer (profile cordis.patch.yml) for token mode or tuning.
+- id: directory-picker
+  disabled: true
+- insert:
+    - id: directory-picker-browse
+      name: '@deepseek-ai/dsh-host-directory-picker-browse'
+    - id: ui-directory-picker-browse
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'
 - id: auth-tunnel
   name: '@deepseek-ai/dsh-auth-tunnel'
   config:

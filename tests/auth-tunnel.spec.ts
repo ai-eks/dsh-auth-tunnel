@@ -284,6 +284,23 @@ async function sleep(ms: number): Promise<void> {
 }
 
 describe('password gate over the loopback webserver', () => {
+  it('serves the public Web App Manifest without opening other unauthenticated paths', { timeout: 60_000 }, async () => {
+    const { loaded, gateBase } = await bootQuick()
+    loaded.webServer.register({
+      kind: 'exact', path: '/manifest.webmanifest', handler: (_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/manifest+json' })
+        res.end('{"name":"DeepSeek Harness"}')
+      },
+    })
+    const base = await gateBase()
+
+    const manifest = await fetch(`${base}/manifest.webmanifest`)
+    expect(manifest.status).toBe(200)
+    expect(await manifest.json()).toEqual({ name: 'DeepSeek Harness' })
+    expect((await fetch(`${base}/manifest.webmanifest`, { method: 'POST' })).status).toBe(401)
+    expect((await fetch(`${base}/favicon.svg`)).status).toBe(401)
+  })
+
   it('challenges navigations and APIs, serves the login dance, and proxies accepted requests', { timeout: 60_000 }, async () => {
     const { loaded, gateBase } = await bootQuick()
     let observedHost = ''
@@ -561,6 +578,42 @@ describe('fetch-metadata navigation', () => {
 })
 
 describe('containment against broken peers', () => {
+  it('cancels the upstream HTTP request when the public client disconnects', { timeout: 60_000 }, async () => {
+    const { loaded, gateBase } = await bootQuick()
+    let markStarted!: () => void
+    let markCancelled!: () => void
+    const started = new Promise<void>((resolve) => { markStarted = resolve })
+    const cancelled = new Promise<void>((resolve) => { markCancelled = resolve })
+    loaded.webServer.register({
+      kind: 'exact', path: '/api/slow', handler: (_req, res) => {
+        markStarted()
+        res.once('close', () => {
+          if (!res.writableFinished) markCancelled()
+        })
+      },
+    })
+    const base = await gateBase()
+    const port = Number(new URL(base).port)
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const socket = connect(port, '127.0.0.1')
+    socket.on('error', () => { /* Destroying this fixture is the tested client disconnect. */ })
+    await once(socket, 'connect')
+    socket.write([
+      'GET /api/slow HTTP/1.1',
+      `Host: 127.0.0.1:${String(port)}`,
+      `Cookie: ${cookie}`,
+      'Connection: keep-alive',
+      '',
+      '',
+    ].join('\r\n'))
+    await started
+    socket.destroy()
+    await Promise.race([
+      cancelled,
+      sleep(1000).then(() => { throw new Error('upstream request survived the client disconnect') }),
+    ])
+  })
+
   it('answers 502 when the upstream refuses, keeps serving, and passes buffered head bytes through upgrades', { timeout: 60_000 }, async () => {
     const { loaded, gateBase } = await bootQuick()
     loaded.webServer.register({

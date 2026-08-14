@@ -14,7 +14,9 @@ public client
 
 保护在门上,因此该行只针对服务工作:它要求 `webServer` 与 `credentials`(`inject = ['webServer', 'credentials']`,组合缺少任一服务时该行保持 pending),通过二者解析代理目标与密码,并在可选的 shell-env 和 system-prompt 服务挂载时注入事实。任何面向 Web 的包都不需要改动。门后,被放行的请求会被代理到上游,`Host` 和匹配该主机的浏览器 `Origin` 都改写为 loopback 地址,使 connection 的 DNS-rebinding 与同源信任栅栏(`/api` 防护)看到它为之构建的 loopback 面;外来或不透明 Origin 保持原样,仍会被上游拒绝。直接访问 `127.0.0.1:<webserver 端口>` 是有意的未认证:密码只锁公网路径。
 
-握手是一段共享访问密码加 `/dsh-auth-tunnel/login` 的自包含登录页:组合配置只放密码引用(绝不放密码值);POST 成功即签发 `dsh_auth_tunnel`——一个 `HttpOnly; SameSite=Strict` Cookie,HMAC 密钥是 `SHA-256(password)`;密码错误时携带 `?error=1` 反弹。会话密钥**每次请求**重新解析,所以更换所引用的凭据会使所有已开会话立即失效,无需重启(内联测试组合证明了这一点)。`GET/POST /dsh-auth-tunnel/logout` 清除客户端 Cookie。登录请求体上限 16 KiB(声明长度与流式都算),类型错误返回 415;未认证请求由门回答 302 到登录页(导航请求、`Sec-Fetch-Dest: document` 或 `Accept: text/html`)或极简的 401 JSON(其他一切,包括升级请求)。WebSocket/升级连接同样先过 Cookie 检查,然后双向转发原始字节,任一侧关闭时一并拆掉对端。
+握手是一段共享访问密码加 `/dsh-auth-tunnel/login` 的自包含登录页:组合配置只放密码引用(绝不放密码值);POST 成功即签发 `dsh_auth_tunnel`——一个 `HttpOnly; SameSite=Strict` Cookie,HMAC 密钥是 `SHA-256(password)`;密码错误时携带 `?error=1` 反弹。会话密钥**每次请求**重新解析,所以更换所引用的凭据会使所有已开会话立即失效,无需重启(内联测试组合证明了这一点)。`GET/POST /dsh-auth-tunnel/logout` 清除客户端 Cookie。登录请求体上限 16 KiB(声明长度与流式都算),类型错误返回 415;未认证请求由门回答 302 到登录页(导航请求、`Sec-Fetch-Dest: document` 或 `Accept: text/html`)或极简的 401 JSON(其他一切,包括升级请求)。唯一例外是只读的 `/manifest.webmanifest`:未配置 `crossorigin="use-credentials"` 时浏览器获取它不会携带凭据;该文件只含公开应用元数据,因此未认证的 `GET`/`HEAD` 请求会被代理。WebSocket/升级连接同样先过 Cookie 检查,然后双向转发原始字节,任一侧关闭时一并拆掉对端。HTTP 代理也会在公网客户端断开时取消上游请求。
+
+挂载该 bundle 还会把启动时选择的原生目录选择器换成应用内目录浏览器。一次启动可以同时服务回环与公网客户端,却只能挂载一种选择器交互;浏览器交互两边都可用,而公网调用 `host.pickDirectory` 会等待主机上的系统弹窗,直至 Cloudflare 超时。后续 profile patch 可以在禁用这两个插入行后固定其他选择器,但这样会再次让远程选目录依赖主机显示器。
 
 ## Cloudflare 模式
 
@@ -100,3 +102,4 @@ This instance is also reachable from the public internet at <publicUrl> through 
 - **本地绕行**:loopback 浏览器按设计保持对 Web GUI 的未认证访问(门只挡隧道入口);如果威胁模型覆盖本机进程,请把整个 GUI 放在私有网络中运行。
 - **子进程环境最小化**:只继承 PATH、HOME、TMPDIR;公司代理后的 cloudflared 需要它自己的系统级配置,而不是在这里加环境变量。
 - **密码门与上游之间是明文 HTTP**:两者都是同主机上的 loopback 监听者,在当前拓扑下 TLS 没有增加任何东西。
+- **每次启动只有一种目录选择器交互**:启用该 bundle 后,本机客户端也使用应用内目录浏览器,因为 Web 应用不能按连接分别挂载原生与浏览器选择器。
