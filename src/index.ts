@@ -4,15 +4,16 @@
  * a plain `node:http` proxy the plugin owns outright, so no web-facing
  * package changes shape: cloudflared dials the gate on loopback, the gate
  * enforces the shared-access-password handshake, and accepted requests reach
- * the loopback webserver with their Host rewritten to the loopback authority
- * (which keeps the upstream trust fence satisfied). Only the public path is
- * password-protected; direct loopback use of the Web GUI stays open.
+ * the loopback webserver with their Host and matching browser Origin rewritten
+ * to the loopback authority (which keeps the upstream trust fence satisfied).
+ * Only the public path is password-protected; direct loopback use of the Web
+ * GUI stays open.
  * @module @deepseek-ai/dsh-auth-tunnel
  */
 
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { once } from 'node:events'
-import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { createServer, request as httpRequest, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { connect as netConnect } from 'node:net'
 import { type Duplex } from 'node:stream'
 import { spawn, type ChildProcess } from 'node:child_process'
@@ -71,8 +72,9 @@ interface InternalConfig {
 
 export const name = '@deepseek-ai/dsh-auth-tunnel'
 
-// The gate proxies onto the loopback webserver, so activation waits for it.
-export const inject = ['webServer']
+// The gate proxies onto the loopback webserver and resolves credential
+// references, so activation waits for both services.
+export const inject = ['webServer', 'credentials']
 
 export const Config: z<InternalConfig> = z.object({
   passwordRef: z.string().role('credential-ref').default('DSH_WEB_PASSWORD'),
@@ -104,11 +106,7 @@ export function publicAccessPrompt(publicUrl: string): string {
 
 /** Fetch one credential-backed HMAC key the login handshake and the cookie verifier are compared against. */
 async function sessionKey(ctx: Context, ref: string): Promise<Buffer | undefined> {
-  const credentials = ctx.get('credentials')
-  if (credentials === undefined) {
-    throw new Error('auth-tunnel: the credentials service is required to resolve the access password')
-  }
-  const hit = await credentials.resolve(credentialRef(ref))
+  const hit = await ctx.credentials.resolve(credentialRef(ref))
   /* The load-time check keeps boot honest: unconfigured never opens a public
      gate; the runtime re-check only guards a credential deleted mid-flight */
   if (hit === undefined || hit.value === '') return undefined
@@ -154,6 +152,33 @@ function isNavigation(req: IncomingMessage): boolean {
   if (req.method !== 'GET' && req.method !== 'HEAD') return false
   if (req.headers['sec-fetch-dest'] === 'document') return true
   return req.headers.accept?.includes('text/html') === true
+}
+
+/** Whether an HTTP(S) Origin names the incoming request authority. */
+function originMatchesHost(origin: string, host: string): boolean {
+  try {
+    const parsed = new URL(origin)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
+    return new URL(`${parsed.protocol}//${host}`).host === parsed.host
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Copy request headers onto the loopback trust surface. A browser Origin is
+ * rewritten only when it names the incoming Host; foreign and opaque origins
+ * stay unchanged so the upstream same-origin fence can reject them.
+ */
+function upstreamHeaders(req: IncomingMessage, upstreamPort: number): IncomingHttpHeaders {
+  const authority = `127.0.0.1:${String(upstreamPort)}`
+  const headers: IncomingHttpHeaders = { ...req.headers, host: authority }
+  const origin = req.headers.origin
+  const host = req.headers.host
+  if (origin !== undefined && host !== undefined && originMatchesHost(origin, host)) {
+    headers.origin = `http://${authority}`
+  }
+  return headers
 }
 
 /** Format a Set-Cookie attribute line for one minted (or cleared) session cookie. */
@@ -358,7 +383,7 @@ class PasswordGate {
 
   /** Forward one accepted HTTP request to the loopback webserver with the Host rewritten. */
   private proxy(req: IncomingMessage, res: ServerResponse): void {
-    const headers: Record<string, string | string[] | undefined> = { ...req.headers, host: `127.0.0.1:${String(this.upstreamPort)}` }
+    const headers = upstreamHeaders(req, this.upstreamPort)
     delete headers.connection
     delete headers['keep-alive']
     delete headers.upgrade
@@ -399,7 +424,7 @@ class PasswordGate {
     }
     const upstream = netConnect(this.upstreamPort, '127.0.0.1')
     await once(upstream, 'connect')
-    const headers = { ...req.headers, host: `127.0.0.1:${String(this.upstreamPort)}` }
+    const headers = upstreamHeaders(req, this.upstreamPort)
     /* v8 ignore next 2 -- IncomingMessage surface entries carry no undefined values; node joins repeats */
     const lines = Object.entries(headers).flatMap(([entry, value]) =>
       value === undefined ? [] : [`${entry}: ${Array.isArray(value) ? value.join(', ') : value}`])
@@ -447,14 +472,7 @@ async function spawnTunnel(ctx: Context, config: InternalConfig, target: string)
     if (config.gatePort === 0) {
       throw new Error('auth-tunnel: token mode requires gatePort: the named tunnel\'s dashboard ingress points at this loopback port, so it must be fixed')
     }
-    const credentials = ctx.get('credentials')
-    /* v8 ignore next 3 -- apply() resolved the password through the service
-    before this branch runs; the throw hardens the contract against a mid-
-    activation disappearance */
-    if (credentials === undefined) {
-      throw new Error('auth-tunnel: the credentials service is required to resolve the Tunnel Token')
-    }
-    const hit = await credentials.resolve(credentialRef(tokenRef))
+    const hit = await ctx.credentials.resolve(credentialRef(tokenRef))
     if (hit === undefined || hit.value === '') {
       throw new Error(`auth-tunnel: credential reference "${tokenRef}" is not configured`)
     }

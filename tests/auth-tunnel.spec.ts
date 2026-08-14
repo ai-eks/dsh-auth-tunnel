@@ -145,6 +145,8 @@ async function liveFixturePids(): Promise<string[]> {
 interface CompositionOptions {
   /** Register no credentials stub row at all. */
   withCredentials?: boolean
+  /** Make the credentials row activate after the webserver-dependent tunnel row. */
+  credentialsAfterWebServer?: boolean
   /** Register no shell-env/system-prompt stub rows. */
   withShell?: boolean
   /** Seed no DSH_WEB_PASSWORD. */
@@ -161,23 +163,28 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
     ...(options?.withPassword === false ? {} : { DSH_WEB_PASSWORD: 's3kret-passw0rd' }),
     ...options?.seeds,
   }
+  const credentialRows = options?.withCredentials === false ? [] : [
+    "- name: '@deepseek-ai/dsh-credentials'",
+    '  config:',
+    `    seeds: ${JSON.stringify(seeds)}`,
+  ]
+  const tunnelRows = [
+    "- name: '@deepseek-ai/dsh-auth-tunnel'",
+    '  config:',
+    ...Object.entries(tunnelConfig).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`),
+  ]
   const rows: string[] = [
     "- name: '@deepseek-ai/dsh-host-webserver'",
     '  config:',
     "    host: '127.0.0.1'",
     '    port: 0',
-    ...(options?.withCredentials === false ? [] : [
-      "- name: '@deepseek-ai/dsh-credentials'",
-      '  config:',
-      `    seeds: ${JSON.stringify(seeds)}`,
-    ]),
+    ...(options?.credentialsAfterWebServer === true ? [] : credentialRows),
     ...(options?.withShell === false ? [] : [
       "- name: '@deepseek-ai/dsh-shell-env'",
       "- name: '@deepseek-ai/dsh-system-prompt'",
     ]),
-    "- name: '@deepseek-ai/dsh-auth-tunnel'",
-    '  config:',
-    ...Object.entries(tunnelConfig).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`),
+    ...tunnelRows,
+    ...(options?.credentialsAfterWebServer === true ? credentialRows : []),
     '',
   ]
   await writeFile(configPath, rows.join('\n'))
@@ -194,6 +201,7 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
     const service = new StubCredentials(ctx2)
     for (const [ref, value] of Object.entries(config?.seeds ?? {})) service.set(ref, value)
   }
+  credentialsPlugin.inject = options?.credentialsAfterWebServer === true ? ['webServer'] : []
   const webserver = (await import('@deepseek-ai/dsh-host-webserver')).default
   const tunnel = await import('../src/index.ts')
   const modules = new Map<string, unknown>([
@@ -232,14 +240,17 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
 }
 
 /** Boot one quick-mode composition with the password seeded. */
-async function bootQuick(overrides?: Record<string, unknown>): Promise<StubbedContext> {
+async function bootQuick(
+  overrides?: Record<string, unknown>,
+  options?: CompositionOptions,
+): Promise<StubbedContext> {
   return loadComposition({
     sessionTtlHours: 720,
     mode: 'quick',
     executable: await fixtureExecutable('fake-cloudflared-quick.sh'),
     startupTimeoutMs: 15_000,
     ...overrides,
-  })
+  }, options)
 }
 
 /** Log in over the gate and return the minted Cookie header value. */
@@ -276,9 +287,11 @@ describe('password gate over the loopback webserver', () => {
   it('challenges navigations and APIs, serves the login dance, and proxies accepted requests', { timeout: 60_000 }, async () => {
     const { loaded, gateBase } = await bootQuick()
     let observedHost = ''
+    let observedOrigin = ''
     loaded.webServer.register({
       kind: 'prefix', path: '/api', handler: (req, res) => {
         observedHost = String(req.headers.host)
+        observedOrigin = String(req.headers.origin)
         res.writeHead(200, { 'content-type': 'application/json', 'x-mark': 'gate' })
         res.end('{"ok":true}')
       },
@@ -321,6 +334,32 @@ describe('password gate over the loopback webserver', () => {
     expect(proxied.headers.get('x-mark')).toBe('gate')
     expect(await proxied.text()).toBe('{"ok":true}')
     expect(observedHost).toMatch(/^127\.0\.0\.1:\d+$/)
+
+    const port = Number(new URL(base).port)
+    const browserApi = await rawRequest(port, [
+      'GET /api/probe HTTP/1.1',
+      'Host: public.example',
+      'Origin: https://public.example',
+      `Cookie: ${cookie}`,
+      'Connection: close',
+      '',
+      '',
+    ])
+    expect(browserApi).toContain('200 OK')
+    expect(observedOrigin).toBe(`http://${observedHost}`)
+
+    // Authentication does not launder a cross-origin request: an Origin that
+    // does not name the incoming Host stays foreign for the upstream fence.
+    await rawRequest(port, [
+      'GET /api/probe HTTP/1.1',
+      'Host: public.example',
+      'Origin: https://foreign.example',
+      `Cookie: ${cookie}`,
+      'Connection: close',
+      '',
+      '',
+    ])
+    expect(observedOrigin).toBe('https://foreign.example')
 
     // Foreign cookies are not trusted: wrong signature, wrong shape, wrong
     // version, and an unrelated cookie that names nothing.
@@ -447,9 +486,13 @@ describe('password gate over the loopback webserver', () => {
 describe('upgrade pass-through', () => {
   it('proxies authenticated upgrades and closes both directions on client disconnect', { timeout: 60_000 }, async () => {
     const { loaded, gateBase } = await bootQuick()
+    let observedHost = ''
+    let observedOrigin = ''
     loaded.webServer.registerUpgrade({
       path: '/events',
-      handler: (_req, socket, head) => {
+      handler: (req, socket, head) => {
+        observedHost = String(req.headers.host)
+        observedOrigin = String(req.headers.origin)
         socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: dsh-echo\r\nConnection: Upgrade\r\n\r\n')
         if (head.length > 0) socket.write(head)
         socket.on('data', (chunk: Buffer) => { socket.write(chunk) })
@@ -466,12 +509,15 @@ describe('upgrade pass-through', () => {
       'Host: public.example:443',
       'Connection: Upgrade',
       'Upgrade: dsh-echo',
+      'Origin: https://public.example',
       `Cookie: ${cookie}`,
       '',
       '',
     ].join('\r\n'))
     const [head] = await once(socket, 'data') as [Buffer]
     expect(String(head)).toContain('101 Switching Protocols')
+    expect(observedHost).toMatch(/^127\.0\.0\.1:\d+$/)
+    expect(observedOrigin).toBe(`http://${observedHost}`)
 
     socket.write('hello-tunnel')
     const [echo] = await once(socket, 'data') as [Buffer]
@@ -594,6 +640,11 @@ describe('containment against broken peers', () => {
 })
 
 describe('tunnel lifecycle', () => {
+  it('waits for credentials that activate after the webserver', { timeout: 60_000 }, async () => {
+    const { gateBase } = await bootQuick(undefined, { credentialsAfterWebServer: true })
+    expect((await fetch(`${await gateBase()}/dsh-auth-tunnel/login`)).status).toBe(200)
+  })
+
   it('prints the public URL, publishes DSH_PUBLIC_URL, and section-strings the model', { timeout: 60_000 }, async () => {
     const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
     const { shellEnv, systemPrompt } = await bootQuick()
@@ -641,8 +692,8 @@ describe('tunnel lifecycle', () => {
   })
 })
 
-describe('boot failures are loud', () => {
-  type BootFailureOptions = { withCredentials?: boolean; withPassword?: boolean; seeds?: Record<string, string> }
+describe('activation dependencies and boot failures', () => {
+  type BootFailureOptions = { withPassword?: boolean; seeds?: Record<string, string> }
   const expectBootFailure = async (config: Record<string, unknown>, pattern: RegExp, options?: BootFailureOptions): Promise<void> => {
     const composition = await loadComposition(config, { wait: false, ...options })
     const pending = composition.loaded.loader.await() as Promise<unknown>
@@ -650,12 +701,17 @@ describe('boot failures are loud', () => {
     await sleep(100)
   }
 
-  it('fails when the composition offers no credentials service at all', { timeout: 60_000 }, async () => {
-    await expectBootFailure({
+  it('stays pending when the composition offers no credentials service', { timeout: 60_000 }, async () => {
+    const composition = await loadComposition({
       mode: 'quick',
       executable: await fixtureExecutable('fake-cloudflared-quick.sh'),
       startupTimeoutMs: 15_000,
-    }, /the credentials service is required to resolve the access password/, { withCredentials: false })
+    }, { withCredentials: false })
+    const tunnel = [...composition.loaded.loader.entries()]
+      .find(entry => entry.options.name === '@deepseek-ai/dsh-auth-tunnel')
+    expect(tunnel).toBeDefined()
+    expect(tunnel?.fiber?.state).toBe(0)
+    expect(await liveFixturePids()).toEqual([])
   })
 
   it('refuses to gate a public URL when the access password is unconfigured', { timeout: 60_000 }, async () => {
