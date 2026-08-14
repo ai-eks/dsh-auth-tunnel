@@ -618,3 +618,14 @@ describe('activation dependencies and failures', () => {
     }, /credential reference "DSH_TUNNEL_TOKEN" is not configured/)
   })
 })
+
+describe('bundle patch', () => {
+  it('inserts the auth-tunnel row into profiles that do not already contain it', async () => {
+    const patch = await readFile(fileURLToPath(new URL('../cordis.patch.yml', import.meta.url)), 'utf8')
+    expect(patch).toContain([
+      '- insert:',
+      '    - id: auth-tunnel',
+      "      name: '@deepseek-ai/dsh-auth-tunnel'",
+    ].join('\n'))
+  })
+})

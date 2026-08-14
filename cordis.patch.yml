@@ -1,7 +1,8 @@
 # Register one password authenticator with the Web bundle's global access
 # service and publish the existing WebServer through Cloudflare Tunnel.
-- id: auth-tunnel
-  name: '@deepseek-ai/dsh-auth-tunnel'
-  config:
-    passwordRef: DSH_WEB_PASSWORD
-    mode: quick
+- insert:
+    - id: auth-tunnel
+      name: '@deepseek-ai/dsh-auth-tunnel'
+      config:
+        passwordRef: DSH_WEB_PASSWORD
+        mode: quick
