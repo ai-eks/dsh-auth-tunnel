@@ -7,6 +7,10 @@ if [ -z "$TUNNEL_TOKEN" ]; then
   echo 'ERR fixture: TUNNEL_TOKEN missing' >&2
   exit 3
 fi
+if [ "$#" -ne 3 ] || [ "$1" != 'tunnel' ] || [ "$2" != '--no-autoupdate' ] || [ "$3" != 'run' ]; then
+  echo 'ERR fixture: unexpected named-tunnel arguments' >&2
+  exit 4
+fi
 echo 'INF booting connectors' >&2
 sleep 0.01
 printf 'INF Registered tunnel ' >&2

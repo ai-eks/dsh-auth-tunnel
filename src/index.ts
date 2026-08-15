@@ -499,6 +499,7 @@ class PasswordGate {
 async function spawnTunnel(ctx: Context, config: InternalConfig, target: string): Promise<{ child: ChildProcess; publicUrl: string }> {
   let args: string[]
   let publicUrlHint: string | undefined
+  let tokenValue: string | undefined
   /* The child gets a minimal environment on purpose: deployment variables that
      could steer the process (proxy settings) stay out; only what cloudflared
      needs is passed. */
@@ -526,8 +527,9 @@ async function spawnTunnel(ctx: Context, config: InternalConfig, target: string)
     }
     // The token travels over the environment, never argv: a process listing
     // must not expose it.
-    env.TUNNEL_TOKEN = hit.value
-    args = ['tunnel', 'run', '--no-autoupdate']
+    tokenValue = hit.value
+    env.TUNNEL_TOKEN = tokenValue
+    args = ['tunnel', '--no-autoupdate', 'run']
   }
 
   const child = spawn(config.executable, args, { env, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -556,8 +558,9 @@ async function spawnTunnel(ctx: Context, config: InternalConfig, target: string)
       })
       child.once('exit', (code, signal) => {
         finish(() => {
+          const diagnosticTail = tokenValue === undefined ? tail : tail.replaceAll(tokenValue, '[REDACTED]')
           reject(new Error(
-            `auth-tunnel: cloudflared exited before the tunnel came up (code ${String(code)}, signal ${String(signal)})\n${tail}`,
+            `auth-tunnel: cloudflared exited before the tunnel came up (code ${String(code)}, signal ${String(signal)})\n${diagnosticTail}`,
           ))
         })
       })
