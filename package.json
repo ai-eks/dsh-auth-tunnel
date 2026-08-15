@@ -1,10 +1,8 @@
 {
-  "name": "@deepseek-ai/dsh-auth-tunnel",
+  "name": "dsh-auth-tunnel",
+  "private": true,
   "description": "Password-gated public access for the Web GUI via Cloudflare Tunnel: a loopback password gate (login page + HMAC cookie) in front of the webserver, published by spawning cloudflared in quick or named-tunnel mode - tells the shell and the model the public URL",
   "version": "0.1.0-rc.6",
-  "publishConfig": {
-    "access": "public"
-  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ai-eks/dsh-auth-tunnel.git"

@@ -169,7 +169,7 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
     `    seeds: ${JSON.stringify(seeds)}`,
   ]
   const tunnelRows = [
-    "- name: '@deepseek-ai/dsh-auth-tunnel'",
+    "- name: 'dsh-auth-tunnel'",
     '  config:',
     ...Object.entries(tunnelConfig).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`),
   ]
@@ -209,7 +209,7 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
     ['@deepseek-ai/dsh-credentials', credentialsPlugin],
     ['@deepseek-ai/dsh-shell-env', shellEnvPlugin],
     ['@deepseek-ai/dsh-system-prompt', systemPromptPlugin],
-    ['@deepseek-ai/dsh-auth-tunnel', tunnel],
+    ['dsh-auth-tunnel', tunnel],
   ])
   context.loader.internal = {
     version: 'v2',
@@ -809,7 +809,7 @@ describe('activation dependencies and boot failures', () => {
       startupTimeoutMs: 15_000,
     }, { withCredentials: false })
     const tunnel = [...composition.loaded.loader.entries()]
-      .find(entry => entry.options.name === '@deepseek-ai/dsh-auth-tunnel')
+      .find(entry => entry.options.name === 'dsh-auth-tunnel')
     expect(tunnel).toBeDefined()
     expect(tunnel?.fiber?.state).toBe(0)
     expect(await liveFixturePids()).toEqual([])
@@ -983,7 +983,7 @@ describe('bundle patch', () => {
       '    - id: ui-directory-picker-browse',
       "      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'",
       '    - id: auth-tunnel',
-      "      name: '@deepseek-ai/dsh-auth-tunnel'",
+      "      name: 'dsh-auth-tunnel'",
     ].join('\n'))
     expect(patch).not.toMatch(/^- id: auth-tunnel$/m)
   })

@@ -1,4 +1,4 @@
-# @deepseek-ai/dsh-auth-tunnel
+# DSH Auth Tunnel
 
 English | [中文](README.zh.md)
 
