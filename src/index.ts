@@ -8,7 +8,7 @@
  * to the loopback authority (which keeps the upstream trust fence satisfied).
  * Only the public path is password-protected; direct loopback use of the Web
  * GUI stays open.
- * @module @deepseek-ai/dsh-auth-tunnel
+ * @module dsh-auth-tunnel
  */
 
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
@@ -70,7 +70,7 @@ interface InternalConfig {
   startupTimeoutMs: number
 }
 
-export const name = '@deepseek-ai/dsh-auth-tunnel'
+export const name = 'dsh-auth-tunnel'
 
 // The gate proxies onto the loopback webserver and resolves credential
 // references, so activation waits for both services.

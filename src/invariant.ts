@@ -1,12 +1,12 @@
 /**
- * Package-owned invariant companion for `@deepseek-ai/dsh-auth-tunnel`.
- * @module @deepseek-ai/dsh-auth-tunnel/invariant
+ * Package-owned invariant companion for `dsh-auth-tunnel`.
+ * @module dsh-auth-tunnel/invariant
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { InvariantInstaller } from '@deepseek-ai/dsh-invariants'
 
-const PACKAGE_NAME = '@deepseek-ai/dsh-auth-tunnel'
+const PACKAGE_NAME = 'dsh-auth-tunnel'
 
 /** Cordis companion plugin name. */
 export const name = 'auth-tunnel-invariant'
