@@ -859,6 +859,23 @@ describe('activation dependencies and boot failures', () => {
     })
   })
 
+  it('redacts the named-tunnel token from early-exit diagnostics', { timeout: 60_000 }, async () => {
+    const token = 'fixture-token-must-not-leak'
+    const composition = await loadComposition({
+      mode: 'token',
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
+      gatePort: 32_308,
+      executable: await fixtureExecutable('fake-cloudflared-token-crash.sh'),
+      startupTimeoutMs: 15_000,
+    }, { wait: false, seeds: { DSH_TUNNEL_TOKEN: token } })
+    const pending = composition.loaded.loader.await() as Promise<unknown>
+    await expect(pending).rejects.toSatisfy((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      return message.includes('[REDACTED]') && !message.includes(token)
+    })
+  })
+
   it('fails on the startup timeout and kills the silent child', { timeout: 60_000 }, async () => {
     await expectBootFailure({
       mode: 'quick',
