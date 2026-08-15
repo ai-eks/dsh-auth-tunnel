@@ -76,12 +76,14 @@ export const name = '@deepseek-ai/dsh-auth-tunnel'
 // references, so activation waits for both services.
 export const inject = ['webServer', 'credentials']
 
+const PUBLIC_HOSTNAME_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i
+
 export const Config: z<InternalConfig> = z.object({
   passwordRef: z.string().role('credential-ref').default('DSH_WEB_PASSWORD'),
   sessionTtlHours: z.number().min(0.01).default(720),
   mode: z.union(['quick', 'token']).default('quick'),
-  tokenRef: z.string().role('credential-ref'),
-  publicHostname: z.string(),
+  tokenRef: z.string().min(1).role('credential-ref'),
+  publicHostname: z.string().min(1).pattern(PUBLIC_HOSTNAME_PATTERN),
   gatePort: z.number().step(1).min(0).max(65535).default(0),
   executable: z.string().default('cloudflared'),
   startupTimeoutMs: z.number().step(1).min(1).default(15_000),
@@ -96,6 +98,17 @@ const MAX_LOGIN_BODY_BYTES = 16 * 1024
 const OUTPUT_TAIL_CHARS = 8192
 const KILL_GRACE_MS = 2000
 const QUICK_URL_PATTERN = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'proxy-connection',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+])
 
 /** The model-facing prompt section text for one live public URL.
  * @param publicUrl - the discovered quick-tunnel URL or the configured hostname URL.
@@ -185,6 +198,21 @@ function upstreamHeaders(req: IncomingMessage, upstreamPort: number): IncomingHt
     headers.origin = `http://${authority}`
   }
   return headers
+}
+
+/** Remove transport-local fields, including extension fields named by Connection. */
+function withoutHopByHopHeaders(headers: IncomingHttpHeaders): IncomingHttpHeaders {
+  const result = { ...headers }
+  const connection = Array.isArray(headers.connection) ? headers.connection.join(',') : headers.connection
+  const blocked = new Set(HOP_BY_HOP_HEADERS)
+  for (const token of connection?.split(',') ?? []) {
+    const name = token.trim().toLowerCase()
+    if (name !== '') blocked.add(name)
+  }
+  for (const name of Object.keys(result)) {
+    if (blocked.has(name.toLowerCase())) delete result[name]
+  }
+  return result
 }
 
 /** Format a Set-Cookie attribute line for one minted (or cleared) session cookie. */
@@ -302,8 +330,14 @@ class PasswordGate {
         socket.destroy()
       })
     })
-    server.listen(gatePort, '127.0.0.1')
-    await once(server, 'listening')
+    const listening = once(server, 'listening')
+    try {
+      server.listen(gatePort, '127.0.0.1')
+      await listening
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      throw new Error(`auth-tunnel: gate failed to bind 127.0.0.1:${String(gatePort)}: ${detail}`, { cause: error })
+    }
     const address = server.address()
     /* v8 ignore next -- a listening TCP server always reports an AddressInfo */
     if (address === null || typeof address === 'string') throw new Error('auth-tunnel: gate bound to an unexpected address')
@@ -394,10 +428,7 @@ class PasswordGate {
 
   /** Forward one accepted HTTP request to the loopback webserver with the Host rewritten. */
   private proxy(req: IncomingMessage, res: ServerResponse): void {
-    const headers = upstreamHeaders(req, this.upstreamPort)
-    delete headers.connection
-    delete headers['keep-alive']
-    delete headers.upgrade
+    const headers = withoutHopByHopHeaders(upstreamHeaders(req, this.upstreamPort))
     /* v8 ignore next -- node:http always sets url on server requests */
     const outgoing = httpRequest({
       host: '127.0.0.1',
@@ -407,7 +438,7 @@ class PasswordGate {
       headers,
     }, (upstream) => {
       /* v8 ignore next -- node:http client always sets a status line */
-      res.writeHead(upstream.statusCode ?? 502, upstream.headers)
+      res.writeHead(upstream.statusCode ?? 502, withoutHopByHopHeaders(upstream.headers))
       upstream.pipe(res)
     })
     const cancelUpstream = (): void => {
@@ -530,17 +561,21 @@ async function spawnTunnel(ctx: Context, config: InternalConfig, target: string)
           ))
         })
       })
-      const scan = (chunk: Buffer): void => {
+      const scan = (previous: string, chunk: Buffer): string => {
+        const output = (previous + chunk.toString('utf8')).slice(-OUTPUT_TAIL_CHARS)
         if (config.mode === 'quick') {
-          const hit = QUICK_URL_PATTERN.exec(chunk.toString('utf8'))
+          const hit = QUICK_URL_PATTERN.exec(output)
           if (hit !== null) finish(() => { resolve(hit[0]) })
-        } else if (publicUrlHint !== undefined && chunk.toString('utf8').includes('Registered tunnel connection')) {
+        } else if (publicUrlHint !== undefined && output.includes('Registered tunnel connection')) {
           const publicUrl = publicUrlHint
           finish(() => { resolve(publicUrl) })
         }
+        return output
       }
-      child.stderr.on('data', scan)
-      child.stdout.on('data', scan)
+      let stderrReadinessTail = ''
+      let stdoutReadinessTail = ''
+      child.stderr.on('data', (chunk: Buffer) => { stderrReadinessTail = scan(stderrReadinessTail, chunk) })
+      child.stdout.on('data', (chunk: Buffer) => { stdoutReadinessTail = scan(stdoutReadinessTail, chunk) })
     })
     const publicUrl = await ready
     return { child, publicUrl }

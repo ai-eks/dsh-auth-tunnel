@@ -437,6 +437,54 @@ describe('password gate over the loopback webserver', () => {
     expect((await fetch(`${base}/`, { redirect: 'manual', headers: { cookie: fresh } })).status).not.toBe(302)
   })
 
+  it('regenerates hop-by-hop headers on both HTTP proxy legs', { timeout: 60_000 }, async () => {
+    const { loaded, gateBase } = await bootQuick()
+    let observedHeaders: Record<string, string | string[] | undefined> = {}
+    loaded.webServer.register({
+      kind: 'exact', path: '/api/hop-by-hop', handler: (req, res) => {
+        observedHeaders = { ...req.headers }
+        res.writeHead(200, {
+          connection: 'x-upstream-hop, keep-alive',
+          'x-upstream-hop': 'private',
+          'keep-alive': 'timeout=99',
+          'proxy-authenticate': 'Basic realm="upstream"',
+          trailer: 'x-upstream-trailer',
+          'x-end-to-end': 'kept',
+        })
+        res.end('OK')
+      },
+    })
+    const base = await gateBase()
+    const port = Number(new URL(base).port)
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const response = await rawRequest(port, [
+      'GET /api/hop-by-hop HTTP/1.1',
+      `Host: 127.0.0.1:${String(port)}`,
+      `Cookie: ${cookie}`,
+      'Connection: x-client-hop, close',
+      'X-Client-Hop: private',
+      'Keep-Alive: timeout=99',
+      'Proxy-Authorization: Basic private',
+      'TE: trailers',
+      'Trailer: x-client-trailer',
+      'X-End-To-End: kept',
+      '',
+      '',
+    ])
+
+    expect(observedHeaders['x-client-hop']).toBeUndefined()
+    expect(observedHeaders['keep-alive']).toBeUndefined()
+    expect(observedHeaders['proxy-authorization']).toBeUndefined()
+    expect(observedHeaders.te).toBeUndefined()
+    expect(observedHeaders.trailer).toBeUndefined()
+    expect(observedHeaders['x-end-to-end']).toBe('kept')
+    expect(response.toLowerCase()).not.toContain('x-upstream-hop')
+    expect(response.toLowerCase()).not.toContain('keep-alive: timeout=99')
+    expect(response.toLowerCase()).not.toContain('proxy-authenticate')
+    expect(response.toLowerCase()).not.toContain('trailer: x-upstream-trailer')
+    expect(response.toLowerCase()).toContain('x-end-to-end: kept')
+  })
+
   it('rejects expired cookies regardless of the signature', { timeout: 60_000 }, async () => {
     const { gateBase } = await bootQuick()
     const base = await gateBase()
@@ -818,6 +866,39 @@ describe('activation dependencies and boot failures', () => {
       startupTimeoutMs: 50,
     }, /produced no public URL/)
     await sleep(300)
+    expect(await liveFixturePids()).toEqual([])
+  })
+
+  it('reports an occupied fixed gate port as a handled boot failure', { timeout: 60_000 }, async () => {
+    const blocker = createNetServer()
+    blocker.listen(0, '127.0.0.1')
+    await once(blocker, 'listening')
+    const address = blocker.address()
+    if (address === null || typeof address === 'string') throw new Error('test blocker bound to an unexpected address')
+    try {
+      await expectBootFailure({
+        mode: 'quick',
+        gatePort: address.port,
+        executable: await fixtureExecutable('fake-cloudflared-quick.sh'),
+        startupTimeoutMs: 15_000,
+      }, new RegExp(`gate failed to bind 127\\.0\\.0\\.1:${String(address.port)}:.*EADDRINUSE`))
+      expect(await liveFixturePids()).toEqual([])
+    } finally {
+      const closed = once(blocker, 'close')
+      blocker.close()
+      await closed
+    }
+  })
+
+  it('rejects a scheme-prefixed public hostname before opening the gate', { timeout: 60_000 }, async () => {
+    await expectBootFailure({
+      mode: 'token',
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'https://gui.example.com',
+      gatePort: 32_313,
+      executable: await fixtureExecutable('fake-cloudflared-token.sh'),
+      startupTimeoutMs: 15_000,
+    }, /expect string to match regexp/, { seeds: { DSH_TUNNEL_TOKEN: 'fixture-token' } })
     expect(await liveFixturePids()).toEqual([])
   })
 

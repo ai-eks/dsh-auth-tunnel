@@ -12,7 +12,7 @@ public client
   → loopback webserver    ← unchanged: routes, fallback, /api fence
 ```
 
-保护在门上,因此该行只针对服务工作:它要求 `webServer` 与 `credentials`(`inject = ['webServer', 'credentials']`,组合缺少任一服务时该行保持 pending),通过二者解析代理目标与密码,并在可选的 shell-env 和 system-prompt 服务挂载时注入事实。任何面向 Web 的包都不需要改动。门后,被放行的请求会被代理到上游,`Host` 和匹配该主机的浏览器 `Origin` 都改写为 loopback 地址,使 connection 的 DNS-rebinding 与同源信任栅栏(`/api` 防护)看到它为之构建的 loopback 面;外来或不透明 Origin 保持原样,仍会被上游拒绝。直接访问 `127.0.0.1:<webserver 端口>` 是有意的未认证:密码只锁公网路径。
+保护在门上,因此该行只针对服务工作:它要求 `webServer` 与 `credentials`(`inject = ['webServer', 'credentials']`,组合缺少任一服务时该行保持 pending),通过二者解析代理目标与密码,并在可选的 shell-env 和 system-prompt 服务挂载时注入事实。任何面向 Web 的包都不需要改动。门后,被放行的请求会被代理到上游,`Host` 和匹配该主机的浏览器 `Origin` 都改写为 loopback 地址,使 connection 的 DNS-rebinding 与同源信任栅栏(`/api` 防护)看到它为之构建的 loopback 面;外来或不透明 Origin 保持原样,仍会被上游拒绝。HTTP 两段代理都会删除逐跳头,再由 Node 为各自连接重新生成;升级握手保留其协议所需字段。直接访问 `127.0.0.1:<webserver 端口>` 是有意的未认证:密码只锁公网路径。
 
 握手是一段共享访问密码加 `/dsh-auth-tunnel/login` 的自包含登录页:组合配置只放密码引用(绝不放密码值);POST 成功即签发 `dsh_auth_tunnel`——一个 `HttpOnly; SameSite=Strict` Cookie,HMAC 密钥是 `SHA-256(password)`;密码错误时携带 `?error=1` 反弹。会话密钥**每次请求**重新解析,所以更换所引用的凭据会使所有已开会话立即失效,无需重启(内联测试组合证明了这一点)。`GET/POST /dsh-auth-tunnel/logout` 清除客户端 Cookie。登录请求体上限 16 KiB(声明长度与流式都算),类型错误返回 415;未认证请求由门回答 302 到登录页(导航请求、`Sec-Fetch-Dest: document` 或 `Accept: text/html`)或极简的 401 JSON(其他一切,包括升级请求)。唯一例外是只读的 `/manifest.webmanifest`:未配置 `crossorigin="use-credentials"` 时浏览器获取它不会携带凭据;该文件只含公开应用元数据,因此未认证的 `GET`/`HEAD` 请求会被代理。WebSocket/升级连接同样先过 Cookie 检查,然后双向转发原始字节,任一侧关闭时一并拆掉对端。HTTP 代理也会在公网客户端断开时取消上游请求。
 
@@ -23,7 +23,7 @@ public client
 - **quick** 拉起 `cloudflared tunnel --url http://127.0.0.1:<gate>` 并从子进程输出中抓取 `*.trycloudflare.com` URL。快速隧道的主机名每次运行都会变,边缘立即可达。
 - **token** 拉起 `cloudflared tunnel run`,Tunnel Token 通过 `TUNNEL_TOKEN` 环境变量传递(绝不经 argv),并等待 `Registered tunnel connection` 就绪标记。命名隧道的 dashboard ingress 必须指向门地址,因此 token 模式下 `gatePort` 是必填的固定值,`publicHostname` 是你在 dashboard 绑定的主机名。`tokenRef` 同样只命名一个凭据引用(存在 `.credentials.yaml` 或 `$DSH_ENV`),绝不放 token 本身。
 
-激活阶段就把能校验的全部校验掉,并在任何公网 URL 出现之前让启动失败:不可解析的 `passwordRef`;模式键矛盾(quick 模式里出现 `tokenRef`);token 模式缺 `publicHostname`/`gatePort`;不可解析的 `tokenRef`;cloudflared 可执行文件缺失;子进程提前退出(附带限长尾部的诊断);以及超时。隧道就绪之前激活不完成;完成后控制台打印 `cloudflare tunnel: <url>`,shell 得到 `DSH_PUBLIC_URL`(shell-env 行挂载时),模型看到 `app:public-access` 提示段(system-prompt 行挂载时)。拆卸时关闭密码门、终止 cloudflared(先 SIGTERM,2000 ms 后 SIGKILL),并移除两项注册贡献;子进程意外退出会以错误级别记录并点名已死的 URL。
+激活阶段就把能校验的全部校验掉,并在任何公网 URL 出现之前让启动失败:不可解析的 `passwordRef`;模式键矛盾(quick 模式里出现 `tokenRef`);token 模式缺只含 DNS 主机名的 `publicHostname` 或固定 `gatePort`;不可解析的 `tokenRef`;密码门端口被占用;cloudflared 可执行文件缺失;子进程提前退出(附带限长尾部的诊断);以及超时。隧道就绪之前激活不完成;完成后控制台打印 `cloudflare tunnel: <url>`,shell 得到 `DSH_PUBLIC_URL`(shell-env 行挂载时),模型看到 `app:public-access` 提示段(system-prompt 行挂载时)。拆卸时关闭密码门、终止 cloudflared(先 SIGTERM,2000 ms 后 SIGKILL),并移除两项注册贡献;子进程意外退出会以错误级别记录并点名已死的 URL。
 
 ## 配置
 
@@ -33,7 +33,7 @@ public client
 | `sessionTtlHours` | number ≥ 0.01 | `720` | Cookie 有效期(小时,30 天)。 |
 | `mode` | `quick` \| `token` | `quick` | 隧道模式;见上。 |
 | `tokenRef` | string(credential-ref) | — | Tunnel Token 引用;仅 token 模式。 |
-| `publicHostname` | string | — | 命名隧道主机名,用于 URL 行和模型事实;仅 token 模式。 |
+| `publicHostname` | DNS hostname | — | 不带 scheme、端口或路径的命名隧道主机名;仅 token 模式。 |
 | `gatePort` | integer 0…65535 | `0` | 密码门监听的 loopback 端口;0 交给操作系统。token 模式必须显式给出,因为 dashboard ingress 指向它。 |
 | `executable` | string | `cloudflared` | cloudflared 可执行文件:PATH 名或绝对路径。 |
 | `startupTimeoutMs` | integer ≥ 1 | `15000` | 激活等待隧道就绪的时长。 |
@@ -45,13 +45,21 @@ public client
   disabled: false
 ```
 
-脱离 monorepo 的安装(独立克隆本仓库)以 bundle 形式一条命令装完——包自带的 patch 层会自动插入该组合行:
+从 registry 或 Git 安装时,一条命令即可把插件作为 bundle 加入——包自带的 patch 层会自动插入该组合行:
 
 ```sh
 dsh plugin --profile web add <package>
 ```
 
-`<package>` 是本仓库的 npm 名、git 地址或 `file:` 路径。上面这个 bundle 层足以按默认值启动;只有要覆盖键(token 模式、TTL、端口)时,才把同样的 `auth-tunnel` 行写进你 profile 的 patch 层。
+`<package>` 是本仓库的 npm 名或 Git 地址。Git 安装通过 `prepare` 构建源码;pnpm 10 及以上版本可能先要求你在 profile 的 `pnpm-workspace.yaml` 中允许该构建。本地 `file:` 路径要先构建 checkout 再添加:
+
+```sh
+cd /path/to/dsh-auth-tunnel
+pnpm install
+dsh plugin --profile web add .
+```
+
+上面这个 bundle 层足以按默认值启动;只有要覆盖键(token 模式、TTL、端口)时,才把同样的 `auth-tunnel` 行写进你 profile 的 patch 层。
 
 `dsh web` 启动时打印 `cloudflare tunnel: https://<random>.trycloudflare.com`;浏览器首先看到密码页,挂上的行(id `auth-tunnel`)与其他条目一样出现在 Web Settings → Plugins 中。命名隧道模式扩展同一条 patch 行:
 
