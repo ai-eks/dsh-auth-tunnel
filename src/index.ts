@@ -1,15 +1,21 @@
 /**
- * Password-authenticated public access for the Web GUI through Cloudflare
- * Tunnel. The plugin contributes one authenticator to the Host's global Web
- * access service, then points cloudflared directly at the existing WebServer.
- * The core guard covers every current and future HTTP/upgrade route while
- * preserving unauthenticated direct-loopback use.
+ * Self-contained public access for the Web GUI: a loopback password gate in
+ * front of the webserver, published through a Cloudflare Tunnel. The gate is
+ * a plain `node:http` proxy the plugin owns outright, so no web-facing
+ * package changes shape: cloudflared dials the gate on loopback, the gate
+ * enforces the shared-access-password handshake, and accepted requests reach
+ * the loopback webserver with their Host and matching browser Origin rewritten
+ * to the loopback authority (which keeps the upstream trust fence satisfied).
+ * Only the public path is password-protected; direct loopback use of the Web
+ * GUI stays open.
  * @module @deepseek-ai/dsh-auth-tunnel
  */
 
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { once } from 'node:events'
-import type { IncomingMessage } from 'node:http'
+import { createServer, request as httpRequest, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { connect as netConnect } from 'node:net'
+import { type Duplex } from 'node:stream'
 import { spawn, type ChildProcess } from 'node:child_process'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -22,43 +28,53 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 /** Which tunnel this composition runs. */
 export type TunnelMode = 'quick' | 'token'
 
-/** Plugin config: the access password, tunnel mode, named-tunnel facts, and process tuning. */
+/** Plugin config: the access password, tunnel mode, the named-tunnel facts, and process tuning. */
 export interface Config {
-  /** Credential reference resolving to the shared access password. */
+  /**
+   * Credential reference resolving to the shared access password, resolved
+   * through the composition's credentials service. Configuration carries the
+   * reference, never the password.
+   */
   passwordRef: string
   /** Session-cookie lifetime in hours; a minted cookie is valid for this long regardless of activity. */
   sessionTtlHours: number
-  /** `quick` creates an ephemeral URL; `token` runs the named tunnel belonging to a Tunnel Token. */
+  /** `quick` dials an ephemeral `*.trycloudflare.com` tunnel; `token` runs the named tunnel a Tunnel Token belongs to. */
   mode: TunnelMode
-  /** Credential reference resolving to the Tunnel Token (`token` mode only). */
+  /** Credential reference resolving to the Tunnel Token (`token` mode only); configuration carries the reference, never the token. */
   tokenRef?: string
-  /** Public hostname bound to the named tunnel (`token` mode only). */
+  /**
+   * Public hostname bound to the named tunnel in the Cloudflare dashboard
+   * (`token` mode only), used for the URL line and the model-facing values.
+   */
   publicHostname?: string
+  /**
+   * Loopback port the password gate listens on; 0 assigns one from the OS.
+   * `token` mode requires an explicit value: the named tunnel's dashboard
+   * ingress must point at this port, and a random one could not be known there.
+   */
+  gatePort: number
   /** cloudflared executable: a PATH name or an absolute path. */
   executable: string
   /** How long activation waits for the tunnel to come up before failing the load. */
   startupTimeoutMs: number
 }
 
-interface InternalConfig extends Config {}
-
-interface WebAccessDecision {
-  kind: 'grant' | 'respond'
-  response?: Response
-}
-
-interface WebAccessAuthenticator {
-  authorize(request: IncomingMessage): WebAccessDecision | Promise<WebAccessDecision>
-}
-
-interface WebAccessService {
-  registerAuthenticator(authenticator: WebAccessAuthenticator): () => void
+interface InternalConfig {
+  passwordRef: string
+  sessionTtlHours: number
+  mode: TunnelMode
+  tokenRef?: string
+  publicHostname?: string
+  gatePort: number
+  executable: string
+  startupTimeoutMs: number
 }
 
 export const name = '@deepseek-ai/dsh-auth-tunnel'
 
-/** The existing WebServer, its global access service, and credentials must all exist before activation. */
-export const inject = ['webServer', 'webAccess', 'credentials']
+// The gate proxies onto the loopback webserver and resolves credential
+// references, so activation waits for both services.
+export const inject = ['webServer', 'credentials']
 
 export const Config: z<InternalConfig> = z.object({
   passwordRef: z.string().role('credential-ref').default('DSH_WEB_PASSWORD'),
@@ -66,6 +82,7 @@ export const Config: z<InternalConfig> = z.object({
   mode: z.union(['quick', 'token']).default('quick'),
   tokenRef: z.string().role('credential-ref'),
   publicHostname: z.string(),
+  gatePort: z.number().step(1).min(0).max(65535).default(0),
   executable: z.string().default('cloudflared'),
   startupTimeoutMs: z.number().step(1).min(1).default(15_000),
 })
@@ -73,81 +90,112 @@ export const Config: z<InternalConfig> = z.object({
 const AUTH_PREFIX = '/dsh-auth-tunnel'
 const LOGIN_PATH = `${AUTH_PREFIX}/login`
 const LOGOUT_PATH = `${AUTH_PREFIX}/logout`
+const PUBLIC_MANIFEST_PATH = '/manifest.webmanifest'
 const AUTH_COOKIE = 'dsh_auth_tunnel'
 const MAX_LOGIN_BODY_BYTES = 16 * 1024
 const OUTPUT_TAIL_CHARS = 8192
 const KILL_GRACE_MS = 2000
 const QUICK_URL_PATTERN = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/
 
-/**
- * The model-facing prompt section text for one live public URL.
- * @param publicUrl - discovered quick-tunnel URL or configured hostname URL.
+/** The model-facing prompt section text for one live public URL.
+ * @param publicUrl - the discovered quick-tunnel URL or the configured hostname URL.
  * @returns the `app:public-access` section body.
  */
 export function publicAccessPrompt(publicUrl: string): string {
   return `This instance is also reachable from the public internet at ${publicUrl} through a Cloudflare Tunnel, protected by the instance's shared access password. Share that URL — never the password — when the user asks to open this GUI from another device or network. All sessions, tools, and files still run on this host.`
 }
 
-/** Resolve the credential-backed HMAC key used by login and cookie verification. */
+/** Fetch one credential-backed HMAC key the login handshake and the cookie verifier are compared against. */
 async function sessionKey(ctx: Context, ref: string): Promise<Buffer | undefined> {
   const hit = await ctx.credentials.resolve(credentialRef(ref))
+  /* The load-time check keeps boot honest: unconfigured never opens a public
+     gate; the runtime re-check only guards a credential deleted mid-flight */
   if (hit === undefined || hit.value === '') return undefined
   return createHash('sha256').update(hit.value).digest()
 }
 
-/** Mint the session cookie value: version, absolute expiry, and HMAC. */
+/** Mint the session cookie value: version, absolute expiry, and the HMAC over both. */
 function mintCookie(key: Buffer, ttlMs: number): string {
   const expiry = Date.now() + ttlMs
   const mac = createHmac('sha256', key).update(`dsh-auth-tunnel/v1/${String(expiry)}`).digest('base64url')
   return `v1.${String(expiry)}.${mac}`
 }
 
-/** Verify a minted cookie value against the current key and clock. */
+/** Verify a minted cookie value against the current session key and the clock. */
 function verifyCookie(key: Buffer, value: string): boolean {
   const parts = value.split('.')
   if (parts.length !== 3 || parts[0] !== 'v1') return false
   const expiry = Number(parts[1])
   if (!Number.isSafeInteger(expiry) || expiry <= Date.now()) return false
   const expected = createHmac('sha256', key).update(`dsh-auth-tunnel/v1/${String(expiry)}`).digest('base64url')
-  /* v8 ignore next -- the three-part check above pins the MAC segment. */
+  /* v8 ignore next -- the 3-part shape above pins the mac segment */
   const presented = Buffer.from(parts.at(2) ?? '')
   const wanted = Buffer.from(expected)
   return presented.length === wanted.length && timingSafeEqual(presented, wanted)
 }
 
-/** Read one cookie value from a node:http Cookie header. */
+/** Read one cookie value out of a node:http cookie header. */
 function readCookie(header: string | string[] | undefined, name: string): string | undefined {
   if (header === undefined) return undefined
-  /* v8 ignore next -- Node joins repeated Cookie headers; the array arm preserves the declared input union. */
+  /* v8 ignore next -- node:http joins repeated cookie headers into one string;
+  the array arm covers callers passing the raw union */
   for (const line of Array.isArray(header) ? header : [header]) {
     for (const segment of line.split(';')) {
       const eq = segment.indexOf('=')
-      if (eq !== -1 && segment.slice(0, eq).trim() === name) return segment.slice(eq + 1).trim()
+      if (segment.slice(0, eq).trim() === name) return segment.slice(eq + 1).trim()
     }
   }
   return undefined
 }
 
-/** Whether an unauthorized request is a browser navigation that wants the login page. */
-function isNavigation(request: IncomingMessage): boolean {
-  if (request.method !== 'GET' && request.method !== 'HEAD') return false
-  if (request.headers['sec-fetch-dest'] === 'document') return true
-  return request.headers.accept?.includes('text/html') === true
+/** Whether the unauthorized request is a browser navigation that wants the login page. */
+function isNavigation(req: IncomingMessage): boolean {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false
+  if (req.headers['sec-fetch-dest'] === 'document') return true
+  return req.headers.accept?.includes('text/html') === true
 }
 
-/** Format a Set-Cookie line for one minted or cleared session. */
+/** Whether this read is browser metadata whose fetch mode omits credentials. */
+function isPublicManifestRequest(url: URL, req: IncomingMessage): boolean {
+  return url.pathname === PUBLIC_MANIFEST_PATH && (req.method === 'GET' || req.method === 'HEAD')
+}
+
+/** Whether an HTTP(S) Origin names the incoming request authority. */
+function originMatchesHost(origin: string, host: string): boolean {
+  try {
+    const parsed = new URL(origin)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false
+    return new URL(`${parsed.protocol}//${host}`).host === parsed.host
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Copy request headers onto the loopback trust surface. A browser Origin is
+ * rewritten only when it names the incoming Host; foreign and opaque origins
+ * stay unchanged so the upstream same-origin fence can reject them.
+ */
+function upstreamHeaders(req: IncomingMessage, upstreamPort: number): IncomingHttpHeaders {
+  const authority = `127.0.0.1:${String(upstreamPort)}`
+  const headers: IncomingHttpHeaders = { ...req.headers, host: authority }
+  const origin = req.headers.origin
+  const host = req.headers.host
+  if (origin !== undefined && host !== undefined && originMatchesHost(origin, host)) {
+    headers.origin = `http://${authority}`
+  }
+  return headers
+}
+
+/** Format a Set-Cookie attribute line for one minted (or cleared) session cookie. */
 function setSessionCookie(secure: boolean, value: string, ttlMs: number): string {
   const base = `${AUTH_COOKIE}=${encodeURIComponent(value)}; HttpOnly; Path=/; SameSite=Strict; Max-Age=${String(Math.floor(ttlMs / 1000))}`
+  // A Cloudflare edge always terminates TLS, so requests arriving through the
+  // tunnel mark themselves; loopback never takes the public path.
   return secure ? `${base}; Secure` : base
 }
 
-/** Whether the tunnel-facing request arrived at Cloudflare over HTTPS. */
-function isSecureRequest(request: IncomingMessage): boolean {
-  const value = request.headers['x-forwarded-proto']
-  return typeof value === 'string' && value.split(',', 1)[0]?.trim().toLowerCase() === 'https'
-}
-
-/** Self-contained login page; it needs no unauthenticated asset routes. */
+/** The login page: fully self-contained (inline styles, no scripts, no external assets) because the whole GUI sits behind the gate. */
 function loginPage(error: boolean): string {
   const banner = error ? '<p class="error">密码错误,请重试</p>' : ''
   return `<!doctype html>
@@ -171,7 +219,7 @@ button:hover{background:#5f88ff}
 <body>
 <main>
 <h1>访问密码</h1>
-<form method="post" action="${LOGIN_PATH}" data-error="${error ? '1' : '0'}">
+<form method="post" action="${LOGIN_PATH}" data-error="${error ? '1' : ''}">
 <label for="password">请输入共享访问密码</label>
 <input id="password" name="password" type="password" autocomplete="off" required autofocus>
 <button type="submit">登录</button>
@@ -183,123 +231,249 @@ ${banner}
 </html>`
 }
 
-type FormRead = { form: URLSearchParams } | { response: Response }
-
-/** Read one bounded URL-encoded login body. */
-async function readForm(request: IncomingMessage): Promise<FormRead> {
-  const mediaType = request.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase()
+/** Read and parse the form body of a login post, answering oversized or wrong-type requests in place. */
+async function readForm(req: IncomingMessage, res: ServerResponse): Promise<URLSearchParams | undefined> {
+  const mediaType = req.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase()
   if (mediaType !== 'application/x-www-form-urlencoded') {
-    return { response: new Response(null, { status: 415 }) }
+    res.writeHead(415)
+    res.end()
+    return undefined
   }
-  const declared = request.headers['content-length']
+  const declared = req.headers['content-length']
   if (declared !== undefined && Number(declared) > MAX_LOGIN_BODY_BYTES) {
-    return { response: new Response(null, { status: 413, headers: { connection: 'close' } }) }
+    res.writeHead(413, { connection: 'close' })
+    res.end()
+    req.destroy()
+    return undefined
   }
   let received = 0
   const chunks: Buffer[] = []
-  for await (const chunk of request) {
-    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
-    received += bytes.byteLength
+  for await (const chunk of req) {
+    received += (chunk as Buffer).byteLength
     if (received > MAX_LOGIN_BODY_BYTES) {
-      request.resume()
-      return { response: new Response(null, { status: 413, headers: { connection: 'close' } }) }
+      res.writeHead(413, { connection: 'close' })
+      res.end()
+      req.destroy()
+      return undefined
     }
-    chunks.push(bytes)
+    chunks.push(chunk as Buffer)
   }
-  return { form: new URLSearchParams(Buffer.concat(chunks).toString('utf8')) }
+  return new URLSearchParams(Buffer.concat(chunks).toString('utf8'))
 }
 
-/** Password provider for the core global Web access service. */
-class PasswordAuthenticator implements WebAccessAuthenticator {
+/**
+ * The loopback gate: everything under {@link AUTH_PREFIX} is the login
+ * handshake, the Web App Manifest is public metadata, and everything else
+ * passes the cookie check before it is proxied to the upstream webserver. This
+ * server speaks plain HTTP on loopback only — the public client is always
+ * cloudflared, never a browser.
+ */
+class PasswordGate {
+  private readonly ref: string
   private readonly ttlMs: number
+  private readonly upstreamPort: number
 
   constructor(
     private readonly ctx: Context,
-    private readonly passwordRef: string,
-    sessionTtlHours: number,
+    config: { passwordRef: string; sessionTtlHours: number },
+    upstreamPort: number,
   ) {
-    this.ttlMs = sessionTtlHours * 3600 * 1000
+    this.ref = config.passwordRef
+    this.ttlMs = config.sessionTtlHours * 3600 * 1000
+    this.upstreamPort = upstreamPort
   }
 
-  /** Authenticate the request or answer the login/logout handshake. */
-  async authorize(request: IncomingMessage): Promise<WebAccessDecision> {
-    /* v8 ignore next -- node:http server requests always carry a URL. */
-    const url = new URL(request.url ?? '/', 'http://dsh.invalid')
-    if (url.pathname === LOGIN_PATH || url.pathname === LOGOUT_PATH) {
-      return { kind: 'respond', response: await this.handshake(url, request) }
-    }
-    const key = await sessionKey(this.ctx, this.passwordRef)
-    const cookie = readCookie(request.headers.cookie, AUTH_COOKIE)
-    if (key !== undefined && cookie !== undefined && verifyCookie(key, cookie)) return { kind: 'grant' }
-    if (isNavigation(request)) {
-      return {
-        kind: 'respond',
-        response: new Response(null, {
-          status: 302,
-          headers: { location: LOGIN_PATH, 'cache-control': 'no-store' },
-        }),
-      }
-    }
-    return {
-      kind: 'respond',
-      response: new Response('{"error":"authentication required"}', {
-        status: 401,
-        headers: { 'content-type': 'application/json', 'cache-control': 'no-store' },
-      }),
-    }
-  }
-
-  private async handshake(url: URL, request: IncomingMessage): Promise<Response> {
-    if (url.pathname === LOGIN_PATH && request.method === 'GET') {
-      return new Response(loginPage(url.searchParams.get('error') === '1'), {
-        status: 200,
-        headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+  /** Bind the gate on the configured loopback port (0 asks the OS for one).
+   * @param gatePort - the configured port.
+   * @returns the listening server and its port.
+   */
+  async start(gatePort: number): Promise<{ server: Server; port: number }> {
+    const server = createServer((req, res) => {
+      void this.handle(req, res).catch((error: unknown) => {
+        /* v8 ignore next -- services throw Errors; String() guards an exotic fault */
+        this.ctx.logger.warn(`auth-tunnel: gate request failed: ${error instanceof Error ? error.message : String(error)}`)
+        /* v8 ignore next -- handle() rejects only before it answered, so headers are never sent */
+        if (!res.headersSent) res.writeHead(500)
+        res.end()
       })
+    })
+    server.on('upgrade', (req, socket, head) => {
+      void this.handleUpgrade(req, socket, head).catch(() => {
+        socket.destroy()
+      })
+    })
+    server.listen(gatePort, '127.0.0.1')
+    await once(server, 'listening')
+    const address = server.address()
+    /* v8 ignore next -- a listening TCP server always reports an AddressInfo */
+    if (address === null || typeof address === 'string') throw new Error('auth-tunnel: gate bound to an unexpected address')
+    return { server, port: address.port }
+  }
+
+  /** One accepted identity check: minted cookie against the current key. */
+  private async authenticated(req: IncomingMessage): Promise<boolean> {
+    const key = await sessionKey(this.ctx, this.ref)
+    if (key === undefined) return false
+    const presented = readCookie(req.headers.cookie, AUTH_COOKIE)
+    return presented !== undefined && verifyCookie(key, presented)
+  }
+
+  /** Answer one unauthorized request: login page for navigations, terse 401 otherwise. */
+  private async challenge(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (isNavigation(req)) {
+      res.writeHead(302, { location: LOGIN_PATH, 'cache-control': 'no-store' })
+      await new Promise<void>((resolve) => { res.end(resolve) })
+      return
     }
-    if (url.pathname === LOGIN_PATH && request.method === 'POST') {
-      const read = await readForm(request)
-      if ('response' in read) return read.response
-      const key = await sessionKey(this.ctx, this.passwordRef)
+    res.writeHead(401, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    await new Promise<void>((resolve) => { res.end('{"error":"authentication required"}', resolve) })
+  }
+
+  private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    /* v8 ignore next -- node:http always sets url on server requests */
+    const url = new URL(req.url ?? '/', 'http://x')
+    if (url.pathname === LOGIN_PATH || url.pathname === LOGOUT_PATH) {
+      await this.handleHandshake(url, req, res)
+      return
+    }
+    if (isPublicManifestRequest(url, req)) {
+      this.proxy(req, res)
+      return
+    }
+    if (!await this.authenticated(req)) {
+      await this.challenge(req, res)
+      return
+    }
+    this.proxy(req, res)
+  }
+
+  private async handleHandshake(url: URL, req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (url.pathname === LOGIN_PATH && req.method === 'GET') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+      res.end(loginPage(url.searchParams.get('error') === '1'))
+      return
+    }
+    if (url.pathname === LOGIN_PATH && req.method === 'POST') {
+      const form = await readForm(req, res)
+      if (form === undefined) return // response already answered (413/415)
+      const key = await sessionKey(this.ctx, this.ref)
       if (key === undefined) {
         this.ctx.logger.error('auth-tunnel: the access-password credential is no longer configured')
-        return new Response(null, { status: 503 })
+        res.writeHead(503)
+        res.end()
+        return
       }
-      const presented = createHash('sha256').update(read.form.get('password') ?? '').digest()
+      const presented = createHash('sha256').update(form.get('password') ?? '').digest()
       if (!timingSafeEqual(presented, key)) {
-        return new Response(null, {
-          status: 303,
-          headers: { location: `${LOGIN_PATH}?error=1`, 'cache-control': 'no-store' },
-        })
+        res.writeHead(303, { location: `${LOGIN_PATH}?error=1`, 'cache-control': 'no-store' })
+        res.end()
+        return
       }
-      return new Response(null, {
-        status: 303,
-        headers: {
-          location: '/',
-          'cache-control': 'no-store',
-          'set-cookie': setSessionCookie(isSecureRequest(request), mintCookie(key, this.ttlMs), this.ttlMs),
-        },
+      const secure = req.headers['x-forwarded-proto'] === 'https'
+      res.writeHead(303, {
+        location: '/',
+        'cache-control': 'no-store',
+        'set-cookie': setSessionCookie(secure, mintCookie(key, this.ttlMs), this.ttlMs),
       })
+      res.end()
+      return
     }
-    if (url.pathname === LOGOUT_PATH && (request.method === 'GET' || request.method === 'POST')) {
-      return new Response(null, {
-        status: 303,
-        headers: {
-          location: LOGIN_PATH,
-          'cache-control': 'no-store',
-          'set-cookie': setSessionCookie(isSecureRequest(request), '', 0),
-        },
+    if (url.pathname === LOGOUT_PATH && (req.method === 'GET' || req.method === 'POST')) {
+      const secure = req.headers['x-forwarded-proto'] === 'https'
+      res.writeHead(303, {
+        location: LOGIN_PATH,
+        'cache-control': 'no-store',
+        'set-cookie': setSessionCookie(secure, '', 0),
       })
+      res.end()
+      return
     }
-    return new Response(null, { status: 404 })
+    res.writeHead(404)
+    res.end()
+  }
+
+  /** Forward one accepted HTTP request to the loopback webserver with the Host rewritten. */
+  private proxy(req: IncomingMessage, res: ServerResponse): void {
+    const headers = upstreamHeaders(req, this.upstreamPort)
+    delete headers.connection
+    delete headers['keep-alive']
+    delete headers.upgrade
+    /* v8 ignore next -- node:http always sets url on server requests */
+    const outgoing = httpRequest({
+      host: '127.0.0.1',
+      port: this.upstreamPort,
+      method: req.method,
+      path: req.url ?? '/',
+      headers,
+    }, (upstream) => {
+      /* v8 ignore next -- node:http client always sets a status line */
+      res.writeHead(upstream.statusCode ?? 502, upstream.headers)
+      upstream.pipe(res)
+    })
+    const cancelUpstream = (): void => {
+      if (!res.writableFinished) outgoing.destroy()
+    }
+    res.once('close', cancelUpstream)
+    outgoing.once('close', () => { res.off('close', cancelUpstream) })
+    outgoing.on('error', (error: Error) => {
+      if (res.destroyed) return
+      this.ctx.logger.warn(`auth-tunnel: upstream HTTP error: ${error.message}`)
+      /* v8 ignore start -- the accepted flow only forwards request bodies, so
+      an upstream error always lands before upstream response headers; the
+      destroy arm exists for defense against a mid-transfer anomaly */
+      if (res.headersSent) {
+        res.destroy()
+        return
+      }
+      /* v8 ignore stop */
+      res.writeHead(502, { 'content-type': 'application/json' })
+      res.end('{"error":"upstream unreachable"}')
+    })
+    req.pipe(outgoing)
+  }
+
+  /** Forward one accepted upgrade handshake by piping the raw connection to the upstream. */
+  private async handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
+    if (!await this.authenticated(req)) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n')
+      socket.destroy()
+      return
+    }
+    const upstream = netConnect(this.upstreamPort, '127.0.0.1')
+    await once(upstream, 'connect')
+    const headers = upstreamHeaders(req, this.upstreamPort)
+    /* v8 ignore next 2 -- IncomingMessage surface entries carry no undefined values; node joins repeats */
+    const lines = Object.entries(headers).flatMap(([entry, value]) =>
+      value === undefined ? [] : [`${entry}: ${Array.isArray(value) ? value.join(', ') : value}`])
+    /* v8 ignore next -- node:http always sets method and url on upgrade requests */
+    upstream.write(`${req.method ?? 'GET'} ${req.url ?? '/'} HTTP/${req.httpVersion}\r\n${lines.join('\r\n')}\r\n\r\n`)
+    if (head.length > 0) upstream.write(head)
+    upstream.pipe(socket)
+    socket.pipe(upstream)
+    // Either half finishing tears the other down right away: waiting for
+    // 'close' on both sides would deadlock (each side's FIN waits on the
+    // other's).
+    const drop = (): void => {
+      upstream.destroy()
+      socket.destroy()
+    }
+    upstream.once('end', drop)
+    socket.once('end', drop)
+    upstream.once('error', drop)
+    socket.once('error', drop)
   }
 }
 
-/** Spawn cloudflared and resolve once the public tunnel is ready. */
+/** Spawn one cloudflared and resolve once the tunnel is up; any failure kills the child. */
 async function spawnTunnel(ctx: Context, config: InternalConfig, target: string): Promise<{ child: ChildProcess; publicUrl: string }> {
   let args: string[]
   let publicUrlHint: string | undefined
+  /* The child gets a minimal environment on purpose: deployment variables that
+     could steer the process (proxy settings) stay out; only what cloudflared
+     needs is passed. */
   const env: NodeJS.ProcessEnv = {}
-  /* v8 ignore start -- present in real processes; conditionals support scrubbed tests. */
+  /* v8 ignore start -- PATH/HOME/TMPDIR are present in every real process;
+  the conditionals keep tests with scrubbed environments honest */
   if (process.env.PATH !== undefined) env.PATH = process.env.PATH
   if (process.env.HOME !== undefined) env.HOME = process.env.HOME
   if (process.env.TMPDIR !== undefined) env.TMPDIR = process.env.TMPDIR
@@ -312,18 +486,26 @@ async function spawnTunnel(ctx: Context, config: InternalConfig, target: string)
   } else {
     const tokenRef = required(config, 'tokenRef', 'token mode requires tokenRef naming the Tunnel Token credential reference')
     publicUrlHint = `https://${required(config, 'publicHostname', 'token mode requires publicHostname, the hostname bound to the named tunnel in the Cloudflare dashboard')}`
+    if (config.gatePort === 0) {
+      throw new Error('auth-tunnel: token mode requires gatePort: the named tunnel\'s dashboard ingress points at this loopback port, so it must be fixed')
+    }
     const hit = await ctx.credentials.resolve(credentialRef(tokenRef))
     if (hit === undefined || hit.value === '') {
       throw new Error(`auth-tunnel: credential reference "${tokenRef}" is not configured`)
     }
+    // The token travels over the environment, never argv: a process listing
+    // must not expose it.
     env.TUNNEL_TOKEN = hit.value
     args = ['tunnel', 'run', '--no-autoupdate']
   }
 
   const child = spawn(config.executable, args, { env, stdio: ['ignore', 'pipe', 'pipe'] })
+  // A bounded rolling tail of cloudflared output for diagnostics; the
+  // console gets only the one URL line, not the child's chatter.
   let tail = ''
   const onData = (chunk: Buffer): void => {
     const text = chunk.toString('utf8')
+    // Never accumulate beyond the line budget the failure message prints.
     tail = (tail + text).slice(Math.max(tail.length + text.length - OUTPUT_TAIL_CHARS, 0))
   }
   child.stderr.on('data', onData)
@@ -353,20 +535,22 @@ async function spawnTunnel(ctx: Context, config: InternalConfig, target: string)
           const hit = QUICK_URL_PATTERN.exec(chunk.toString('utf8'))
           if (hit !== null) finish(() => { resolve(hit[0]) })
         } else if (publicUrlHint !== undefined && chunk.toString('utf8').includes('Registered tunnel connection')) {
-          finish(() => { resolve(publicUrlHint) })
+          const publicUrl = publicUrlHint
+          finish(() => { resolve(publicUrl) })
         }
       }
       child.stderr.on('data', scan)
       child.stdout.on('data', scan)
     })
-    return { child, publicUrl: await ready }
+    const publicUrl = await ready
+    return { child, publicUrl }
   } catch (error) {
     await killTree(child)
     throw error
   }
 }
 
-/** Terminate cloudflared and await its exit: SIGTERM, then SIGKILL after the grace. */
+/** Terminate one cloudflared and await its exit: SIGTERM, with SIGKILL after the grace. */
 async function killTree(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return
   const closed = once(child, 'close')
@@ -377,54 +561,51 @@ async function killTree(child: ChildProcess): Promise<void> {
 }
 
 /** Read one mode-required key or throw a load-time misconfiguration. */
-function required<TKey extends 'tokenRef' | 'publicHostname'>(
-  config: InternalConfig,
-  key: TKey,
-  message: string,
-): NonNullable<InternalConfig[TKey]> {
+function required<TKey extends 'tokenRef' | 'publicHostname'>(config: InternalConfig, key: TKey, message: string): NonNullable<InternalConfig[TKey]> {
   const value = config[key]
   if (value === undefined) throw new Error(`auth-tunnel: ${message}`)
   return value
 }
 
-/** Resolve the injected service without coupling this external package to an unreleased type package. */
-function accessService(ctx: Context): WebAccessService {
-  const service = ctx.get('webAccess') as WebAccessService | undefined
-  if (service === undefined) throw new Error('auth-tunnel: webAccess service is required')
-  return service
-}
-
 /**
- * Register password authentication, start cloudflared against the existing
- * WebServer, and publish the public URL to optional shell and prompt services.
+ * Start the loopback password gate against the webserver, spawn cloudflared
+ * against the gate, and publish the public URL to the shell and the model.
+ * Activation completes only once the tunnel is up.
  * @param ctx - plugin context.
- * @param config - validated plugin config.
+ * @param config - validated {@link Config}.
  */
 export async function apply(ctx: Context, config: Config): Promise<void> {
+  // Activation checks the password reference before the gate opens: an
+  // unconfigured credential never fronts a public URL.
   const key = await sessionKey(ctx, config.passwordRef)
   if (key === undefined) {
     throw new Error(`auth-tunnel: credential reference "${config.passwordRef}" is not configured`)
   }
-
-  const authenticator = new PasswordAuthenticator(ctx, config.passwordRef, config.sessionTtlHours)
-  const disposeAuthenticator = ctx.effect(
-    () => accessService(ctx).registerAuthenticator(authenticator),
-    'auth-tunnel: Web authenticator',
-  )
+  const gate = new PasswordGate(ctx, config, ctx.webServer.port)
+  const { server, port } = await gate.start(config.gatePort)
   let spawned: { child: ChildProcess; publicUrl: string }
   try {
-    spawned = await spawnTunnel(ctx, config, `http://127.0.0.1:${String(ctx.webServer.port)}`)
+    spawned = await spawnTunnel(ctx, config, `http://127.0.0.1:${String(port)}`)
   } catch (error) {
-    await disposeAuthenticator()
+    // A failed boot must not leave the gate listening behind no tunnel. A
+    // close failure only delays teardown; the boot error stays the outcome.
+    server.close()
+    server.closeAllConnections()
     throw error
   }
-
   const { child, publicUrl } = spawned
   let disposed = false
   child.once('exit', (code, signal) => {
+    // Our own teardown kill is no crash; anything else strands the URL.
     if (disposed) return
     ctx.logger.error(`auth-tunnel: cloudflared exited (code ${String(code)}, signal ${String(signal)}); the public URL ${publicUrl} is now dead. Restart dsh to bring the tunnel back.`)
   })
+  ctx.effect(() => async () => {
+    await new Promise<void>((resolve) => {
+      server.close(() => { resolve() })
+      server.closeAllConnections()
+    })
+  }, 'auth-tunnel: gate')
   ctx.effect(() => async () => {
     disposed = true
     await killTree(child)

@@ -2,89 +2,104 @@
 
 [English](README.md) | 中文
 
-该插件通过 Cloudflare Tunnel 发布 DeepSeek Harness 已有的 WebServer，并向 Web bundle 的全局访问服务贡献共享密码认证。插件不再创建代理，也不需要枚举应用路由。
+通过 Cloudflare Tunnel 为 Web GUI 提供带密码的公网访问,打包成单个自包含插件:启动一个只监听 loopback 的**密码门**(完全归插件所有的 `node:http` 代理),把 `cloudflared` 指到这道门上,并把公网 URL 告知操作者、shell 和模型。需要从另一台设备或网络打开 GUI 时挂载这一行;行不存在时一切照旧——loopback webserver 直接响应浏览器。
 
-```text
-公网浏览器
-  -> Cloudflare edge（TLS）
-  -> 本机 cloudflared
-  -> WebServer 全局访问 guard  <- 登录页与 Cookie 认证
-  -> 当前及未来插件注册的全部 HTTP、WebSocket 路由
-
-loopback 浏览器
-  -> WebServer 全局访问 guard  <- 判定为 local，不要求密码
+```
+public client
+  → Cloudflare edge (TLS)
+  → cloudflared (this host)
+  → gate, loopback only   ← login page, cookie check, Host rewrite
+  → loopback webserver    ← unchanged: routes, fallback, /api fence
 ```
 
-插件注入 `webServer`、`webAccess` 和 `credentials`。不提供全局 `webAccess` 服务的旧版 Harness 会让该插件保持 pending，不会启动一条未受保护的 tunnel。核心 guard 在路由匹配前运行，因此其他插件晚于本插件注册的接口也会自动经过相同认证。放行后的请求保留原始公网 `Host` 和 `Origin`；核心 connection 层使用服务端写入的 authenticated 结论，同时继续执行同源与 DNS rebinding 检查。
+保护在门上,因此该行只针对服务工作:它要求 `webServer` 与 `credentials`(`inject = ['webServer', 'credentials']`,组合缺少任一服务时该行保持 pending),通过二者解析代理目标与密码,并在可选的 shell-env 和 system-prompt 服务挂载时注入事实。任何面向 Web 的包都不需要改动。门后,被放行的请求会被代理到上游,`Host` 和匹配该主机的浏览器 `Origin` 都改写为 loopback 地址,使 connection 的 DNS-rebinding 与同源信任栅栏(`/api` 防护)看到它为之构建的 loopback 面;外来或不透明 Origin 保持原样,仍会被上游拒绝。直接访问 `127.0.0.1:<webserver 端口>` 是有意的未认证:密码只锁公网路径。
 
-同一访问结论会投影到浏览器。已认证公网页面可以使用 Host 配置面，本机桌面操作仍只允许 local 页面。Web bundle 可以同时注册原生和应用内目录 provider：同一进程里，loopback 页面使用 OS 目录选择器，公网页面使用应用内目录浏览器。
+握手是一段共享访问密码加 `/dsh-auth-tunnel/login` 的自包含登录页:组合配置只放密码引用(绝不放密码值);POST 成功即签发 `dsh_auth_tunnel`——一个 `HttpOnly; SameSite=Strict` Cookie,HMAC 密钥是 `SHA-256(password)`;密码错误时携带 `?error=1` 反弹。会话密钥**每次请求**重新解析,所以更换所引用的凭据会使所有已开会话立即失效,无需重启(内联测试组合证明了这一点)。`GET/POST /dsh-auth-tunnel/logout` 清除客户端 Cookie。登录请求体上限 16 KiB(声明长度与流式都算),类型错误返回 415;未认证请求由门回答 302 到登录页(导航请求、`Sec-Fetch-Dest: document` 或 `Accept: text/html`)或极简的 401 JSON(其他一切,包括升级请求)。唯一例外是只读的 `/manifest.webmanifest`:未配置 `crossorigin="use-credentials"` 时浏览器获取它不会携带凭据;该文件只含公开应用元数据,因此未认证的 `GET`/`HEAD` 请求会被代理。WebSocket/升级连接同样先过 Cookie 检查,然后双向转发原始字节,任一侧关闭时一并拆掉对端。HTTP 代理也会在公网客户端断开时取消上游请求。
 
-## 认证
-
-登录页位于 `/dsh-auth-tunnel/login`。成功提交 URL-encoded POST 后会签发 `dsh_auth_tunnel` Cookie；该 Cookie 使用 `HttpOnly`、`SameSite=Strict`，Cloudflare 报告 HTTPS 时还会使用 `Secure`。Cookie 只包含绝对过期时间和以 `SHA-256(password)` 为密钥的 HMAC，不保存密码本身。
-
-每次请求都会重新解析密码引用。轮换或删除对应凭据会立即使现有会话失效。`GET` 或 `POST /dsh-auth-tunnel/logout` 会清除 Cookie。登录请求体上限为 16 KiB，且必须使用 `application/x-www-form-urlencoded`。
-
-未认证的文档导航会跳转到登录页，其他 HTTP 请求返回 401 JSON，upgrade 请求在关闭 socket 前返回 401。没有公开资源例外：Web App Manifest 通过 `crossorigin="use-credentials"` 携带认证 Cookie。
+挂载该 bundle 还会把启动时选择的原生目录选择器换成应用内目录浏览器。一次启动可以同时服务回环与公网客户端,却只能挂载一种选择器交互;浏览器交互两边都可用,而公网调用 `host.pickDirectory` 会等待主机上的系统弹窗,直至 Cloudflare 超时。后续 profile patch 可以在禁用这两个插入行后固定其他选择器,但这样会再次让远程选目录依赖主机显示器。
 
 ## Cloudflare 模式
 
-- `quick` 运行 `cloudflared tunnel --url http://127.0.0.1:<webserver-port> --no-autoupdate`，并从进程输出发现生成的 `*.trycloudflare.com` URL。
-- `token` 运行 `cloudflared tunnel run --no-autoupdate`，通过 `TUNNEL_TOKEN` 传递 Tunnel Token，并报告 `https://<publicHostname>`。命名 tunnel 的 dashboard ingress 应指向 WebServer，通常是 `http://localhost:3080`，或 `dsh web --port` 指定的端口。
+- **quick** 拉起 `cloudflared tunnel --url http://127.0.0.1:<gate>` 并从子进程输出中抓取 `*.trycloudflare.com` URL。快速隧道的主机名每次运行都会变,边缘立即可达。
+- **token** 拉起 `cloudflared tunnel run`,Tunnel Token 通过 `TUNNEL_TOKEN` 环境变量传递(绝不经 argv),并等待 `Registered tunnel connection` 就绪标记。命名隧道的 dashboard ingress 必须指向门地址,因此 token 模式下 `gatePort` 是必填的固定值,`publicHostname` 是你在 dashboard 绑定的主机名。`tokenRef` 同样只命名一个凭据引用(存在 `.credentials.yaml` 或 `$DSH_ENV`),绝不放 token 本身。
 
-密码缺失、模式配置冲突、token 缺失、cloudflared 无法启动、就绪前退出或启动超时时，插件会在公开 URL 前失败。卸载时只撤销 authenticator 并终止 cloudflared；插件不拥有也不会关闭 WebServer。
+激活阶段就把能校验的全部校验掉,并在任何公网 URL 出现之前让启动失败:不可解析的 `passwordRef`;模式键矛盾(quick 模式里出现 `tokenRef`);token 模式缺 `publicHostname`/`gatePort`;不可解析的 `tokenRef`;cloudflared 可执行文件缺失;子进程提前退出(附带限长尾部的诊断);以及超时。隧道就绪之前激活不完成;完成后控制台打印 `cloudflare tunnel: <url>`,shell 得到 `DSH_PUBLIC_URL`(shell-env 行挂载时),模型看到 `app:public-access` 提示段(system-prompt 行挂载时)。拆卸时关闭密码门、终止 cloudflared(先 SIGTERM,2000 ms 后 SIGKILL),并移除两项注册贡献;子进程意外退出会以错误级别记录并点名已死的 URL。
 
 ## 配置
 
-| 键 | 类型 | 默认值 | 效果 |
+| 键 | 类型 | 默认 | 效果 |
 |---|---|---|---|
-| `passwordRef` | credential reference | `DSH_WEB_PASSWORD` | 共享访问密码；无法解析或为空时激活失败。 |
-| `sessionTtlHours` | number >= 0.01 | `720` | Cookie 的绝对有效期（小时）。 |
-| `mode` | `quick` \| `token` | `quick` | tunnel 模式。 |
-| `tokenRef` | credential reference | - | Tunnel Token 引用；token 模式必填。 |
-| `publicHostname` | string | - | dashboard 绑定的主机名；token 模式必填。 |
-| `executable` | string | `cloudflared` | PATH 名或 cloudflared 绝对路径。 |
-| `startupTimeoutMs` | integer >= 1 | `15000` | 等待 tunnel 就绪的超时时间。 |
+| `passwordRef` | string(credential-ref) | `DSH_WEB_PASSWORD` | 解析共享访问密码的凭据引用;未配置则启动失败。 |
+| `sessionTtlHours` | number ≥ 0.01 | `720` | Cookie 有效期(小时,30 天)。 |
+| `mode` | `quick` \| `token` | `quick` | 隧道模式;见上。 |
+| `tokenRef` | string(credential-ref) | — | Tunnel Token 引用;仅 token 模式。 |
+| `publicHostname` | string | — | 命名隧道主机名,用于 URL 行和模型事实;仅 token 模式。 |
+| `gatePort` | integer 0…65535 | `0` | 密码门监听的 loopback 端口;0 交给操作系统。token 模式必须显式给出,因为 dashboard ingress 指向它。 |
+| `executable` | string | `cloudflared` | cloudflared 可执行文件:PATH 名或绝对路径。 |
+| `startupTimeoutMs` | integer ≥ 1 | `15000` | 激活等待隧道就绪的时长。 |
 
-## 安装
+随包的 Web bundle 已自带该行(默认禁用)。通过你自己的 profile patch 层 `~/.dsh/profiles/web/cordis.patch.yml`(`$DSH_HOME` 默认为 `~/.dsh`;你的 patch 应用在所有 bundle 层之后,且启动器会监听该文件,运行中的实例无需重启)启用:
 
-把该仓库作为 Web profile bundle 安装：
+```yaml
+- id: auth-tunnel
+  disabled: false
+```
+
+脱离 monorepo 的安装(独立克隆本仓库)以 bundle 形式一条命令装完——包自带的 patch 层会自动插入该组合行:
 
 ```sh
 dsh plugin --profile web add <package>
 ```
 
-`<package>` 可以是 npm 包名、Git URL 或 `file:` 路径。包内 patch 会按 quick 模式默认值插入 `auth-tunnel` 行。把密码存入 Harness 凭据 provider，例如 `$DSH_HOME/.credentials.yaml`：
+`<package>` 是本仓库的 npm 名、git 地址或 `file:` 路径。上面这个 bundle 层足以按默认值启动;只有要覆盖键(token 模式、TTL、端口)时,才把同样的 `auth-tunnel` 行写进你 profile 的 patch 层。
 
-```yaml
-DSH_WEB_PASSWORD: 'pick-a-long-random-password'
-```
-
-命名 tunnel 可在 `~/.dsh/profiles/web/cordis.patch.yml` 覆盖该行：
+`dsh web` 启动时打印 `cloudflare tunnel: https://<random>.trycloudflare.com`;浏览器首先看到密码页,挂上的行(id `auth-tunnel`)与其他条目一样出现在 Web Settings → Plugins 中。命名隧道模式扩展同一条 patch 行:
 
 ```yaml
 - id: auth-tunnel
+  disabled: false
   config:
     mode: token
     tokenRef: DSH_TUNNEL_TOKEN
     publicHostname: gui.example.com
+    gatePort: 7677
 ```
 
-随后在 Cloudflare dashboard 把 `gui.example.com` 指向当前 Harness WebServer 端口，并保存两项凭据：
+同时把 `cloudflared` dashboard 中 `gui.example.com` 的 ingress 指向 `http://localhost:7677`,并把 `DSH_TUNNEL_TOKEN`/`DSH_WEB_PASSWORD` 存为凭据,例如在 `$DSH_HOME/.credentials.yaml`:
 
 ```yaml
 DSH_WEB_PASSWORD: 'pick-a-long-random-password'
 DSH_TUNNEL_TOKEN: 'eyJhIjo...'
 ```
 
-## 运行时事实
+## 模型体验
 
-tunnel 就绪后，进程打印 `cloudflare tunnel: <public-url>`。可选服务存在时，插件还会向 shell 环境贡献 `DSH_PUBLIC_URL`，并注册 `app:public-access` system-prompt 段，要求模型只分享 URL、绝不分享密码。
+### 公网访问提示段
 
-## 限制
+#### 模型看到的内容
 
-- 所有密码持有者共享同一个 authenticated Host 权限；没有多用户身份、速率限制、锁定机制或密码轮换之外的服务端会话吊销。
-- cloudflared 意外退出时只记录错误，不自动重启。
-- quick tunnel 主机名每次运行都会变化。
-- direct-loopback 访问按设计绕过密码；该方案不防御已经运行在 Host 上的恶意进程。
-- token 模式依赖 dashboard ingress 与 WebServer 端口一致；修改 `dsh web --port` 后也要更新 ingress。
+隧道就绪后,一个提示段(`app:public-access`,order −97)给出公网 URL、共享密码保护、"只分享 URL,绝不分享密码"的规则,以及一切仍在本机运行的保证;`<publicUrl>` 是抓到的快速隧道 URL 或 token 配置里的 `https://<publicHostname>`。通过 bash 工具启动的 shell 还会看到 `auth-tunnel` 贡献者提供的 `DSH_PUBLIC_URL` 托管变量(带描述),每次调用从活跃隧道解析。没有这一行时两者都不存在。精确渲染文本:
+
+##### Rendered prompt section
+
+```markdown
+This instance is also reachable from the public internet at <publicUrl> through a Cloudflare Tunnel, protected by the instance's shared access password. Share that URL — never the password — when the user asks to open this GUI from another device or network. All sessions, tools, and files still run on this host.
+```
+
+#### Token 影响
+
+每进程一段提示段落加两行托管环境变量;每次隧道挂载期间恒定。
+
+#### KV Cache 影响
+
+该提示段在进程存活期间是静态的(URL 是启动期事实),不会使跨轮缓存失效。
+
+## 已知限制与延后工作
+
+- **共享密码、单用户**:每个密码持有者都获得完整 Web GUI,包括 Host 配置面;无速率限制、无锁定、无按用户会话、无服务端吊销表(密码轮换会全量失效)。更严肃的部署应当换更强的前置认证。
+- **单隧道、无自重启**:cloudflared 意外退出会以错误记录,但隧道不会复活;需要重启 dsh。
+- **快速隧道 URL 不稳定**:`*.trycloudflare.com` 主机名每次运行都变;token 模式的代价是一条命名隧道加一个域名。
+- **本地绕行**:loopback 浏览器按设计保持对 Web GUI 的未认证访问(门只挡隧道入口);如果威胁模型覆盖本机进程,请把整个 GUI 放在私有网络中运行。
+- **子进程环境最小化**:只继承 PATH、HOME、TMPDIR;公司代理后的 cloudflared 需要它自己的系统级配置,而不是在这里加环境变量。
+- **密码门与上游之间是明文 HTTP**:两者都是同主机上的 loopback 监听者,在当前拓扑下 TLS 没有增加任何东西。
+- **每次启动只有一种目录选择器交互**:启用该 bundle 后,本机客户端也使用应用内目录浏览器,因为 Web 应用不能按连接分别挂载原生与浏览器选择器。

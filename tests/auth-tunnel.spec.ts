@@ -1,9 +1,16 @@
-/** Real Loader composition over a minimal global Web-access host. */
+/**
+ * REAL-composition coverage: a test-only cordis.yml booted through the
+ * vendored Loader mounts the webserver row and the auth-tunnel row over
+ * executable cloudflared fakes, and every assertion observes a user-visible
+ * surface: the gate's login handshake and cookie flow, the proxied Host
+ * rewrite, upgrade pass-through with and without the cookie, the console URL
+ * line, DSH_PUBLIC_URL, the model-facing prompt section, boot-failure
+ * diagnostics, and cloudflared/gate teardown.
+ */
 
 import { chmod, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises'
 import { once } from 'node:events'
-import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import { connect } from 'node:net'
+import { connect, connect as netConnect, createServer as createNetServer, type AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -12,20 +19,8 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
 
-interface AccessDecision {
-  kind: 'grant' | 'respond'
-  response?: Response
-}
-
-interface Authenticator {
-  authorize(request: IncomingMessage): AccessDecision | Promise<AccessDecision>
-}
-
-/** Minimal credentials service with rotation and a per-request failure knob. */
+/** Minimal in-memory credentials service for the composition (rotate via set). */
 class StubCredentials extends Service {
-  private readonly values = new Map<string, string>()
-  fault = false
-
   constructor(ctx: Context) {
     super(ctx, 'credentials')
   }
@@ -36,178 +31,69 @@ class StubCredentials extends Service {
     return Promise.resolve(hit === undefined ? undefined : { value: hit, source: 'test' })
   }
 
+  /** Test knob: make every resolve throw (per-request error containment). */
+  fault = false
+
+  /** Test knob: set or delete one credential. */
   set(ref: string, value: string | undefined): void {
-    if (value === undefined) this.values.delete(ref)
-    else this.values.set(ref, value)
-  }
-}
-
-/** One-seat access service matching the core provider surface. */
-class StubWebAccess extends Service {
-  private authenticator: Authenticator | undefined
-
-  constructor(ctx: Context) {
-    super(ctx, 'webAccess')
-  }
-
-  registerAuthenticator(authenticator: Authenticator): () => void {
-    if (this.authenticator !== undefined) throw new Error('web-access: authenticator already registered')
-    this.authenticator = authenticator
-    return () => {
-      if (this.authenticator === authenticator) this.authenticator = undefined
+    if (value === undefined) {
+      this.values.delete(ref)
+    } else {
+      this.values.set(ref, value)
     }
   }
 
-  async authorize(request: IncomingMessage): Promise<AccessDecision | undefined> {
-    return this.authenticator?.authorize(request)
-  }
+  private readonly values = new Map<string, string>()
 }
 
-/** Serialize a Fetch Response onto node:http. */
-async function sendResponse(request: IncomingMessage, response: Response, res: ServerResponse): Promise<void> {
-  res.writeHead(response.status, Object.fromEntries(response.headers.entries()))
-  if (request.method !== 'HEAD' && response.body !== null) {
-    for await (const chunk of response.body) res.write(chunk)
-  }
-  res.end()
-}
-
-/** Loopback HTTP server whose global guard delegates public Host requests to StubWebAccess. */
-class StubWebServer extends Service {
-  private server!: Server
-  private listenedPort!: number
-  private readonly upgradedSockets = new Set<import('node:stream').Duplex>()
-
-  constructor(ctx: Context) {
-    super(ctx, 'webServer')
-  }
-
-  get port(): number {
-    return this.listenedPort
-  }
-
-  async [Service.init](): Promise<void> {
-    this.server = createServer((request, response) => {
-      void this.handle(request, response).catch(() => {
-        if (!response.headersSent) response.writeHead(500)
-        response.end()
-      })
-    })
-    this.server.on('upgrade', (request, socket) => {
-      this.upgradedSockets.add(socket)
-      socket.once('close', () => { this.upgradedSockets.delete(socket) })
-      void this.handleUpgrade(request, socket).catch(() => { socket.destroy() })
-    })
-    await new Promise<void>((resolve) => {
-      this.server.listen(0, '127.0.0.1', () => {
-        this.listenedPort = (this.server.address() as { port: number }).port
-        resolve()
-      })
-    })
-    this.ctx.effect(() => async () => {
-      await new Promise<void>((resolve) => {
-        this.server.close(() => { resolve() })
-        this.server.closeAllConnections()
-        for (const socket of this.upgradedSockets) socket.destroy()
-      })
-    }, 'stub webserver')
-  }
-
-  private local(request: IncomingMessage): boolean {
-    const host = request.headers.host ?? ''
-    return host.startsWith('127.') || host.startsWith('localhost')
-  }
-
-  private async access(request: IncomingMessage): Promise<'local' | 'remote' | 'authenticated' | Response> {
-    if (this.local(request)) return 'local'
-    const service = this.ctx.get('webAccess') as StubWebAccess | undefined
-    const decision = await service?.authorize(request)
-    if (decision === undefined) return 'remote'
-    if (decision.kind === 'grant') return 'authenticated'
-    if (decision.response === undefined) throw new Error('respond decision is missing its response')
-    return decision.response
-  }
-
-  private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
-    const access = await this.access(request)
-    if (access instanceof Response) {
-      await sendResponse(request, access, response)
-      return
-    }
-    response.writeHead(200, { 'content-type': 'application/json' })
-    response.end(JSON.stringify({
-      access,
-      path: request.url,
-      host: request.headers.host,
-      origin: request.headers.origin,
-    }))
-  }
-
-  private async handleUpgrade(request: IncomingMessage, socket: import('node:stream').Duplex): Promise<void> {
-    const access = await this.access(request)
-    if (access instanceof Response) {
-      socket.end(`HTTP/1.1 ${String(access.status)} Unauthorized\r\nContent-Length: 0\r\n\r\n`)
-      return
-    }
-    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: dsh-echo\r\nConnection: Upgrade\r\nX-Access: ${access}\r\n\r\n`)
-    socket.on('data', chunk => { socket.write(chunk) })
-  }
-}
-
-/** Minimal shell-env service capturing contributors. */
+/** Minimal shell-env service capturing every contributor for later assertions. */
 class StubShellEnv extends Service {
-  contributors: { name: string; resolve(): Record<string, string> }[] = []
-
   constructor(ctx: Context) {
     super(ctx, 'shellEnv')
   }
 
+  contributors: { name: string; resolve(): Record<string, string> }[] = []
+
   register(contributor: { name: string; resolve(): Record<string, string> }): () => void {
     this.contributors.push(contributor)
-    return () => { this.contributors = this.contributors.filter(entry => entry !== contributor) }
+    return () => {
+      this.contributors = this.contributors.filter(entry => entry !== contributor)
+    }
   }
 }
 
-/** Minimal system-prompt service capturing sections. */
+/** Minimal system-prompt service capturing every section for later assertions. */
 class StubSystemPrompt extends Service {
-  sections: { name: string; text(): string }[] = []
-
   constructor(ctx: Context) {
     super(ctx, 'systemPrompt')
   }
 
+  sections: { name: string; text(): string }[] = []
+
   section(section: { name: string; text(): string }): () => void {
     this.sections.push(section)
-    return () => { this.sections = this.sections.filter(entry => entry !== section) }
+    return () => {
+      this.sections = this.sections.filter(entry => entry !== section)
+    }
   }
 }
 
-interface Composition {
+interface StubbedContext {
   loaded: Context
   credentials: () => StubCredentials
-  webAccess: () => StubWebAccess
   shellEnv: () => StubShellEnv
   systemPrompt: () => StubSystemPrompt
-  targetBase: () => Promise<string>
-}
-
-interface CompositionOptions {
-  withCredentials?: boolean
-  withWebAccess?: boolean
-  withShell?: boolean
-  withPassword?: boolean
-  seeds?: Record<string, string>
-  wait?: boolean
+  gateBase: () => Promise<string>
 }
 
 const FIXTURES = fileURLToPath(new URL('fixtures/', import.meta.url))
 const QUICK_URL = 'https://alpha-bravo-charlie.trycloudflare.com'
-const PUBLIC_HOST = 'public.example'
 const FAKE_PREFIX = 'fake-cloudflared-'
 
 let root: string | undefined
 let context: Context | undefined
 
+/** Sweep any fakes' pid/url files from earlier tests or runs. */
 async function cleanFixtureMarkers(): Promise<void> {
   for (const entry of await readdir(tmpdir())) {
     if (entry.startsWith(FAKE_PREFIX)) await unlink(join(tmpdir(), entry)).catch(() => undefined)
@@ -225,9 +111,11 @@ afterEach(async () => {
   if (root !== undefined) await rm(root, { recursive: true, force: true })
   root = undefined
   await cleanFixtureMarkers()
+  vi.useRealTimers()
   vi.restoreAllMocks()
 })
 
+/** Materialize one executable fake cloudflared from a fixture into the temp root. */
 async function fixtureExecutable(fixture: string): Promise<string> {
   const target = join(root!, fixture)
   await writeFile(target, await readFile(join(FIXTURES, fixture)))
@@ -235,6 +123,7 @@ async function fixtureExecutable(fixture: string): Promise<string> {
   return target
 }
 
+/** Pids of live fakes (markers name the pid; alive check keeps killed pids out). */
 async function liveFixturePids(): Promise<string[]> {
   const pids: string[] = []
   for (const entry of await readdir(tmpdir())) {
@@ -244,51 +133,79 @@ async function liveFixturePids(): Promise<string[]> {
       process.kill(Number(hit[1]), 0)
       pids.push(hit[1]!)
     } catch {
-      // The process already exited.
+      // Dead pid: the process already exited.
     }
   }
   return pids
 }
 
-async function loadComposition(config: Record<string, unknown>, options?: CompositionOptions): Promise<Composition> {
-  const seeds = {
+/** Write a cordis.yml with webserver + stubs + the tunnel row and create the Loader child.
+ * Does not await the load unless asked.
+ */
+interface CompositionOptions {
+  /** Register no credentials stub row at all. */
+  withCredentials?: boolean
+  /** Make the credentials row activate after the webserver-dependent tunnel row. */
+  credentialsAfterWebServer?: boolean
+  /** Register no shell-env/system-prompt stub rows. */
+  withShell?: boolean
+  /** Seed no DSH_WEB_PASSWORD. */
+  withPassword?: boolean
+  /** Extra seeded credentials. */
+  seeds?: Record<string, string>
+  /** Skip the loader resolution wait (boot-failure tests). */
+  wait?: boolean
+}
+
+async function loadComposition(tunnelConfig: Record<string, unknown>, options?: CompositionOptions): Promise<StubbedContext> {
+  const configPath = join(root!, 'cordis.yml')
+  const seeds: Record<string, string> = {
     ...(options?.withPassword === false ? {} : { DSH_WEB_PASSWORD: 's3kret-passw0rd' }),
     ...options?.seeds,
   }
-  const rows = [
+  const credentialRows = options?.withCredentials === false ? [] : [
+    "- name: '@deepseek-ai/dsh-credentials'",
+    '  config:',
+    `    seeds: ${JSON.stringify(seeds)}`,
+  ]
+  const tunnelRows = [
+    "- name: '@deepseek-ai/dsh-auth-tunnel'",
+    '  config:',
+    ...Object.entries(tunnelConfig).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`),
+  ]
+  const rows: string[] = [
     "- name: '@deepseek-ai/dsh-host-webserver'",
-    ...(options?.withWebAccess === false ? [] : ["- name: '@deepseek-ai/dsh-host-web-access'"]),
-    ...(options?.withCredentials === false ? [] : [
-      "- name: '@deepseek-ai/dsh-credentials'",
-      '  config:',
-      `    seeds: ${JSON.stringify(seeds)}`,
-    ]),
+    '  config:',
+    "    host: '127.0.0.1'",
+    '    port: 0',
+    ...(options?.credentialsAfterWebServer === true ? [] : credentialRows),
     ...(options?.withShell === false ? [] : [
       "- name: '@deepseek-ai/dsh-shell-env'",
       "- name: '@deepseek-ai/dsh-system-prompt'",
     ]),
-    "- name: '@deepseek-ai/dsh-auth-tunnel'",
-    '  config:',
-    ...Object.entries(config).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`),
+    ...tunnelRows,
+    ...(options?.credentialsAfterWebServer === true ? credentialRows : []),
     '',
   ]
-  const configPath = join(root!, 'cordis.yml')
   await writeFile(configPath, rows.join('\n'))
 
   context = new Context()
   context.baseUrl = pathToFileURL(root!).href + '/'
   await context.plugin(Loader)
   context.loader.builtins.include = Include
-  const credentialsPlugin = (ctx: Context, input?: { seeds?: Record<string, string> }): void => {
-    const service = new StubCredentials(ctx)
-    for (const [ref, value] of Object.entries(input?.seeds ?? {})) service.set(ref, value)
+  const shellEnvPlugin = (ctx2: Context): void => { void ctx2.plugin(StubShellEnv) }
+  const systemPromptPlugin = (ctx2: Context): void => { void ctx2.plugin(StubSystemPrompt) }
+  // Seeds must land in the service BEFORE the tunnel row evaluates its row:
+  // activation reads the password reference at load, never afterwards.
+  const credentialsPlugin = (ctx2: Context, config?: { seeds?: Record<string, string> }): void => {
+    const service = new StubCredentials(ctx2)
+    for (const [ref, value] of Object.entries(config?.seeds ?? {})) service.set(ref, value)
   }
-  const shellEnvPlugin = (ctx: Context): void => { void new StubShellEnv(ctx) }
-  const systemPromptPlugin = (ctx: Context): void => { void new StubSystemPrompt(ctx) }
+  credentialsPlugin.inject = options?.credentialsAfterWebServer === true ? ['webServer'] : []
+  const webserver = (await import('@deepseek-ai/dsh-host-webserver')).default
   const tunnel = await import('../src/index.ts')
   const modules = new Map<string, unknown>([
-    ['@deepseek-ai/dsh-host-webserver', StubWebServer],
-    ['@deepseek-ai/dsh-host-web-access', StubWebAccess],
+    ['@deepseek-ai/dsh-host-webserver', webserver],
     ['@deepseek-ai/dsh-credentials', credentialsPlugin],
     ['@deepseek-ai/dsh-shell-env', shellEnvPlugin],
     ['@deepseek-ai/dsh-system-prompt', systemPromptPlugin],
@@ -309,22 +226,24 @@ async function loadComposition(config: Record<string, unknown>, options?: Compos
   const loaded = context
   return {
     loaded,
-    credentials: () => loaded.get('credentials') as unknown as StubCredentials,
-    webAccess: () => loaded.get('webAccess') as unknown as StubWebAccess,
-    shellEnv: () => loaded.get('shellEnv') as unknown as StubShellEnv,
-    systemPrompt: () => loaded.get('systemPrompt') as unknown as StubSystemPrompt,
-    async targetBase() {
+    credentials: () => loaded.get('credentials')! as unknown as StubCredentials,
+    shellEnv: () => loaded.get('shellEnv')! as unknown as StubShellEnv,
+    systemPrompt: () => loaded.get('systemPrompt')! as unknown as StubSystemPrompt,
+    async gateBase(): Promise<string> {
       for (const entry of await readdir(tmpdir())) {
-        if (new RegExp(`^${FAKE_PREFIX}\\d+\\.url$`).test(entry)) {
-          return (await readFile(join(tmpdir(), entry), 'utf8')).trim()
-        }
+        const hit = new RegExp(`^${FAKE_PREFIX}\\d+\\.url$`).exec(entry)
+        if (hit !== null) return (await readFile(join(tmpdir(), entry), 'utf8')).trim()
       }
-      throw new Error('no fake recorded its WebServer target')
+      throw new Error('no fake recorded its gate target')
     },
   }
 }
 
-async function bootQuick(overrides?: Record<string, unknown>, options?: CompositionOptions): Promise<Composition> {
+/** Boot one quick-mode composition with the password seeded. */
+async function bootQuick(
+  overrides?: Record<string, unknown>,
+  options?: CompositionOptions,
+): Promise<StubbedContext> {
   return loadComposition({
     sessionTtlHours: 720,
     mode: 'quick',
@@ -334,42 +253,12 @@ async function bootQuick(overrides?: Record<string, unknown>, options?: Composit
   }, options)
 }
 
-function publicFetch(base: string, path: string, init?: RequestInit): Promise<Response> {
-  const target = new URL(base)
-  return new Promise((resolve, reject) => {
-    const headers = Object.fromEntries(new Headers(init?.headers).entries())
-    const request = httpRequest({
-      host: '127.0.0.1',
-      port: Number(target.port),
-      path,
-      method: init?.method ?? 'GET',
-      headers: { host: PUBLIC_HOST, ...headers },
-    }, (response) => {
-      const chunks: Buffer[] = []
-      response.on('data', (chunk: Buffer) => { chunks.push(chunk) })
-      response.on('end', () => {
-        const responseHeaders = new Headers()
-        for (let index = 0; index < response.rawHeaders.length; index += 2) {
-          responseHeaders.append(response.rawHeaders[index]!, response.rawHeaders[index + 1]!)
-        }
-        resolve(new Response(Buffer.concat(chunks), {
-          status: response.statusCode ?? 500,
-          statusText: response.statusMessage,
-          headers: responseHeaders,
-        }))
-      })
-    })
-    request.on('error', reject)
-    if (typeof init?.body === 'string') request.end(init.body)
-    else request.end()
-  })
-}
-
-async function login(base: string, password = 's3kret-passw0rd'): Promise<Headers> {
-  const response = await publicFetch(base, '/dsh-auth-tunnel/login', {
+/** Log in over the gate and return the minted Cookie header value. */
+async function login(base: string, extraHeaders?: Record<string, string>, password = 's3kret-passw0rd'): Promise<Headers> {
+  const response = await fetch(`${base}/dsh-auth-tunnel/login`, {
     method: 'POST',
     redirect: 'manual',
-    headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-forwarded-proto': 'https' },
+    headers: { 'content-type': 'application/x-www-form-urlencoded', ...extraHeaders },
     body: `password=${encodeURIComponent(password)}`,
   })
   expect(response.status).toBe(303)
@@ -377,255 +266,627 @@ async function login(base: string, password = 's3kret-passw0rd'): Promise<Header
   return response.headers
 }
 
-async function rawRequest(port: number, lines: string[]): Promise<string> {
+/** One raw HTTP request over a socket; returns the raw response head. */
+async function rawRequest(port: number, request: string[]): Promise<string> {
   const socket = connect(port, '127.0.0.1')
   await once(socket, 'connect')
-  socket.write(lines.join('\r\n'))
+  socket.write(request.join('\r\n'))
   const [data] = await once(socket, 'data') as [Buffer]
   socket.end()
   return String(data)
 }
 
+/** Wait one bounded interval in real time. */
 async function sleep(ms: number): Promise<void> {
-  await new Promise<void>(resolve => setTimeout(resolve, ms))
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms)
+  })
 }
 
-describe('global password authentication', () => {
-  it('protects metadata and routes registered by any plugin while preserving direct loopback use', { timeout: 60_000 }, async () => {
-    const { targetBase } = await bootQuick()
-    const base = await targetBase()
-    const target = new URL(base)
+describe('password gate over the loopback webserver', () => {
+  it('serves the public Web App Manifest without opening other unauthenticated paths', { timeout: 60_000 }, async () => {
+    const { loaded, gateBase } = await bootQuick()
+    loaded.webServer.register({
+      kind: 'exact', path: '/manifest.webmanifest', handler: (_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/manifest+json' })
+        res.end('{"name":"DeepSeek Harness"}')
+      },
+    })
+    const base = await gateBase()
 
-    expect((await publicFetch(base, '/manifest.webmanifest')).status).toBe(401)
-    expect((await publicFetch(base, '/future-plugin/route')).status).toBe(401)
-    const local = await fetch(`${base}/future-plugin/route`)
-    expect((await local.json() as { access: string }).access).toBe('local')
-
-    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
-    const manifest = await publicFetch(base, '/manifest.webmanifest', { headers: { cookie } })
+    const manifest = await fetch(`${base}/manifest.webmanifest`)
     expect(manifest.status).toBe(200)
-    expect(await manifest.json()).toMatchObject({ access: 'authenticated', host: PUBLIC_HOST })
-    expect(base).toBe(`http://127.0.0.1:${target.port}`)
+    expect(await manifest.json()).toEqual({ name: 'DeepSeek Harness' })
+    expect((await fetch(`${base}/manifest.webmanifest`, { method: 'POST' })).status).toBe(401)
+    expect((await fetch(`${base}/favicon.svg`)).status).toBe(401)
   })
 
-  it('serves the login dance, preserves public request facts, rotates sessions, and logs out', { timeout: 60_000 }, async () => {
-    const { credentials, targetBase } = await bootQuick()
-    const base = await targetBase()
-
-    const navigation = await publicFetch(base, '/anything', {
-      redirect: 'manual', headers: { accept: 'text/html' },
+  it('challenges navigations and APIs, serves the login dance, and proxies accepted requests', { timeout: 60_000 }, async () => {
+    const { loaded, gateBase } = await bootQuick()
+    let observedHost = ''
+    let observedOrigin = ''
+    loaded.webServer.register({
+      kind: 'prefix', path: '/api', handler: (req, res) => {
+        observedHost = String(req.headers.host)
+        observedOrigin = String(req.headers.origin)
+        res.writeHead(200, { 'content-type': 'application/json', 'x-mark': 'gate' })
+        res.end('{"ok":true}')
+      },
     })
-    expect(navigation.status).toBe(302)
-    expect(navigation.headers.get('location')).toBe('/dsh-auth-tunnel/login')
-    expect(await (await publicFetch(base, '/api/probe')).text()).toBe('{"error":"authentication required"}')
+    const base = await gateBase()
 
-    const page = await publicFetch(base, '/dsh-auth-tunnel/login')
-    expect(await page.text()).toContain('访问密码')
-    const wrong = await publicFetch(base, '/dsh-auth-tunnel/login', {
+    // No cookie: navigations redirect to the login page; API calls get a terse 401.
+    const nav = await fetch(`${base}/anything`, { redirect: 'manual', headers: { accept: 'text/html' } })
+    expect(nav.status).toBe(302)
+    expect(nav.headers.get('location')).toBe('/dsh-auth-tunnel/login')
+    const api = await fetch(`${base}/api/probe`)
+    expect(api.status).toBe(401)
+    expect(await api.text()).toBe('{"error":"authentication required"}')
+    const apiPost = await fetch(`${base}/api/probe`, { method: 'POST' })
+    expect(apiPost.status).toBe(401)
+
+    // GET login serves the self-contained page; a wrong password bounces with the error flag.
+    const page = await fetch(`${base}/dsh-auth-tunnel/login`)
+    expect(page.status).toBe(200)
+    expect((await page.text()).length).toBeGreaterThan(500)
+    const wrong = await fetch(`${base}/dsh-auth-tunnel/login`, {
       method: 'POST', redirect: 'manual',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: 'password=nope',
     })
+    expect(wrong.status).toBe(303)
     expect(wrong.headers.get('location')).toBe('/dsh-auth-tunnel/login?error=1')
 
-    const good = await login(base)
+    // A correct password behind the TLS edge mints a Secure HttpOnly cookie.
+    const good = await login(base, { 'x-forwarded-proto': 'https' })
+    expect(good.get('location')).toBe('/')
     const cookie = good.get('set-cookie')!.split(';', 1)[0]!
-    expect(good.get('set-cookie')).toContain('HttpOnly')
-    expect(good.get('set-cookie')).toContain('SameSite=Strict')
     expect(good.get('set-cookie')).toContain('Secure')
-    const accepted = await publicFetch(base, '/api/probe', {
-      headers: { cookie, origin: `https://${PUBLIC_HOST}` },
-    })
-    expect(await accepted.json()).toEqual({
-      access: 'authenticated', path: '/api/probe', host: PUBLIC_HOST, origin: `https://${PUBLIC_HOST}`,
-    })
 
-    credentials().set('DSH_WEB_PASSWORD', 'rotated')
-    expect((await publicFetch(base, '/api/probe', { headers: { cookie } })).status).toBe(401)
-    const rotated = (await login(base, 'rotated')).get('set-cookie')!.split(';', 1)[0]!
-    const logout = await publicFetch(base, '/dsh-auth-tunnel/logout', {
-      redirect: 'manual', headers: { cookie: rotated, 'x-forwarded-proto': 'https' },
+    // The accepted cookie reaches the upstream, which saw the loopback
+    // authority rather than the public hostname (the DNS-rebinding fence
+    // keeps reading the loopback webserver's own trust surface).
+    const proxied = await fetch(`${base}/api/probe`, { headers: { cookie } })
+    expect(proxied.status).toBe(200)
+    expect(proxied.headers.get('x-mark')).toBe('gate')
+    expect(await proxied.text()).toBe('{"ok":true}')
+    expect(observedHost).toMatch(/^127\.0\.0\.1:\d+$/)
+
+    const port = Number(new URL(base).port)
+    const browserApi = await rawRequest(port, [
+      'GET /api/probe HTTP/1.1',
+      'Host: public.example',
+      'Origin: https://public.example',
+      `Cookie: ${cookie}`,
+      'Connection: close',
+      '',
+      '',
+    ])
+    expect(browserApi).toContain('200 OK')
+    expect(observedOrigin).toBe(`http://${observedHost}`)
+
+    // Authentication does not launder a cross-origin request: an Origin that
+    // does not name the incoming Host stays foreign for the upstream fence.
+    await rawRequest(port, [
+      'GET /api/probe HTTP/1.1',
+      'Host: public.example',
+      'Origin: https://foreign.example',
+      `Cookie: ${cookie}`,
+      'Connection: close',
+      '',
+      '',
+    ])
+    expect(observedOrigin).toBe('https://foreign.example')
+
+    // Foreign cookies are not trusted: wrong signature, wrong shape, wrong
+    // version, and an unrelated cookie that names nothing.
+    for (const bad of [
+      'dsh_auth_tunnel=v1.99999999999999.AAAA',
+      'dsh_auth_tunnel=v1.123',
+      'dsh_auth_tunnel=v9.99999999999999.AAAA',
+      'dsh_auth_tunnel=v1.abc.AAAA',
+      'unrelated=1; another=2',
+    ]) {
+      expect((await fetch(`${base}/api/probe`, { headers: { cookie: bad } })).status).toBe(401)
+    }
+
+    // A navigation spelled with Fetch Metadata (no Accept header) still lands
+    // on the login page; a form without the password field bounces with the
+    // error flag, and any other login-verb is a literal 404.
+    const fetchMeta = await fetch(`${base}/anything`, { redirect: 'manual', headers: { 'sec-fetch-dest': 'document' } })
+    expect(fetchMeta.status).toBe(302)
+    const acceptOnly = await fetch(`${base}/anything`, { redirect: 'manual', headers: { accept: 'text/html,application/xhtml+xml' } })
+    expect(acceptOnly.status).toBe(302)
+    const missingField = await fetch(`${base}/dsh-auth-tunnel/login`, {
+      method: 'POST', redirect: 'manual',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'whatever=1',
     })
-    expect(logout.status).toBe(303)
-    expect(logout.headers.get('location')).toBe('/dsh-auth-tunnel/login')
-    expect(logout.headers.get('set-cookie')).toContain('Max-Age=0')
+    expect(missingField.status).toBe(303)
+    expect(missingField.headers.get('location')).toBe('/dsh-auth-tunnel/login?error=1')
+    const wrongVerb = await fetch(`${base}/dsh-auth-tunnel/login`, { method: 'DELETE' })
+    expect(wrongVerb.status).toBe(404)
+
+    // The error banner is rendered when the dance bounces.
+    const errorPage = await fetch(`${base}/dsh-auth-tunnel/login?error=1`)
+    expect(await errorPage.text()).toContain('密码错误')
+
+    // Logout clears the cookie with Max-Age=0, marks Secure behind the TLS
+    // edge, and lands back on the login page; the POST verb does the same.
+    const loggedOut = await fetch(`${base}/dsh-auth-tunnel/logout`, {
+      redirect: 'manual',
+      headers: { cookie, 'x-forwarded-proto': 'https' },
+    })
+    expect(loggedOut.status).toBe(303)
+    expect(loggedOut.headers.get('location')).toBe('/dsh-auth-tunnel/login')
+    expect(loggedOut.headers.get('set-cookie')).toContain('Max-Age=0')
+    expect(loggedOut.headers.get('set-cookie')).toContain('Secure')
+    const loggedOutPost = await fetch(`${base}/dsh-auth-tunnel/logout`, { method: 'POST', redirect: 'manual' })
+    expect(loggedOutPost.status).toBe(303)
   })
 
-  it('bounds login bodies, validates content type, and fails closed when the credential disappears', { timeout: 60_000 }, async () => {
-    const { credentials, targetBase } = await bootQuick()
-    const base = await targetBase()
-    expect((await publicFetch(base, '/dsh-auth-tunnel/login', { method: 'POST' })).status).toBe(415)
-    expect((await publicFetch(base, '/dsh-auth-tunnel/login', {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: `password=${'x'.repeat(20_000)}`,
-    })).status).toBe(413)
+  it('rejects cookies minted before a password rotation and accepts cookies minted after it', { timeout: 60_000 }, async () => {
+    const { credentials, gateBase } = await bootQuick()
+    const base = await gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    expect((await fetch(`${base}/`, { redirect: 'manual', headers: { cookie } })).status).not.toBe(302)
+
+    credentials().set('DSH_WEB_PASSWORD', 'rotated-passw0rd')
+    expect((await fetch(`${base}/`, { redirect: 'manual', headers: { cookie } })).status).toBe(401)
+    const fresh = (await login(base, undefined, 'rotated-passw0rd')).get('set-cookie')!.split(';', 1)[0]!
+    expect((await fetch(`${base}/`, { redirect: 'manual', headers: { cookie: fresh } })).status).not.toBe(302)
+  })
+
+  it('rejects expired cookies regardless of the signature', { timeout: 60_000 }, async () => {
+    const { gateBase } = await bootQuick()
+    const base = await gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(Date.now() + 31 * 24 * 3600 * 1000)
+    expect((await fetch(`${base}/`, { redirect: 'manual', headers: { cookie } })).status).toBe(401)
+  })
+
+  it('answers wrong content types, oversized bodies, and deleted credentials inside the login handshake', { timeout: 60_000 }, async () => {
+    const { credentials, gateBase } = await bootQuick()
+    const base = await gateBase()
+    const port = Number(new URL(base).port)
+
+    // 415 for a non-form login post.
+    const wrongType = await fetch(`${base}/dsh-auth-tunnel/login`, { method: 'POST', body: 'x' })
+    expect(wrongType.status).toBe(415)
+
+    // 413 when the declared content-length already exceeds the budget.
+    const declared = await rawRequest(port, [
+      'POST /dsh-auth-tunnel/login HTTP/1.1',
+      `Host: 127.0.0.1:${String(port)}`,
+      'Content-Type: application/x-www-form-urlencoded',
+      'Content-Length: 70000',
+      '',
+      '',
+    ])
+    expect(declared.startsWith('HTTP/1.1 413')).toBe(true)
+
+    // 413 when a streamed (chunked) body overruns the budget mid-flight.
+    const socket = netConnect(port, '127.0.0.1')
+    await once(socket, 'connect')
+    socket.write([
+      'POST /dsh-auth-tunnel/login HTTP/1.1',
+      `Host: 127.0.0.1:${String(port)}`,
+      'Content-Type: application/x-www-form-urlencoded',
+      'Transfer-Encoding: chunked',
+      '',
+      '4100',
+      'x'.repeat(0x4100),
+      '0',
+      '',
+      '',
+    ].join('\r\n'))
+    const [streamedHead] = await once(socket, 'data') as [Buffer]
+    socket.end()
+    expect(String(streamedHead).startsWith('HTTP/1.1 413')).toBe(true)
+
+    // A deleted password credential fails the login loudly, not silently.
     credentials().set('DSH_WEB_PASSWORD', undefined)
-    expect((await publicFetch(base, '/dsh-auth-tunnel/login', {
+    const deleted = await fetch(`${base}/dsh-auth-tunnel/login`, {
       method: 'POST', redirect: 'manual',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: 'password=s3kret-passw0rd',
-    })).status).toBe(503)
+    })
+    expect(deleted.status).toBe(503)
+
+    // A minted cookie minted before the deletion also fails closed.
+    const stale = await fetch(`${base}/api/probe`, { headers: { cookie: 'dsh_auth_tunnel=v1.99999999999999.AAAA' } })
+    expect(stale.status).toBe(401)
   })
+})
 
-  it('authenticates upgrades through the same cookie without proxying the socket', { timeout: 60_000 }, async () => {
-    const { targetBase } = await bootQuick()
-    const base = await targetBase()
+describe('upgrade pass-through', () => {
+  it('proxies authenticated upgrades and closes both directions on client disconnect', { timeout: 60_000 }, async () => {
+    const { loaded, gateBase } = await bootQuick()
+    let observedHost = ''
+    let observedOrigin = ''
+    loaded.webServer.registerUpgrade({
+      path: '/events',
+      handler: (req, socket, head) => {
+        observedHost = String(req.headers.host)
+        observedOrigin = String(req.headers.origin)
+        socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: dsh-echo\r\nConnection: Upgrade\r\n\r\n')
+        if (head.length > 0) socket.write(head)
+        socket.on('data', (chunk: Buffer) => { socket.write(chunk) })
+      },
+    })
+    const base = await gateBase()
     const port = Number(new URL(base).port)
-    const denied = await rawRequest(port, [
-      'GET /events HTTP/1.1', `Host: ${PUBLIC_HOST}`, 'Connection: Upgrade', 'Upgrade: dsh-echo', '', '',
-    ])
-    expect(denied).toContain('401 Unauthorized')
-
     const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+
     const socket = connect(port, '127.0.0.1')
     await once(socket, 'connect')
     socket.write([
       'GET /events HTTP/1.1',
-      `Host: ${PUBLIC_HOST}`,
+      'Host: public.example:443',
       'Connection: Upgrade',
       'Upgrade: dsh-echo',
+      'Origin: https://public.example',
       `Cookie: ${cookie}`,
       '',
       '',
     ].join('\r\n'))
     const [head] = await once(socket, 'data') as [Buffer]
     expect(String(head)).toContain('101 Switching Protocols')
-    expect(String(head)).toContain('X-Access: authenticated')
-    socket.write('hello')
+    expect(observedHost).toMatch(/^127\.0\.0\.1:\d+$/)
+    expect(observedOrigin).toBe(`http://${observedHost}`)
+
+    socket.write('hello-tunnel')
     const [echo] = await once(socket, 'data') as [Buffer]
-    expect(String(echo)).toBe('hello')
-    socket.destroy()
+    expect(String(echo)).toBe('hello-tunnel')
+    socket.end()
+    const closed = once(socket, 'close')
+    await closed
   })
 
-  it('contains credential-store failures to the exact HTTP or upgrade request', { timeout: 60_000 }, async () => {
-    const { credentials, targetBase } = await bootQuick()
-    const base = await targetBase()
+  it('rejects unauthenticated upgrades with a terse 401', { timeout: 60_000 }, async () => {
+    const { gateBase } = await bootQuick()
+    const base = await gateBase()
     const port = Number(new URL(base).port)
-    credentials().fault = true
-    expect((await publicFetch(base, '/')).status).toBe(500)
+    const response = await rawRequest(port, [
+      'GET /events HTTP/1.1',
+      `Host: 127.0.0.1:${String(port)}`,
+      'Connection: Upgrade',
+      'Upgrade: dsh-echo',
+      '',
+      '',
+    ])
+    expect(response).toContain('401 Unauthorized')
+  })
+})
+
+describe('fetch-metadata navigation', () => {
+  it('spells the login redirect for a bare Sec-Fetch-Dest navigation', { timeout: 60_000 }, async () => {
+    const { gateBase } = await bootQuick()
+    const port = Number(new URL(await gateBase()).port)
+    const head = await rawRequest(port, [
+      'GET /lecture HTTP/1.1',
+      `Host: 127.0.0.1:${String(port)}`,
+      'Sec-Fetch-Dest: document',
+      'Connection: close',
+      '',
+      '',
+    ])
+    expect(head).toContain('302')
+    expect(head.toLowerCase()).toContain('location: /dsh-auth-tunnel/login')
+  })
+})
+
+describe('containment against broken peers', () => {
+  it('cancels the upstream HTTP request when the public client disconnects', { timeout: 60_000 }, async () => {
+    const { loaded, gateBase } = await bootQuick()
+    let markStarted!: () => void
+    let markCancelled!: () => void
+    const started = new Promise<void>((resolve) => { markStarted = resolve })
+    const cancelled = new Promise<void>((resolve) => { markCancelled = resolve })
+    loaded.webServer.register({
+      kind: 'exact', path: '/api/slow', handler: (_req, res) => {
+        markStarted()
+        res.once('close', () => {
+          if (!res.writableFinished) markCancelled()
+        })
+      },
+    })
+    const base = await gateBase()
+    const port = Number(new URL(base).port)
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
     const socket = connect(port, '127.0.0.1')
-    socket.on('error', () => {})
+    socket.on('error', () => { /* Destroying this fixture is the tested client disconnect. */ })
+    await once(socket, 'connect')
+    socket.write([
+      'GET /api/slow HTTP/1.1',
+      `Host: 127.0.0.1:${String(port)}`,
+      `Cookie: ${cookie}`,
+      'Connection: keep-alive',
+      '',
+      '',
+    ].join('\r\n'))
+    await started
+    socket.destroy()
+    await Promise.race([
+      cancelled,
+      sleep(1000).then(() => { throw new Error('upstream request survived the client disconnect') }),
+    ])
+  })
+
+  it('answers 502 when the upstream refuses, keeps serving, and passes buffered head bytes through upgrades', { timeout: 60_000 }, async () => {
+    const { loaded, gateBase } = await bootQuick()
+    loaded.webServer.register({
+      kind: 'exact', path: '/api/broken', handler: (req) => { req.socket.destroy() },
+    })
+    loaded.webServer.register({
+      kind: 'exact', path: '/probe', handler: (_req, res) => { res.writeHead(200); res.end('ALIVE') },
+    })
+    let upgradeSawHead = 0
+    loaded.webServer.registerUpgrade({
+      path: '/events',
+      handler: (_req, socket, head) => {
+        upgradeSawHead = head.length
+        socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: dsh-echo\r\nConnection: Upgrade\r\n\r\n')
+      },
+    })
+    const base = await gateBase()
+    const port = Number(new URL(base).port)
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+
+    // The aborted upstream answers the gate error surface, and the gate keeps
+    // serving accepted cookies afterwards.
+    const broken = await fetch(`${base}/api/broken`, { headers: { cookie } })
+    expect(broken.status).toBe(502)
+    expect(await broken.json()).toEqual({ error: 'upstream unreachable' })
+    expect((await fetch(`${base}/probe`, { headers: { cookie } })).status).toBe(200)
+
+    // Any bytes the client flushed together with the handshake (Buffer head)
+    // are forwarded, not dropped.
+    const socket = connect(port, '127.0.0.1')
+    await once(socket, 'connect')
+    socket.write([
+      'GET /events HTTP/1.1',
+      'Host: public.example:443',
+      'Connection: Upgrade',
+      'Upgrade: dsh-echo',
+      `Cookie: ${cookie}`,
+      '',
+      '',
+    ].join('\r\n') + 'HEADBYTES')
+    const [head] = await once(socket, 'data') as [Buffer]
+    expect(String(head)).toContain('101 Switching Protocols')
+    socket.end()
+    await once(socket, 'close')
+    // Upstream saw the flushed head bytes (asserted after the pipes settled).
+    await sleep(50)
+    expect(upgradeSawHead).toBe('HEADBYTES'.length)
+  })
+
+  it('contains a credential-store failure inside single requests', { timeout: 60_000 }, async () => {
+    const { credentials, gateBase } = await bootQuick()
+    const base = await gateBase()
+    const port = Number(new URL(base).port)
+
+    // An HTTP request while the store throws: 500 for that request, gate alive.
+    credentials().fault = true
+    const failed = await fetch(`${base}/`)
+    expect(failed.status).toBe(500)
+
+    // An upgrade while the store throws: the socket is destroyed, gate alive.
+    const socket = netConnect(port, '127.0.0.1')
+    socket.on('error', () => { /* The destroyed socket is the fixture outcome. */ })
     await once(socket, 'connect')
     const closed = once(socket, 'close')
-    socket.write(['GET /events HTTP/1.1', `Host: ${PUBLIC_HOST}`, 'Connection: Upgrade', 'Upgrade: dsh', '', ''].join('\r\n'))
+    socket.write([
+      'GET /events HTTP/1.1',
+      `Host: 127.0.0.1:${String(port)}`,
+      'Connection: Upgrade',
+      'Upgrade: dsh-echo',
+      '',
+      '',
+    ].join('\r\n'))
     await closed
     credentials().fault = false
-    expect((await publicFetch(base, '/dsh-auth-tunnel/login')).status).toBe(200)
+    expect((await fetch(`${base}/dsh-auth-tunnel/login`)).status).toBe(200)
   })
 })
 
 describe('tunnel lifecycle', () => {
-  it('publishes the URL to the console, shell, and model', { timeout: 60_000 }, async () => {
+  it('waits for credentials that activate after the webserver', { timeout: 60_000 }, async () => {
+    const { gateBase } = await bootQuick(undefined, { credentialsAfterWebServer: true })
+    expect((await fetch(`${await gateBase()}/dsh-auth-tunnel/login`)).status).toBe(200)
+  })
+
+  it('prints the public URL, publishes DSH_PUBLIC_URL, and section-strings the model', { timeout: 60_000 }, async () => {
     const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
     const { shellEnv, systemPrompt } = await bootQuick()
     expect(consoleSpy.mock.calls.flat().join('\n')).toContain(`cloudflare tunnel: ${QUICK_URL}`)
     expect(shellEnv().contributors.find(entry => entry.name === 'auth-tunnel')?.resolve().DSH_PUBLIC_URL).toBe(QUICK_URL)
-    expect(systemPrompt().sections.find(entry => entry.name === 'app:public-access')?.text()).toContain(QUICK_URL)
+    const section = systemPrompt().sections.find(entry => entry.name === 'app:public-access')
+    expect(section?.text()).toContain(QUICK_URL)
+    expect(section?.text()).toContain('shared access password')
+
   })
 
-  it('teardown kills cloudflared and releases authentication without closing the WebServer', { timeout: 60_000 }, async () => {
-    const { loaded, targetBase } = await bootQuick()
-    const base = await targetBase()
-    expect((await liveFixturePids()).length).toBe(1)
-    const entry = [...loaded.loader.entries()].find(item => item.options.name === '@deepseek-ai/dsh-auth-tunnel')!
-    await entry.fiber!.dispose()
+  it('teardown kills the cloudflared child and closes the gate', { timeout: 60_000 }, async () => {
+    const { gateBase } = await bootQuick()
+    const base = await gateBase()
+    const pidsBefore = await liveFixturePids()
+    expect(pidsBefore.length).toBe(1)
+    expect((await fetch(`${base}/dsh-auth-tunnel/login`)).status).toBe(200)
+
+    await context!.fiber.dispose()
+    context = undefined
     await sleep(100)
     expect(await liveFixturePids()).toEqual([])
-    const publicAfter = await publicFetch(base, '/after-dispose')
-    expect((await publicAfter.json() as { access: string }).access).toBe('remote')
+    await expect(fetch(`${base}/dsh-auth-tunnel/login`)).rejects.toThrow()
   })
 
-  it('escalates a stubborn cloudflared and reports unexpected exits', { timeout: 60_000 }, async () => {
+  it('escalates a stubborn cloudflared to SIGKILL after the grace', { timeout: 60_000 }, async () => {
     await bootQuick({ executable: await fixtureExecutable('fake-cloudflared-stubborn.sh') })
+    expect((await liveFixturePids()).length).toBe(1)
     await context!.fiber.dispose()
     context = undefined
     await sleep(2600)
     expect(await liveFixturePids()).toEqual([])
+  })
 
-    const composition = await bootQuick()
+  it('logs a loud error when cloudflared dies after the tunnel came up', { timeout: 60_000 }, async () => {
+    const { loaded } = await bootQuick()
     const pids = await liveFixturePids()
+    expect(pids.length).toBe(1)
     const logged: string[] = []
-    composition.loaded.logger.exporter({ export(message) { logged.push(String(message.args[0])) } })
+    loaded.logger.exporter({ export(message) { logged.push(String(message.args[0])) } })
     process.kill(Number(pids[0]!), 'SIGTERM')
+    // The fixture's TERM trap runs only after its current `sleep 1` returns.
     await sleep(1500)
-    expect(logged.some(line => line.includes(QUICK_URL) && line.includes('now dead'))).toBe(true)
+    expect(logged.some(line => line.includes('the public URL') && line.includes(QUICK_URL))).toBe(true)
   })
 })
 
-describe('activation dependencies and failures', () => {
-  async function expectBootFailure(
-    config: Record<string, unknown>,
-    pattern: RegExp,
-    options?: Pick<CompositionOptions, 'withPassword' | 'seeds'>,
-  ): Promise<void> {
+describe('activation dependencies and boot failures', () => {
+  type BootFailureOptions = { withPassword?: boolean; seeds?: Record<string, string> }
+  const expectBootFailure = async (config: Record<string, unknown>, pattern: RegExp, options?: BootFailureOptions): Promise<void> => {
     const composition = await loadComposition(config, { wait: false, ...options })
-    await expect(composition.loaded.loader.await()).rejects.toThrow(pattern)
+    const pending = composition.loaded.loader.await() as Promise<unknown>
+    await expect(pending).rejects.toThrow(pattern)
     await sleep(100)
   }
 
-  it.each([
-    ['credentials', { withCredentials: false }],
-    ['webAccess', { withWebAccess: false }],
-  ] as const)('stays pending without the %s service', { timeout: 60_000 }, async (_name, options) => {
-    const composition = await bootQuick(undefined, options)
+  it('stays pending when the composition offers no credentials service', { timeout: 60_000 }, async () => {
+    const composition = await loadComposition({
+      mode: 'quick',
+      executable: await fixtureExecutable('fake-cloudflared-quick.sh'),
+      startupTimeoutMs: 15_000,
+    }, { withCredentials: false })
     const tunnel = [...composition.loaded.loader.entries()]
       .find(entry => entry.options.name === '@deepseek-ai/dsh-auth-tunnel')
+    expect(tunnel).toBeDefined()
     expect(tunnel?.fiber?.state).toBe(0)
     expect(await liveFixturePids()).toEqual([])
   })
 
-  it('rejects missing password and contradictory quick-mode keys before leaving a child', { timeout: 60_000 }, async () => {
+  it('refuses to gate a public URL when the access password is unconfigured', { timeout: 60_000 }, async () => {
     await expectBootFailure({
-      mode: 'quick', executable: await fixtureExecutable('fake-cloudflared-quick.sh'), startupTimeoutMs: 15_000,
+      mode: 'quick',
+      executable: await fixtureExecutable('fake-cloudflared-quick.sh'),
+      startupTimeoutMs: 15_000,
     }, /credential reference "DSH_WEB_PASSWORD" is not configured/, { withPassword: false })
+    expect(await liveFixturePids()).toEqual([]) // the child never spawned
+  })
+
+  it('rejects a quick-mode row that names token-mode keys', { timeout: 60_000 }, async () => {
     await expectBootFailure({
-      mode: 'quick', tokenRef: 'DSH_TUNNEL_TOKEN', executable: await fixtureExecutable('fake-cloudflared-quick.sh'), startupTimeoutMs: 15_000,
+      mode: 'quick',
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      executable: await fixtureExecutable('fake-cloudflared-quick.sh'),
+      startupTimeoutMs: 15_000,
     }, /tokenRef and publicHostname belong to token mode/)
     expect(await liveFixturePids()).toEqual([])
   })
 
-  it('reports spawn, early-exit, and timeout failures and releases the authenticator', { timeout: 60_000 }, async () => {
-    await expectBootFailure({ mode: 'quick', executable: '/nonexistent/cloudflared', startupTimeoutMs: 15_000 }, /failed to spawn/)
+  it('fails when the executable cannot spawn', { timeout: 60_000 }, async () => {
     await expectBootFailure({
-      mode: 'quick', executable: await fixtureExecutable('fake-cloudflared-crash.sh'), startupTimeoutMs: 15_000,
-    }, /exited before the tunnel came up.*fixture fatal/s)
+      mode: 'quick',
+      executable: '/nonexistent/cloudflared',
+      startupTimeoutMs: 15_000,
+    }, /failed to spawn/)
+  })
+
+  it('fails when cloudflared exits before the tunnel comes up, with tail-bounded diagnostics', { timeout: 60_000 }, async () => {
+    const composition = await loadComposition({
+      mode: 'quick',
+      executable: await fixtureExecutable('fake-cloudflared-crash.sh'),
+      startupTimeoutMs: 15_000,
+    }, { wait: false })
+    const pending = composition.loaded.loader.await() as Promise<unknown>
+    await expect(pending).rejects.toSatisfy((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      return message.includes('exited before the tunnel came up')
+        && message.includes('fixture fatal: cannot dial the edge')
+        // 200 ERR lines of ~66 chars would be ~13k; the rolling tail keeps
+        // the failure message inside one line budget plus the prefix.
+        && message.length < 9_200
+    })
+  })
+
+  it('fails on the startup timeout and kills the silent child', { timeout: 60_000 }, async () => {
     await expectBootFailure({
-      mode: 'quick', executable: await fixtureExecutable('fake-cloudflared-silent.sh'), startupTimeoutMs: 50,
+      mode: 'quick',
+      executable: await fixtureExecutable('fake-cloudflared-silent.sh'),
+      startupTimeoutMs: 50,
     }, /produced no public URL/)
     await sleep(300)
     expect(await liveFixturePids()).toEqual([])
   })
 
-  it('runs token mode without a second origin port and validates its named-tunnel facts', { timeout: 60_000 }, async () => {
+  it('token mode: runs the named tunnel over the env-var token against the fixed gate port', { timeout: 60_000 }, async () => {
+    // Reserve one free loopback port for the gate; the dashboard ingress
+    // would point at exactly this address.
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const gatePort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+
     const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
     const composition = await loadComposition({
       mode: 'token',
       tokenRef: 'DSH_TUNNEL_TOKEN',
       publicHostname: 'gui.example.com',
+      gatePort,
       executable: await fixtureExecutable('fake-cloudflared-token.sh'),
       startupTimeoutMs: 15_000,
     }, { seeds: { DSH_TUNNEL_TOKEN: 'fixture-token' } })
     expect(consoleSpy.mock.calls.flat().join('\n')).toContain('cloudflare tunnel: https://gui.example.com')
-    expect(composition.systemPrompt().sections.find(entry => entry.name === 'app:public-access')?.text())
-      .toContain('https://gui.example.com')
+    const section = composition.systemPrompt().sections.find(entry => entry.name === 'app:public-access')
+    expect(section?.text()).toContain('https://gui.example.com')
+    // The gate really listens on exactly the configured fixed port.
+    expect((await fetch(`http://127.0.0.1:${String(gatePort)}/dsh-auth-tunnel/login`)).status).toBe(200)
+  })
+
+  it('token mode names its missing row facts: hostname, gate port, and token', { timeout: 60_000 }, async () => {
+    await expectBootFailure({
+      mode: 'token',
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      gatePort: 32_313,
+      executable: await fixtureExecutable('fake-cloudflared-token.sh'),
+      startupTimeoutMs: 15_000,
+    }, /token mode requires publicHostname/, { seeds: { DSH_TUNNEL_TOKEN: 'fixture-token' } })
 
     await expectBootFailure({
-      mode: 'token', tokenRef: 'DSH_TUNNEL_TOKEN', executable: await fixtureExecutable('fake-cloudflared-token.sh'), startupTimeoutMs: 15_000,
-    }, /token mode requires publicHostname/, { seeds: { DSH_TUNNEL_TOKEN: 'fixture-token' } })
+      mode: 'token',
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
+      executable: await fixtureExecutable('fake-cloudflared-token.sh'),
+      startupTimeoutMs: 15_000,
+    }, /token mode requires gatePort/, { seeds: { DSH_TUNNEL_TOKEN: 'fixture-token' } })
+
     await expectBootFailure({
-      mode: 'token', tokenRef: 'DSH_TUNNEL_TOKEN', publicHostname: 'gui.example.com', executable: await fixtureExecutable('fake-cloudflared-token.sh'), startupTimeoutMs: 15_000,
-    }, /credential reference "DSH_TUNNEL_TOKEN" is not configured/)
+      mode: 'token',
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
+      gatePort: 32_309,
+      executable: await fixtureExecutable('fake-cloudflared-token.sh'),
+      startupTimeoutMs: 15_000,
+    }, /credential reference \"DSH_TUNNEL_TOKEN\" is not configured/)
   })
 })
 
 describe('bundle patch', () => {
-  it('inserts the auth-tunnel row into profiles that do not already contain it', async () => {
+  it('inserts the auth-tunnel row into a stock Web profile', async () => {
     const patch = await readFile(fileURLToPath(new URL('../cordis.patch.yml', import.meta.url)), 'utf8')
     expect(patch).toContain([
       '- insert:',
+      '    - id: directory-picker-browse',
+      "      name: '@deepseek-ai/dsh-host-directory-picker-browse'",
+      '    - id: ui-directory-picker-browse',
+      "      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'",
       '    - id: auth-tunnel',
       "      name: '@deepseek-ai/dsh-auth-tunnel'",
     ].join('\n'))
+    expect(patch).not.toMatch(/^- id: auth-tunnel$/m)
   })
 })

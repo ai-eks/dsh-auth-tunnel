@@ -1,6 +1,6 @@
 #!/bin/sh
 # Fixture cloudflared, quick mode: records its pid, echoes the --url target it
-# was pointed at (the existing WebServer), overruns the plugin's rolling output
+# was pointed at (the password gate), overruns the plugin's rolling output
 # tail, then prints a trycloudflare URL in cloudflared's box format and idles
 # until terminated.
 echo $$ > "${TMPDIR:-/tmp}/fake-cloudflared-$$.pid"
