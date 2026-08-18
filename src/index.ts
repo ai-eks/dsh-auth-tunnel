@@ -89,22 +89,29 @@ export const AUTH_TUNNEL_SETTINGS_NAMESPACE = settingsNamespace('auth-tunnel')
 export const inject = ['webServer', 'credentials', 'settings']
 
 const PUBLIC_HOSTNAME_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i
+const SESSION_TTL_MS_PER_HOUR = 3_600_000
+const MAX_SESSION_TTL_HOURS = Math.floor((Number.MAX_SAFE_INTEGER - Date.now()) / SESSION_TTL_MS_PER_HOUR)
+const MAX_TIMER_DELAY_MS = 2_147_483_647
 
 export const Config: z<InternalConfig> = z.object({
   enabled: z.boolean().default(true),
   allowRemoteSettings: z.boolean().default(false),
   passwordRef: z.string().min(1).role('credential-ref').default('DSH_WEB_PASSWORD'),
-  sessionTtlHours: z.number().min(0.01).default(720),
+  sessionTtlHours: z.number().min(0.01).max(MAX_SESSION_TTL_HOURS).default(720),
   mode: z.union(['quick', 'token']).default('quick'),
   tokenRef: z.string().min(1).role('credential-ref'),
   publicHostname: z.string().min(1).pattern(PUBLIC_HOSTNAME_PATTERN),
   gatePort: z.number().step(1).min(0).max(65535).default(0),
   executable: z.string().min(1).default('cloudflared'),
-  startupTimeoutMs: z.number().step(1).min(1).default(15_000),
+  startupTimeoutMs: z.number().step(1).min(1).max(MAX_TIMER_DELAY_MS).default(15_000),
 })
 
 /** Reject mode combinations that the field-level schema cannot express. */
 export function validateConfig(config: Config): void {
+  const sessionExpiry = Math.floor(Date.now() + config.sessionTtlHours * SESSION_TTL_MS_PER_HOUR)
+  if (!Number.isSafeInteger(sessionExpiry)) {
+    throw new Error('auth-tunnel: sessionTtlHours exceeds the verifiable expiration range')
+  }
   if (!config.enabled) return
   if (config.mode !== 'token') return
   if (config.tokenRef === undefined) {
@@ -195,7 +202,7 @@ async function sessionKey(ctx: Context, ref: string): Promise<Buffer | undefined
 
 /** Mint the session cookie value: version, absolute expiry, and the HMAC over both. */
 function mintCookie(key: Buffer, ttlMs: number): string {
-  const expiry = Date.now() + ttlMs
+  const expiry = Math.floor(Date.now() + ttlMs)
   const mac = createHmac('sha256', key).update(`dsh-auth-tunnel/v1/${String(expiry)}`).digest('base64url')
   return `v1.${String(expiry)}.${mac}`
 }
@@ -1313,7 +1320,11 @@ class AuthTunnelRuntime {
         if (!candidate.alive) {
           const restored = this.restorePreviousAfterFailedHandoff(candidate, previous)
           await this.stop(candidate)
-          if (!restored) await this.stop(previous)
+          if (!restored) {
+            this.active = undefined
+            this.publish(undefined)
+            await this.stop(previous)
+          }
           return
         }
         await this.stop(previous)

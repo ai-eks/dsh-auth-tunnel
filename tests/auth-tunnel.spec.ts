@@ -21,6 +21,7 @@ import Include from '@deepseek-ai/cordis-plugin-include'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { SettingsProvider, settingsNamespace, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
+import { Config } from '../src/index.ts'
 
 /** Minimal in-memory credentials service for the composition (rotate via set). */
 class StubCredentials extends Service {
@@ -1365,6 +1366,11 @@ describe('activation dependencies and boot failures', () => {
     await sleep(100)
   }
 
+  it('rejects timer values that Node or the session verifier cannot represent', () => {
+    expect(() => Config({ sessionTtlHours: 3_000_000_000 })).toThrow()
+    expect(() => Config({ startupTimeoutMs: 2_147_483_648 })).toThrow()
+  })
+
   it('stays pending when the composition offers no credentials service', { timeout: 60_000 }, async () => {
     const composition = await loadComposition({
       mode: 'quick',
@@ -1886,6 +1892,47 @@ describe('rc7 plugin settings', () => {
     expect(await liveFixturePids()).toEqual(originalPids)
     expect((await fetch(`${base}/dsh-auth-tunnel/login`)).status).toBe(200)
     expect(composition.shellEnv().contributors[0]?.resolve().DSH_PUBLIC_URL).toBe(QUICK_URL)
+  })
+
+  it('rebuilds the gate after both sides of a gate-port handoff die', { timeout: 60_000 }, async () => {
+    const quickExecutable = await fixtureExecutable('fake-cloudflared-quick.sh')
+    const crashingExecutable = await fixtureExecutable('fake-cloudflared-ready-crash.sh')
+    const composition = await bootQuick({ executable: quickExecutable })
+    const [previousPid] = await liveFixturePids()
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const nextPort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+
+    await composition.settings().update(namespace, {
+      gatePort: nextPort,
+      executable: crashingExecutable,
+    })
+    await waitForStatus(
+      composition,
+      status => status.phase === 'running' && status.publicUrl?.includes('ready-then-crash') === true,
+    )
+    process.kill(Number(previousPid), 'SIGTERM')
+    const failed = await waitForStatus(
+      composition,
+      status => status.phase === 'error' && !status.running,
+      7000,
+    )
+    const stoppedDeadline = Date.now() + 6000
+    while ((await liveFixturePids()).length !== 0) {
+      if (Date.now() >= stoppedDeadline) throw new Error('failed gate handoff did not stop both tunnels')
+      await sleep(25)
+    }
+
+    await composition.settings().update(namespace, { executable: quickExecutable })
+    await waitForStatus(
+      composition,
+      status => status.revision > failed.revision && status.phase === 'running',
+      7000,
+    )
+    expect((await fetch(`http://127.0.0.1:${String(nextPort)}/dsh-auth-tunnel/login`)).status).toBe(200)
   })
 
   it('waits safely when no settings provider is mounted', { timeout: 60_000 }, async () => {

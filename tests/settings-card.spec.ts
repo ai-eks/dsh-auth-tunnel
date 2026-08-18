@@ -69,6 +69,12 @@ describe('auth-tunnel settings card contract', () => {
       publicHostname: 'gui.example.com',
       gatePort: 32_309,
     })).toEqual({})
+    expect(validateSettingsValues({ ...quick, sessionTtlHours: 3_000_000_000 })).toEqual({
+      sessionTtlHours: 'invalidNumber',
+    })
+    expect(validateSettingsValues({ ...quick, startupTimeoutMs: 2_147_483_648 })).toEqual({
+      startupTimeoutMs: 'invalidInteger',
+    })
   })
 
   it('commits a disable plus configuration switch as one revision-fenced mutation', async () => {
@@ -353,6 +359,35 @@ describe('auth-tunnel settings card contract', () => {
     expect(store.getSnapshot()).toMatchObject({ revision: 4, value: { sessionTtlHours: 24 } })
     expect(notifications).toBe(2)
     dispose()
+    store.dispose()
+  })
+
+  it('makes the remote scope read-only after it revokes its own access', async () => {
+    const document = (allowRemoteSettings: boolean) => parseRemoteSettingsDocument({
+      settings: {
+        value: { ...quick, allowRemoteSettings },
+        base: quick,
+        user: { allowRemoteSettings },
+        revision: allowRemoteSettings ? 3 : 4,
+        writable: true,
+      },
+    })
+    const store = new RemoteSettingsStore({
+      read: vi.fn(() => Promise.resolve(document(true))),
+      commit: vi.fn(() => Promise.resolve(document(false))),
+    })
+
+    await store.refresh()
+    await store.commit({
+      expectedRevision: 3,
+      writes: [{ field: 'allowRemoteSettings', op: 'set', value: false }],
+      password: '',
+    })
+
+    expect(store.getSnapshot()).toMatchObject({
+      status: 'ready', revision: 4, writable: false, value: { allowRemoteSettings: false },
+    })
+    expect(store.getDocument()?.snapshot.writable).toBe(false)
     store.dispose()
   })
 

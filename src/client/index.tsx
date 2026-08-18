@@ -247,6 +247,8 @@ const DEFAULT_VALUES: Record<FieldKey, string | number | boolean | undefined> = 
 }
 
 const PUBLIC_HOSTNAME_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i
+const MAX_SESSION_TTL_HOURS = Math.floor((Number.MAX_SAFE_INTEGER - Date.now()) / 3_600_000)
+const MAX_TIMER_DELAY_MS = 2_147_483_647
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -452,7 +454,9 @@ function parseDraft(draft: Draft): AuthTunnelSettings {
 export function validateSettingsValues(value: AuthTunnelSettings): Partial<Record<FieldKey, ValidationIssue>> {
   const errors: Partial<Record<FieldKey, ValidationIssue>> = {}
   if (value.passwordRef === '') errors.passwordRef = 'required'
-  if (!Number.isFinite(value.sessionTtlHours) || value.sessionTtlHours < 0.01) {
+  if (!Number.isFinite(value.sessionTtlHours)
+    || value.sessionTtlHours < 0.01
+    || value.sessionTtlHours > MAX_SESSION_TTL_HOURS) {
     errors.sessionTtlHours = 'invalidNumber'
   }
   if (value.mode !== 'quick' && value.mode !== 'token') errors.mode = 'required'
@@ -463,7 +467,9 @@ export function validateSettingsValues(value: AuthTunnelSettings): Partial<Recor
     errors.gatePort = 'invalidInteger'
   }
   if (value.executable === '') errors.executable = 'required'
-  if (!Number.isInteger(value.startupTimeoutMs) || value.startupTimeoutMs < 1) {
+  if (!Number.isInteger(value.startupTimeoutMs)
+    || value.startupTimeoutMs < 1
+    || value.startupTimeoutMs > MAX_TIMER_DELAY_MS) {
     errors.startupTimeoutMs = 'invalidInteger'
   }
   if (value.enabled && value.mode === 'token') {
@@ -630,8 +636,11 @@ export class RemoteSettingsStore {
     try {
       const document = await this.transport.commit(request)
       if (!this.disposed) {
-        this.document = document
-        this.publish(document.snapshot)
+        const committed = document.snapshot.value?.allowRemoteSettings === false
+          ? { ...document, snapshot: { ...document.snapshot, writable: false } }
+          : document
+        this.document = committed
+        this.publish(committed.snapshot)
       }
     } catch (error) {
       await this.refresh()
