@@ -43,6 +43,9 @@ class StubCredentials extends Service {
   /** Test knob: make every resolve throw (per-request error containment). */
   fault = false
 
+  /** Test knob: reject the next credential write before it changes storage. */
+  failNextSet = false
+
   /** Test knob: hold credential resolution before startup creates a controller. */
   resolveDelayMs = 0
 
@@ -54,6 +57,10 @@ class StubCredentials extends Service {
 
   /** Test knob: set or delete one credential. */
   set(ref: string, value: string | undefined): void {
+    if (this.failNextSet) {
+      this.failNextSet = false
+      throw new Error('credential persistence failed')
+    }
     if (value === undefined) {
       this.values.delete(ref)
     } else {
@@ -626,7 +633,7 @@ describe('password gate over the loopback webserver', () => {
       }),
     })
 
-    expect(response.status).toBe(409)
+    expect(response.status).toBe(401)
     expect(await composition.credentials().resolve('ALT_WEB_PASSWORD'))
       .toMatchObject({ value: 'alternate-password' })
   })
@@ -652,6 +659,31 @@ describe('password gate over the loopback webserver', () => {
 
     expect(response.status).toBe(409)
     expect(await composition.credentials().resolve('NEW_REMOTE_PASSWORD')).toBeUndefined()
+  })
+
+  it('rolls back remote settings when the credential write fails', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    composition.credentials().failNextSet = true
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+        password: 'replacement-password',
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).sessionTtlHours).toBe(720)
+    expect(await composition.credentials().resolve('DSH_WEB_PASSWORD'))
+      .toMatchObject({ value: 's3kret-passw0rd' })
   })
 
   it('rejects a remote save that rotates the active password and tunnel route together', { timeout: 60_000 }, async () => {
@@ -1270,6 +1302,40 @@ describe('upgrade pass-through', () => {
     socket.destroy()
   })
 
+  it('closes upgraded sockets before disabling the gate', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick()
+    composition.loaded.webServer.registerUpgrade({
+      path: '/events',
+      handler: (_req, socket) => {
+        socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: dsh-echo\r\nConnection: Upgrade\r\n\r\n')
+      },
+    })
+    const base = await composition.gateBase()
+    const port = Number(new URL(base).port)
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const socket = connect(port, '127.0.0.1')
+    socket.on('error', () => {})
+    await once(socket, 'connect')
+    socket.write([
+      'GET /events HTTP/1.1',
+      `Host: 127.0.0.1:${String(port)}`,
+      'Connection: Upgrade',
+      'Upgrade: dsh-echo',
+      `Cookie: ${cookie}`,
+      '',
+      '',
+    ].join('\r\n'))
+    const [head] = await once(socket, 'data') as [Buffer]
+    expect(String(head)).toContain('101 Switching Protocols')
+    const closed = once(socket, 'close').then(() => 'closed')
+
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
+
+    expect(await Promise.race([closed, sleep(3000).then(() => 'timeout')])).toBe('closed')
+    await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
+    expect(socket.destroyed).toBe(true)
+  })
+
   it('closes upgrades on the retained gate after a passwordRef update fails', { timeout: 60_000 }, async () => {
     const composition = await bootQuick()
     composition.loaded.webServer.registerUpgrade({
@@ -1297,12 +1363,10 @@ describe('upgrade pass-through', () => {
     const [head] = await once(socket, 'data') as [Buffer]
     expect(String(head)).toContain('101 Switching Protocols')
 
-    await composition.settings().update(settingsNamespace('auth-tunnel'), { passwordRef: 'MISSING_PASSWORD' })
-    await waitForStatus(composition, status => status.phase === 'error' && status.running)
     const closed = once(socket, 'close').then(() => 'closed')
-    composition.credentials().set('DSH_WEB_PASSWORD', 'rotated-password')
-
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { passwordRef: 'MISSING_PASSWORD' })
     const outcome = await Promise.race([closed, sleep(750).then(() => 'timeout')])
+    await waitForStatus(composition, status => status.phase === 'error' && status.running)
     socket.destroy()
     expect(outcome).toBe('closed')
   })
@@ -1844,9 +1908,14 @@ describe('rc7 plugin settings', () => {
     )
     expect(failed).toMatchObject({ running: true, publicUrl: QUICK_URL })
     expect(failed.message).toContain('MISSING_PASSWORD')
-    await login(base, undefined, 'next-settings-password')
+    const unavailable = await fetch(`${base}/dsh-auth-tunnel/login`, {
+      method: 'POST', redirect: 'manual',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'password=next-settings-password',
+    })
+    expect(unavailable.status).toBe(503)
 
-    expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
+    expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(401)
     composition.credentials().set('MISSING_PASSWORD', 'repaired-password')
     await waitForStatus(
       composition,
@@ -2109,6 +2178,37 @@ describe('rc7 plugin settings', () => {
     expect(response.status).toBe(401)
     expect(await composition.credentials().resolve('ALT_WEB_PASSWORD'))
       .toMatchObject({ value: 'alternate-password' })
+  })
+
+  it('switches every live gate to a newly committed password reference immediately', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick(undefined, {
+      seeds: { ALT_WEB_PASSWORD: 'alternate-password' },
+    })
+    const previousGate = await composition.gateBase()
+    const cookie = (await login(previousGate)).get('set-cookie')!.split(';', 1)[0]!
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const nextPort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const before = await composition.runtimeStatus()
+
+    await composition.settings().update(namespace, { gatePort: nextPort })
+    await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'running',
+    )
+    expect(await liveFixturePids()).toHaveLength(2)
+
+    await composition.settings().update(namespace, { passwordRef: 'ALT_WEB_PASSWORD' })
+
+    expect((await fetch(`${previousGate}/dsh-auth-tunnel/status`, { headers: { cookie } })).status).toBe(401)
+    expect((await fetch(`http://127.0.0.1:${String(nextPort)}/dsh-auth-tunnel/status`, {
+      headers: { cookie },
+    })).status).toBe(401)
+    await login(previousGate, undefined, 'alternate-password')
+    await login(`http://127.0.0.1:${String(nextPort)}`, undefined, 'alternate-password')
   })
 
   it('serializes password rotations across both gates during a port handoff', { timeout: 60_000 }, async () => {

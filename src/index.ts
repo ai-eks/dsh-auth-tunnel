@@ -547,6 +547,7 @@ class PasswordGate {
   private auth: { passwordRef: string; ttlMs: number; allowRemoteSettings: boolean }
   private authGeneration = 0
   private readonly upgradeDrops = new Set<() => void>()
+  private readonly upgradeSockets = new Set<Duplex>()
 
   constructor(
     private readonly ctx: Context,
@@ -575,7 +576,13 @@ class PasswordGate {
   /** Drop upgraded connections authenticated with the previous credential value. */
   revokeAuthenticatedUpgrades(): void {
     this.authGeneration += 1
+    this.closeUpgradedConnections()
+  }
+
+  /** Close every upgraded socket before its gate server is shut down. */
+  closeUpgradedConnections(): void {
     for (const drop of [...this.upgradeDrops]) drop()
+    for (const socket of [...this.upgradeSockets]) socket.destroy()
   }
 
   /** Revoke the settings surface immediately without disturbing ordinary sessions. */
@@ -633,6 +640,8 @@ class PasswordGate {
       })
     })
     server.on('upgrade', (req, socket, head) => {
+      this.upgradeSockets.add(socket)
+      socket.once('close', () => { this.upgradeSockets.delete(socket) })
       void this.handleUpgrade(req, socket, head).catch(() => {
         socket.destroy()
       })
@@ -810,9 +819,14 @@ class PasswordGate {
           }
           if (!current.allowRemoteSettings) throw new Error('remote settings disabled')
           await this.requireRemoteMutationAuthorization(req)
+          let rollbackSettings: (() => Promise<void>) | undefined
           if (request.writes.length !== 0) {
             const settings = this.ctx.get('settings')
             if (settings === undefined) throw new Error('settings service is unavailable')
+            const openedUser = opened.user === undefined ? {} : objectRecord(opened.user)
+            const rollbackWrites = request.writes.map((write): RemoteSettingsWrite => Object.hasOwn(openedUser, write.field)
+              ? { field: write.field, op: 'set', value: openedUser[write.field] }
+              : { field: write.field, op: 'unset' })
             const ops: SettingsPathOp[] = request.writes.map(write => write.op === 'set'
               ? { op: 'set', path: [write.field], value: write.value }
               : { op: 'unset', path: [write.field] })
@@ -825,9 +839,28 @@ class PasswordGate {
             if (request.writes.some(write => !settingsWriteSatisfied(committed, write))) {
               throw new Error('settings write was not committed')
             }
+            rollbackSettings = async () => {
+              const rollbackOps: SettingsPathOp[] = rollbackWrites.map(write => write.op === 'set'
+                ? { op: 'set', path: [write.field], value: write.value }
+                : { op: 'unset', path: [write.field] })
+              await settings.mutate(
+                AUTH_TUNNEL_SETTINGS_NAMESPACE,
+                rollbackOps,
+                committed.revision,
+              )
+              const restored = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE).descriptor
+              if (rollbackWrites.some(write => !settingsWriteSatisfied(restored, write))) {
+                throw new Error('settings rollback was not committed')
+              }
+            }
           }
           if (password !== '') {
-            await this.ctx.credentials.set(credentialRef(target.passwordRef), password)
+            try {
+              await this.ctx.credentials.set(credentialRef(target.passwordRef), password)
+            } catch (error) {
+              await rollbackSettings?.()
+              throw error
+            }
           }
           await writeJsonComplete(res, 200, remoteSettingsDocument(this.ctx))
         } catch (error) {
@@ -1248,6 +1281,17 @@ class AuthTunnelRuntime {
   /** Coalesce scalar settings writes, then reconcile only the latest snapshot. */
   request(config: InternalConfig): void {
     if (this.disposed) return
+    if (this.configured !== undefined && this.configured.passwordRef !== config.passwordRef) {
+      for (const gate of this.liveGates) gate.updateAuth(config)
+      if (this.active !== undefined) {
+        this.active.config = {
+          ...this.active.config,
+          passwordRef: config.passwordRef,
+          sessionTtlHours: config.sessionTtlHours,
+          allowRemoteSettings: config.allowRemoteSettings,
+        }
+      }
+    }
     if (!config.enabled) {
       this.stagedStartup?.abort()
       const handoff = this.finishHandoff
@@ -1569,6 +1613,7 @@ class AuthTunnelRuntime {
         alive: true,
       }
     } catch (error) {
+      gate.closeUpgradedConnections()
       this.liveGates.delete(gate)
       await closeGate(server)
       throw error
@@ -1592,9 +1637,14 @@ class AuthTunnelRuntime {
       candidate.alive = false
     }
     if (!candidate.alive) return false
-    const allowRemoteSettings = this.configured?.allowRemoteSettings ?? candidate.config.allowRemoteSettings
-    if (candidate.config.allowRemoteSettings !== allowRemoteSettings) {
-      candidate.config = { ...candidate.config, allowRemoteSettings }
+    const auth = this.configured
+    if (auth !== undefined) {
+      candidate.config = {
+        ...candidate.config,
+        passwordRef: auth.passwordRef,
+        sessionTtlHours: auth.sessionTtlHours,
+        allowRemoteSettings: auth.allowRemoteSettings,
+      }
     }
     candidate.gate.updateAuth(candidate.config)
     this.active = candidate
@@ -1669,6 +1719,7 @@ class AuthTunnelRuntime {
   }
 
   private async stop(active: ActiveTunnel): Promise<void> {
+    active.gate.closeUpgradedConnections()
     this.liveGates.delete(active.gate)
     await Promise.all([this.stopChild(active), closeGate(active.server)])
   }
