@@ -760,6 +760,40 @@ describe('password gate over the loopback webserver', () => {
       .toMatchObject({ value: 'local-admin-password' })
   })
 
+  it('rolls back passwordless remote settings when the authorizing credential changes during persistence', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    let releasePersist = (): void => {}
+    composition.settings().persistBarrier = new Promise<void>((resolve) => { releasePersist = resolve })
+    let markPersistStarted = (): void => {}
+    const persistStarted = new Promise<void>((resolve) => { markPersistStarted = resolve })
+    composition.settings().persistStarted = markPersistStarted
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+        password: '',
+      }),
+    })
+    await persistStarted
+    composition.credentials().set('DSH_WEB_PASSWORD', 'local-admin-password')
+    composition.settings().persistStarted = undefined
+    composition.settings().persistBarrier = undefined
+    releasePersist()
+
+    expect((await responseTask).status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).sessionTtlHours).toBe(720)
+    expect(await composition.credentials().resolve('DSH_WEB_PASSWORD'))
+      .toMatchObject({ value: 'local-admin-password' })
+  })
+
   it('fences the credential that authorized a reference-changing remote save', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     const base = await composition.gateBase()
@@ -792,6 +826,41 @@ describe('password gate over the loopback webserver', () => {
     expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
     expect(await composition.credentials().resolve('DSH_WEB_PASSWORD'))
       .toMatchObject({ value: 'local-admin-password' })
+    expect(await composition.credentials().resolve('NEXT_WEB_PASSWORD')).toBeUndefined()
+  })
+
+  it('rolls back a passwordless reference change when the target credential is deleted during persistence', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true }, {
+      seeds: { NEXT_WEB_PASSWORD: 'next-password' },
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    let releasePersist = (): void => {}
+    composition.settings().persistBarrier = new Promise<void>((resolve) => { releasePersist = resolve })
+    let markPersistStarted = (): void => {}
+    const persistStarted = new Promise<void>((resolve) => { markPersistStarted = resolve })
+    composition.settings().persistStarted = markPersistStarted
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' }],
+        password: '',
+      }),
+    })
+    await persistStarted
+    composition.credentials().set('NEXT_WEB_PASSWORD', undefined)
+    composition.settings().persistStarted = undefined
+    composition.settings().persistBarrier = undefined
+    releasePersist()
+
+    expect((await responseTask).status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
     expect(await composition.credentials().resolve('NEXT_WEB_PASSWORD')).toBeUndefined()
   })
 

@@ -883,22 +883,22 @@ class PasswordGate {
               }
             }
           }
-          if (password !== '') {
-            try {
-              const latest = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
-              if (!latest.writable) throw new Error('settings provider is read-only')
-              if (latest.descriptor.revision !== credentialRevision) throw new Error('settings revision changed')
-              if (this.credentialGeneration(current.passwordRef) !== authorizationCredentialGeneration) {
-                throw new Error('authorizing access password credential changed')
-              }
-              if (this.credentialGeneration(target.passwordRef) !== credentialGeneration) {
-                throw new Error('access password credential changed')
-              }
-              await this.ctx.credentials.set(credentialRef(target.passwordRef), password)
-            } catch (error) {
-              await rollbackSettings?.()
-              throw error
+          try {
+            const latest = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
+            if (!latest.writable) throw new Error('settings provider is read-only')
+            if (latest.descriptor.revision !== credentialRevision) throw new Error('settings revision changed')
+            if (this.credentialGeneration(current.passwordRef) !== authorizationCredentialGeneration) {
+              throw new Error('authorizing access password credential changed')
             }
+            if (this.credentialGeneration(target.passwordRef) !== credentialGeneration) {
+              throw new Error('access password credential changed')
+            }
+            if (password !== '') {
+              await this.ctx.credentials.set(credentialRef(target.passwordRef), password)
+            }
+          } catch (error) {
+            await rollbackSettings?.()
+            throw error
           }
           await writeJsonComplete(res, 200, remoteSettingsDocument(this.ctx))
         } catch (error) {
