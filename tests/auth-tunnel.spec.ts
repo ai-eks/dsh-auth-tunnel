@@ -1142,6 +1142,31 @@ describe('rc7 plugin settings', () => {
     expect((await fetch(`${await composition.gateBase()}/dsh-auth-tunnel/login`)).status).toBe(200)
   })
 
+  it('keeps the previous public path alive for the runtime-status handoff', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick()
+    const previousGate = await composition.gateBase()
+    const cookie = (await login(previousGate)).get('set-cookie')!.split(';', 1)[0]!
+    const before = await composition.runtimeStatus()
+
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const nextPort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+
+    await composition.settings().update(namespace, { gatePort: nextPort })
+    await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'running',
+    )
+    expect((await fetch(`${previousGate}/dsh-auth-tunnel/status`, { headers: { cookie } })).status).toBe(200)
+    expect((await fetch(`http://127.0.0.1:${String(nextPort)}/dsh-auth-tunnel/login`)).status).toBe(200)
+
+    await sleep(900)
+    await expect(fetch(`${previousGate}/dsh-auth-tunnel/status`, { headers: { cookie } })).rejects.toThrow()
+  })
+
   it('keeps the old tunnel when a live process rebuild fails', { timeout: 60_000 }, async () => {
     const quickExecutable = await fixtureExecutable('fake-cloudflared-quick.sh')
     const silentExecutable = await fixtureExecutable('fake-cloudflared-silent.sh')

@@ -150,6 +150,7 @@ const AUTH_COOKIE = 'dsh_auth_tunnel'
 const MAX_LOGIN_BODY_BYTES = 16 * 1024
 const OUTPUT_TAIL_CHARS = 8192
 const KILL_GRACE_MS = 2000
+const TUNNEL_HANDOFF_MS = 750
 const QUICK_URL_PATTERN = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',
@@ -872,8 +873,13 @@ class AuthTunnelRuntime {
       }
       const previous = this.active
       this.adopt(candidate)
-      if (previous !== undefined) await this.stop(previous)
       this.setStatus('running', true, candidate.publicUrl)
+      // Keep the old public path alive long enough for its page to observe the
+      // new runtime URL before the browser's current tunnel is retired.
+      if (previous !== undefined) {
+        await new Promise<void>(resolve => { setTimeout(resolve, TUNNEL_HANDOFF_MS) })
+        await this.stop(previous)
+      }
       return
     }
 
@@ -900,8 +906,11 @@ class AuthTunnelRuntime {
       }
       candidate.gate.updateAuth(next)
       this.adopt(candidate)
-      if (previous !== undefined) await this.stopChild(previous)
       this.setStatus('running', true, candidate.publicUrl)
+      if (previous !== undefined) {
+        await new Promise<void>(resolve => { setTimeout(resolve, TUNNEL_HANDOFF_MS) })
+        await this.stopChild(previous)
+      }
       return
     }
 

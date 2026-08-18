@@ -4,6 +4,9 @@ import { useState, useSyncExternalStore, type CSSProperties } from 'react'
 import type {
   ClientContext, SettingsScope, SettingsScopeSnapshot,
 } from '@deepseek-ai/dsh-client-runtime/client'
+import type {
+  ConnectionHandle, IApiClient, SettingsNamespaceView, SettingsPathOpView,
+} from '@deepseek-ai/dsh-api-remotes/client'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only service and slot declarations. Cross-plugin behavior stays on
 // Cordis services, so the lazy client bundle imports no plugin implementation.
@@ -43,7 +46,7 @@ const zh: Record<LocaleKey, string> = {
   description: '通过 Cloudflare Tunnel 为 Web GUI 提供密码保护的公网访问。',
   unsaved: '未保存',
   readOnly: '当前设置存储为只读。',
-  live: '保存后自动应用，无需重启 DeepSeek Harness。隧道级变更可能短暂切换；Token 模式的 Gate 端口仍需与 Cloudflare ingress 一致。',
+  live: '保存后自动应用，无需重启 DeepSeek Harness。隧道级变更会短暂交接；若正在通过公网地址操作，请在切换后打开显示的新地址。Token 模式的 Gate 端口仍需与 Cloudflare ingress 一致。',
   enabled: '启用公网隧道',
   enabledHint: '保存后立即启动或停止密码门和 cloudflared，设置卡片会继续保留。',
   enabledOn: '开启',
@@ -79,7 +82,7 @@ const zh: Record<LocaleKey, string> = {
   discard: '放弃修改',
   save: '保存更改',
   saving: '保存中…',
-  saveFailed: '设置没有完整保存，已重新读取 Host 状态，请检查后重试。',
+  saveFailed: '设置未保存，请检查配置或是否已在其他页面修改，然后重试。',
   required: '此项不能为空。',
   invalidNumber: '请输入有效数字。',
   invalidInteger: '请输入范围内的整数。',
@@ -94,7 +97,7 @@ const en: Record<LocaleKey, string> = {
   description: 'Password-gated public access to the Web GUI through Cloudflare Tunnel.',
   unsaved: 'Unsaved',
   readOnly: 'This deployment stores settings read-only.',
-  live: 'Saved changes apply automatically without restarting DeepSeek Harness. Tunnel-level changes may switch briefly; the Token-mode gate port must still match Cloudflare ingress.',
+  live: 'Saved changes apply automatically without restarting DeepSeek Harness. Tunnel-level changes use a brief handoff; when connected through the public tunnel, open the newly displayed URL after a switch. The Token-mode gate port must still match Cloudflare ingress.',
   enabled: 'Enable public tunnel',
   enabledHint: 'Saving starts or stops the password gate and cloudflared immediately while keeping this card available.',
   enabledOn: 'On',
@@ -130,7 +133,7 @@ const en: Record<LocaleKey, string> = {
   discard: 'Discard',
   save: 'Save changes',
   saving: 'Saving…',
-  saveFailed: 'The settings were not fully saved. Host state was reloaded; check the values and retry.',
+  saveFailed: 'The settings were not saved. Check the configuration or concurrent edits, then retry.',
   required: 'This field is required.',
   invalidNumber: 'Enter a valid number.',
   invalidInteger: 'Enter an integer in range.',
@@ -251,6 +254,8 @@ function sameRuntimeStatus(left: RuntimeStatusSnapshot, right: RuntimeStatusSnap
 /** Polling external store used directly by useSyncExternalStore. */
 export class RuntimeStatusStore {
   private snapshot = INITIAL_RUNTIME_STATUS
+  private reliable = false
+  private pendingAfterRevision: number | undefined
   private readonly listeners = new Set<() => void>()
   private timer: ReturnType<typeof setTimeout> | undefined
   private task: Promise<void> | undefined
@@ -282,6 +287,20 @@ export class RuntimeStatusStore {
     return this.task
   }
 
+  /** Reflect one committed settings write while the Host runtime reconciles it. */
+  settingsCommitted(enabled: boolean): void {
+    this.reliable = true
+    this.pendingAfterRevision = this.snapshot.revision
+    this.publish(enabled
+      ? {
+          phase: 'applying',
+          running: this.snapshot.running,
+          revision: this.snapshot.revision,
+          ...(this.snapshot.publicUrl === undefined ? {} : { publicUrl: this.snapshot.publicUrl }),
+        }
+      : { phase: 'stopped', running: false, revision: this.snapshot.revision })
+  }
+
   dispose(): void {
     this.disposed = true
     this.listeners.clear()
@@ -293,9 +312,22 @@ export class RuntimeStatusStore {
     let next: RuntimeStatusSnapshot
     try {
       next = await this.read()
+      if (this.pendingAfterRevision !== undefined) {
+        if (next.revision <= this.pendingAfterRevision) return
+        this.pendingAfterRevision = undefined
+      }
+      this.reliable = true
     } catch {
+      // Tunnel replacement can briefly interrupt the route used by a public
+      // browser. Keep the last confirmed/committed state instead of flashing
+      // an unavailable badge after every single failed poll.
+      if (this.reliable) return
       next = { phase: 'unavailable', running: false, revision: this.snapshot.revision }
     }
+    this.publish(next)
+  }
+
+  private publish(next: RuntimeStatusSnapshot): void {
     if (sameRuntimeStatus(this.snapshot, next)) return
     this.snapshot = next
     for (const listener of this.listeners) listener()
@@ -389,25 +421,6 @@ export function validateSettingsValues(value: AuthTunnelSettings): Partial<Recor
   return errors
 }
 
-/**
- * Keep every intermediate Host section valid while switching modes or
- * activation: disable first, and enable only after the target config is valid.
- */
-export function orderSettingsWrites(
-  writes: readonly SettingsWrite[],
-  target: Pick<AuthTunnelSettings, 'enabled' | 'mode'>,
-): SettingsWrite[] {
-  return [...writes].sort((left, right) => {
-    const rank = (write: SettingsWrite): number => {
-      if (write.field === 'enabled') return target.enabled ? 2 : -2
-      if (!target.enabled) return 0
-      if (write.field !== 'mode') return 0
-      return target.mode === 'quick' ? -1 : 1
-    }
-    return rank(left) - rank(right)
-  })
-}
-
 function savePlan(draft: Draft, target: AuthTunnelSettings): SettingsWrite[] {
   const writes: SettingsWrite[] = []
   for (const field of FIELD_KEYS) {
@@ -424,13 +437,33 @@ function savePlan(draft: Draft, target: AuthTunnelSettings): SettingsWrite[] {
       writes.push({ field, op: 'set', value })
     }
   }
-  return orderSettingsWrites(writes, target)
+  return writes
 }
 
-function writeSatisfied(snapshot: SettingsScopeSnapshot<AuthTunnelSettings>, write: SettingsWrite): boolean {
-  const user = record(snapshot.user)
+function writeSatisfied(source: { user?: unknown }, write: SettingsWrite): boolean {
+  const user = record(source.user)
   if (write.op === 'unset') return !Object.hasOwn(user, write.field)
   return Object.hasOwn(user, write.field) && Object.is(user[write.field], write.value)
+}
+
+type SettingsApi = Pick<IApiClient, 'settings'>
+
+/** Commit the whole edited form in one revision-fenced Host mutation. */
+export async function commitSettingsWrites(
+  api: SettingsApi,
+  revision: number | undefined,
+  writes: readonly SettingsWrite[],
+): Promise<SettingsNamespaceView> {
+  const ops: SettingsPathOpView[] = writes.map(write => write.op === 'set'
+    ? { op: 'set', path: [write.field], value: write.value }
+    : { op: 'unset', path: [write.field] })
+  const response = await api.settings.mutate({
+    ns: SETTINGS_NAMESPACE,
+    ops,
+    ...(revision === undefined ? {} : { expectedRevision: revision }),
+  })
+  if (!response.result.ok) throw new Error(response.result.error.message)
+  return response.result.value
 }
 
 const styles: Record<string, CSSProperties> = {
@@ -691,7 +724,8 @@ interface ShellState {
 }
 
 function AuthTunnelCard(props: CardProps & {
-  scope: SettingsScope<AuthTunnelSettings>
+  scope: Pick<SettingsScope<AuthTunnelSettings>, 'getSnapshot' | 'subscribe'>
+  api: SettingsApi
   runtime: RuntimeStatusStore
 }) {
   const snapshot = useSyncExternalStore(props.scope.subscribe, props.scope.getSnapshot)
@@ -718,19 +752,20 @@ function AuthTunnelCard(props: CardProps & {
   const save = async (draft: Draft): Promise<void> => {
     const target = parseDraft(draft)
     const writes = savePlan(draft, target)
+    const current = record(snapshot.value)
+    const runtimeChanged = writes.some(write => !Object.is(current[write.field], target[write.field]))
     const startingRevision = snapshot.revision
     setShell(current => ({ ...current, saving: true, failed: false }))
-    let threw = false
+    let committed: SettingsNamespaceView | undefined
     try {
-      for (const write of writes) {
-        if (write.op === 'set') await props.scope.set(write.field, write.value)
-        else await props.scope.unset(write.field)
-      }
+      committed = await commitSettingsWrites(props.api, startingRevision, writes)
     } catch {
-      threw = true
+      // The generic failure copy is intentional: credential references and
+      // Host diagnostics must not be reflected into the settings page.
     }
     const latest = props.scope.getSnapshot()
-    const failed = threw || latest.status !== 'ready' || writes.some(write => !writeSatisfied(latest, write))
+    const result = committed
+    const failed = result === undefined || writes.some(write => !writeSatisfied(result, write))
     const draftSurvived = latest.revision === startingRevision
     setShell({
       revision: latest.revision,
@@ -738,6 +773,7 @@ function AuthTunnelCard(props: CardProps & {
       saving: false,
       failed,
     })
+    if (!failed && runtimeChanged) props.runtime.settingsCommitted(target.enabled)
     void props.runtime.refresh()
   }
 
@@ -797,16 +833,15 @@ export function apply(ctx: ClientContext): void {
   const source = ctx.settingsScope.bind<AuthTunnelSettings>({ namespace: SETTINGS_NAMESPACE })
   // Methods on the scope controller use `this`; stable wrappers are also the
   // stable subscribe/getSnapshot pair required by useSyncExternalStore.
-  const scope: SettingsScope<AuthTunnelSettings> = {
+  const scope: Pick<SettingsScope<AuthTunnelSettings>, 'getSnapshot' | 'subscribe'> = {
     getSnapshot: () => source.getSnapshot(),
     subscribe: listener => source.subscribe(listener),
-    set: (field, value) => source.set(field, value),
-    unset: field => source.unset(field),
   }
+  const api = (ctx.get('connection') as ConnectionHandle).api
   const runtime = new RuntimeStatusStore()
   ctx.effect(() => () => { runtime.dispose() }, 'auth-tunnel: runtime status')
   ctx.effect(() => ctx.locale.register(LOCALE_NAMESPACE, { zh, en }), 'auth-tunnel: settings dictionaries')
-  const Card = (props: CardProps) => <AuthTunnelCard {...props} scope={scope} runtime={runtime} />
+  const Card = (props: CardProps) => <AuthTunnelCard {...props} scope={scope} api={api} runtime={runtime} />
   ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
     name: 'settings.plugin.item',
     key: SETTINGS_NAMESPACE,
