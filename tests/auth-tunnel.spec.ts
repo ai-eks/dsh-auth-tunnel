@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Context, Service } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
+import { SettingsProvider, settingsNamespace, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
 
 /** Minimal in-memory credentials service for the composition (rotate via set). */
 class StubCredentials extends Service {
@@ -78,12 +79,42 @@ class StubSystemPrompt extends Service {
   }
 }
 
+/** Writable in-memory settings provider exercising the real rc7 service definition. */
+class StubSettings extends SettingsProvider {
+  readonly writable = true
+  private document: Record<string, unknown>
+
+  constructor(ctx: Context, config?: { document?: Record<string, unknown> }) {
+    super(ctx)
+    this.document = structuredClone(config?.document ?? {})
+  }
+
+  protected load(): Promise<Record<string, unknown>> {
+    return Promise.resolve(structuredClone(this.document))
+  }
+
+  protected persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void> {
+    this.document = { ...this.document, [ns]: structuredClone(section) }
+    return Promise.resolve()
+  }
+}
+
 interface StubbedContext {
   loaded: Context
   credentials: () => StubCredentials
+  settings: () => StubSettings
   shellEnv: () => StubShellEnv
   systemPrompt: () => StubSystemPrompt
   gateBase: () => Promise<string>
+  runtimeStatus: () => Promise<RuntimeStatus>
+}
+
+interface RuntimeStatus {
+  phase: 'stopped' | 'applying' | 'running' | 'error'
+  running: boolean
+  revision: number
+  publicUrl?: string
+  message?: string
 }
 
 const FIXTURES = fileURLToPath(new URL('fixtures/', import.meta.url))
@@ -149,6 +180,10 @@ interface CompositionOptions {
   credentialsAfterWebServer?: boolean
   /** Register no shell-env/system-prompt stub rows. */
   withShell?: boolean
+  /** Register no settings provider row. */
+  withSettings?: boolean
+  /** Initial raw settings document. */
+  settingsDocument?: Record<string, unknown>
   /** Seed no DSH_WEB_PASSWORD. */
   withPassword?: boolean
   /** Extra seeded credentials. */
@@ -173,11 +208,17 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
     '  config:',
     ...Object.entries(tunnelConfig).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`),
   ]
+  const settingsRows = options?.withSettings === false ? [] : [
+    "- name: '@deepseek-ai/dsh-settings'",
+    '  config:',
+    `    document: ${JSON.stringify(options?.settingsDocument ?? {})}`,
+  ]
   const rows: string[] = [
     "- name: '@deepseek-ai/dsh-host-webserver'",
     '  config:',
     "    host: '127.0.0.1'",
     '    port: 0',
+    ...settingsRows,
     ...(options?.credentialsAfterWebServer === true ? [] : credentialRows),
     ...(options?.withShell === false ? [] : [
       "- name: '@deepseek-ai/dsh-shell-env'",
@@ -209,6 +250,7 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
     ['@deepseek-ai/dsh-credentials', credentialsPlugin],
     ['@deepseek-ai/dsh-shell-env', shellEnvPlugin],
     ['@deepseek-ai/dsh-system-prompt', systemPromptPlugin],
+    ['@deepseek-ai/dsh-settings', StubSettings],
     ['dsh-auth-tunnel', tunnel],
   ])
   context.loader.internal = {
@@ -227,14 +269,24 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
   return {
     loaded,
     credentials: () => loaded.get('credentials')! as unknown as StubCredentials,
+    settings: () => loaded.get('settings')! as unknown as StubSettings,
     shellEnv: () => loaded.get('shellEnv')! as unknown as StubShellEnv,
     systemPrompt: () => loaded.get('systemPrompt')! as unknown as StubSystemPrompt,
     async gateBase(): Promise<string> {
-      for (const entry of await readdir(tmpdir())) {
-        const hit = new RegExp(`^${FAKE_PREFIX}\\d+\\.url$`).exec(entry)
-        if (hit !== null) return (await readFile(join(tmpdir(), entry), 'utf8')).trim()
+      for (const pid of await liveFixturePids()) {
+        const path = join(tmpdir(), `${FAKE_PREFIX}${pid}.url`)
+        try {
+          return (await readFile(path, 'utf8')).trim()
+        } catch {
+          // Token fixtures do not record a --url target.
+        }
       }
       throw new Error('no fake recorded its gate target')
+    },
+    async runtimeStatus(): Promise<RuntimeStatus> {
+      const response = await fetch(`http://127.0.0.1:${String(loaded.webServer.port)}/dsh-auth-tunnel/status`)
+      expect(response.status).toBe(200)
+      return response.json() as Promise<RuntimeStatus>
     },
   }
 }
@@ -281,6 +333,22 @@ async function sleep(ms: number): Promise<void> {
   await new Promise<void>((resolve) => {
     setTimeout(resolve, ms)
   })
+}
+
+/** Poll one runtime state transition with a bounded real-time deadline. */
+async function waitForStatus(
+  composition: StubbedContext,
+  predicate: (status: RuntimeStatus) => boolean,
+  timeoutMs = 5000,
+): Promise<RuntimeStatus> {
+  const deadline = Date.now() + timeoutMs
+  let latest = await composition.runtimeStatus()
+  while (!predicate(latest)) {
+    if (Date.now() >= deadline) throw new Error(`runtime status did not converge: ${JSON.stringify(latest)}`)
+    await sleep(25)
+    latest = await composition.runtimeStatus()
+  }
+  return latest
 }
 
 describe('password gate over the loopback webserver', () => {
@@ -824,14 +892,15 @@ describe('activation dependencies and boot failures', () => {
     expect(await liveFixturePids()).toEqual([]) // the child never spawned
   })
 
-  it('rejects a quick-mode row that names token-mode keys', { timeout: 60_000 }, async () => {
-    await expectBootFailure({
+  it('quick mode ignores preserved token-mode settings so the card can switch modes', { timeout: 60_000 }, async () => {
+    const composition = await loadComposition({
       mode: 'quick',
       tokenRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
       executable: await fixtureExecutable('fake-cloudflared-quick.sh'),
       startupTimeoutMs: 15_000,
-    }, /tokenRef and publicHostname belong to token mode/)
-    expect(await liveFixturePids()).toEqual([])
+    })
+    expect((await fetch(`${await composition.gateBase()}/dsh-auth-tunnel/login`)).status).toBe(200)
   })
 
   it('fails when the executable cannot spawn', { timeout: 60_000 }, async () => {
@@ -960,7 +1029,7 @@ describe('activation dependencies and boot failures', () => {
       publicHostname: 'gui.example.com',
       executable: await fixtureExecutable('fake-cloudflared-token.sh'),
       startupTimeoutMs: 15_000,
-    }, /token mode requires gatePort/, { seeds: { DSH_TUNNEL_TOKEN: 'fixture-token' } })
+    }, /token mode requires .*gatePort/, { seeds: { DSH_TUNNEL_TOKEN: 'fixture-token' } })
 
     await expectBootFailure({
       mode: 'token',
@@ -970,6 +1039,138 @@ describe('activation dependencies and boot failures', () => {
       executable: await fixtureExecutable('fake-cloudflared-token.sh'),
       startupTimeoutMs: 15_000,
     }, /credential reference \"DSH_TUNNEL_TOKEN\" is not configured/)
+  })
+})
+
+describe('rc7 plugin settings', () => {
+  const namespace = settingsNamespace('auth-tunnel')
+
+  it('keeps settings available without starting public access while disabled', { timeout: 60_000 }, async () => {
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+    const composition = await loadComposition({
+      enabled: false,
+      mode: 'token',
+      executable: '/missing/cloudflared',
+    }, { withPassword: false })
+
+    const descriptor = composition.settings().describe().find(entry => entry.ns === namespace)
+    expect(descriptor).toMatchObject({
+      ns: namespace,
+      applies: 'live',
+      value: { enabled: false, mode: 'token' },
+    })
+    expect(await composition.runtimeStatus()).toMatchObject({ phase: 'stopped', running: false })
+    expect(consoleSpy).not.toHaveBeenCalled()
+    expect(composition.shellEnv().contributors).toEqual([])
+    expect(composition.systemPrompt().sections).toEqual([])
+    expect(await liveFixturePids()).toEqual([])
+    await expect(composition.settings().update(namespace, { enabled: true }))
+      .rejects.toThrow(/token mode requires tokenRef/)
+  })
+
+  it('hot-switches the password reference and preserves the live gate when the new credential is missing', { timeout: 60_000 }, async () => {
+    const composition = await loadComposition({
+      mode: 'quick',
+      executable: await fixtureExecutable('fake-cloudflared-quick.sh'),
+      startupTimeoutMs: 15_000,
+    }, {
+      withPassword: false,
+      seeds: {
+        ALT_WEB_PASSWORD: 'settings-password',
+        NEXT_WEB_PASSWORD: 'next-settings-password',
+      },
+      settingsDocument: { 'auth-tunnel': { passwordRef: 'ALT_WEB_PASSWORD' } },
+    })
+
+    const descriptor = composition.settings().describe().find(entry => entry.ns === namespace)
+    expect(descriptor).toMatchObject({
+      ns: namespace,
+      applies: 'live',
+      value: { enabled: true, passwordRef: 'ALT_WEB_PASSWORD', mode: 'quick' },
+    })
+    expect(descriptor?.base).toMatchObject({ enabled: true, passwordRef: 'DSH_WEB_PASSWORD', mode: 'quick' })
+
+    const base = await composition.gateBase()
+    await login(base, undefined, 'settings-password')
+
+    const beforeRotation = await composition.runtimeStatus()
+    await composition.settings().update(namespace, { passwordRef: 'NEXT_WEB_PASSWORD' })
+    await waitForStatus(composition, status => status.revision > beforeRotation.revision && status.phase === 'running')
+    const oldPassword = await fetch(`${base}/dsh-auth-tunnel/login`, {
+      method: 'POST', redirect: 'manual',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'password=settings-password',
+    })
+    expect(oldPassword.headers.get('location')).toBe('/dsh-auth-tunnel/login?error=1')
+    await login(base, undefined, 'next-settings-password')
+
+    const beforeFailure = await composition.runtimeStatus()
+    await composition.settings().update(namespace, { passwordRef: 'MISSING_PASSWORD' })
+    const failed = await waitForStatus(
+      composition,
+      status => status.revision > beforeFailure.revision && status.phase === 'error',
+    )
+    expect(failed).toMatchObject({ running: true, publicUrl: QUICK_URL })
+    expect(failed.message).toContain('MISSING_PASSWORD')
+    await login(base, undefined, 'next-settings-password')
+    expect((await liveFixturePids()).length).toBe(1)
+  })
+
+  it('starts and stops the gate and cloudflared from the live enabled switch', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ enabled: false })
+    expect(await composition.runtimeStatus()).toMatchObject({ phase: 'stopped', running: false })
+    expect(await liveFixturePids()).toEqual([])
+
+    await composition.settings().update(namespace, { enabled: true })
+    const running = await waitForStatus(composition, status => status.phase === 'running')
+    expect(running.publicUrl).toBe(QUICK_URL)
+    const firstGate = await composition.gateBase()
+    expect((await fetch(`${firstGate}/dsh-auth-tunnel/login`)).status).toBe(200)
+    expect(composition.shellEnv().contributors).toHaveLength(1)
+    expect(composition.systemPrompt().sections).toHaveLength(1)
+
+    await composition.settings().update(namespace, { enabled: false })
+    await waitForStatus(composition, status => status.phase === 'stopped')
+    expect(await liveFixturePids()).toEqual([])
+    expect(composition.shellEnv().contributors).toEqual([])
+    expect(composition.systemPrompt().sections).toEqual([])
+    await expect(fetch(`${firstGate}/dsh-auth-tunnel/login`)).rejects.toThrow()
+
+    await composition.settings().update(namespace, { enabled: true })
+    await waitForStatus(composition, status => status.phase === 'running')
+    expect((await liveFixturePids()).length).toBe(1)
+    expect((await fetch(`${await composition.gateBase()}/dsh-auth-tunnel/login`)).status).toBe(200)
+  })
+
+  it('keeps the old tunnel when a live process rebuild fails', { timeout: 60_000 }, async () => {
+    const quickExecutable = await fixtureExecutable('fake-cloudflared-quick.sh')
+    const silentExecutable = await fixtureExecutable('fake-cloudflared-silent.sh')
+    const composition = await loadComposition({
+      mode: 'quick',
+      executable: quickExecutable,
+      startupTimeoutMs: 15_000,
+    })
+    const base = await composition.gateBase()
+    const originalPids = await liveFixturePids()
+    expect(originalPids).toHaveLength(1)
+
+    await composition.settings().update(namespace, { startupTimeoutMs: 50 })
+    await composition.settings().update(namespace, { executable: silentExecutable })
+    const failed = await waitForStatus(composition, status => status.phase === 'error', 7000)
+    expect(failed).toMatchObject({ running: true, publicUrl: QUICK_URL })
+    expect(failed.message).toContain('produced no public URL')
+    expect(await liveFixturePids()).toEqual(originalPids)
+    expect((await fetch(`${base}/dsh-auth-tunnel/login`)).status).toBe(200)
+    expect(composition.shellEnv().contributors[0]?.resolve().DSH_PUBLIC_URL).toBe(QUICK_URL)
+
+    await composition.settings().update(namespace, { executable: quickExecutable })
+    await waitForStatus(composition, status => status.phase === 'running')
+  })
+
+  it('keeps the original composition working when no settings provider is mounted', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick(undefined, { withSettings: false })
+    expect(composition.loaded.get('settings')).toBeUndefined()
+    expect((await fetch(`${await composition.gateBase()}/dsh-auth-tunnel/login`)).status).toBe(200)
   })
 })
 
@@ -984,6 +1185,8 @@ describe('bundle patch', () => {
       "      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'",
       '    - id: auth-tunnel',
       "      name: 'dsh-auth-tunnel'",
+      '      config:',
+      '        enabled: true',
     ].join('\n'))
     expect(patch).not.toMatch(/^- id: auth-tunnel$/m)
   })

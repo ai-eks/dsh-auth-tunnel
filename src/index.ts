@@ -20,16 +20,19 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 // Pulls the Context augmentation typing `ctx.webServer`; no runtime import.
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import type {} from '@deepseek-ai/dsh-shell-env'
-import type {} from '@deepseek-ai/dsh-system-prompt'
+import type { ShellEnvRegistry } from '@deepseek-ai/dsh-shell-env'
+import type { SystemPrompt } from '@deepseek-ai/dsh-system-prompt'
 
 /** Which tunnel this composition runs. */
 export type TunnelMode = 'quick' | 'token'
 
 /** Plugin config: the access password, tunnel mode, the named-tunnel facts, and process tuning. */
 export interface Config {
+  /** Keep the settings surface loaded while deciding whether the public tunnel itself runs. */
+  enabled: boolean
   /**
    * Credential reference resolving to the shared access password, resolved
    * through the composition's credentials service. Configuration carries the
@@ -60,6 +63,7 @@ export interface Config {
 }
 
 interface InternalConfig {
+  enabled: boolean
   passwordRef: string
   sessionTtlHours: number
   mode: TunnelMode
@@ -72,6 +76,9 @@ interface InternalConfig {
 
 export const name = 'dsh-auth-tunnel'
 
+/** Host/browser pairing key for the plugin settings card. */
+export const AUTH_TUNNEL_SETTINGS_NAMESPACE = settingsNamespace('auth-tunnel')
+
 // The gate proxies onto the loopback webserver and resolves credential
 // references, so activation waits for both services.
 export const inject = ['webServer', 'credentials']
@@ -79,19 +86,65 @@ export const inject = ['webServer', 'credentials']
 const PUBLIC_HOSTNAME_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i
 
 export const Config: z<InternalConfig> = z.object({
-  passwordRef: z.string().role('credential-ref').default('DSH_WEB_PASSWORD'),
+  enabled: z.boolean().default(true),
+  passwordRef: z.string().min(1).role('credential-ref').default('DSH_WEB_PASSWORD'),
   sessionTtlHours: z.number().min(0.01).default(720),
   mode: z.union(['quick', 'token']).default('quick'),
   tokenRef: z.string().min(1).role('credential-ref'),
   publicHostname: z.string().min(1).pattern(PUBLIC_HOSTNAME_PATTERN),
   gatePort: z.number().step(1).min(0).max(65535).default(0),
-  executable: z.string().default('cloudflared'),
+  executable: z.string().min(1).default('cloudflared'),
   startupTimeoutMs: z.number().step(1).min(1).default(15_000),
 })
+
+/** Reject mode combinations that the field-level schema cannot express. */
+export function validateConfig(config: Config): void {
+  if (!config.enabled) return
+  if (config.mode !== 'token') return
+  if (config.tokenRef === undefined) {
+    throw new Error('auth-tunnel: token mode requires tokenRef')
+  }
+  if (config.publicHostname === undefined) {
+    throw new Error('auth-tunnel: token mode requires publicHostname')
+  }
+  if (config.gatePort === 0) {
+    throw new Error('auth-tunnel: token mode requires a fixed non-zero gatePort')
+  }
+}
+
+/** Register the optional rc7 settings section and forward every live value. */
+function settingsConfig(
+  ctx: Context,
+  entry: Config,
+  onChange: (next: InternalConfig) => void,
+): InternalConfig {
+  const settings = ctx.get('settings')
+  if (settings === undefined) {
+    ctx.inject(['settings'], (settingsCtx) => {
+      const scope = settingsCtx.settings.register(AUTH_TUNNEL_SETTINGS_NAMESPACE, Config, {
+        base: entry,
+        applies: 'live',
+        validate: validateConfig,
+      })
+      settingsCtx.effect(() => scope.watch(next => { onChange(next) }), 'auth-tunnel: settings watcher')
+      onChange(scope.get())
+    })
+    validateConfig(entry)
+    return entry
+  }
+  const scope = settings.register(AUTH_TUNNEL_SETTINGS_NAMESPACE, Config, {
+    base: entry,
+    applies: 'live',
+    validate: validateConfig,
+  })
+  ctx.effect(() => scope.watch(next => { onChange(next) }), 'auth-tunnel: settings watcher')
+  return scope.get()
+}
 
 const AUTH_PREFIX = '/dsh-auth-tunnel'
 const LOGIN_PATH = `${AUTH_PREFIX}/login`
 const LOGOUT_PATH = `${AUTH_PREFIX}/logout`
+export const AUTH_TUNNEL_STATUS_PATH = `${AUTH_PREFIX}/status`
 const PUBLIC_MANIFEST_PATH = '/manifest.webmanifest'
 const AUTH_COOKIE = 'dsh_auth_tunnel'
 const MAX_LOGIN_BODY_BYTES = 16 * 1024
@@ -297,8 +350,7 @@ async function readForm(req: IncomingMessage, res: ServerResponse): Promise<URLS
  * cloudflared, never a browser.
  */
 class PasswordGate {
-  private readonly ref: string
-  private readonly ttlMs: number
+  private auth: { passwordRef: string; ttlMs: number }
   private readonly upstreamPort: number
 
   constructor(
@@ -306,9 +358,19 @@ class PasswordGate {
     config: { passwordRef: string; sessionTtlHours: number },
     upstreamPort: number,
   ) {
-    this.ref = config.passwordRef
-    this.ttlMs = config.sessionTtlHours * 3600 * 1000
+    this.auth = {
+      passwordRef: config.passwordRef,
+      ttlMs: config.sessionTtlHours * 3600 * 1000,
+    }
     this.upstreamPort = upstreamPort
+  }
+
+  /** Atomically replace the authentication policy used by subsequent requests. */
+  updateAuth(config: { passwordRef: string; sessionTtlHours: number }): void {
+    this.auth = {
+      passwordRef: config.passwordRef,
+      ttlMs: config.sessionTtlHours * 3600 * 1000,
+    }
   }
 
   /** Bind the gate on the configured loopback port (0 asks the OS for one).
@@ -346,7 +408,8 @@ class PasswordGate {
 
   /** One accepted identity check: minted cookie against the current key. */
   private async authenticated(req: IncomingMessage): Promise<boolean> {
-    const key = await sessionKey(this.ctx, this.ref)
+    const { passwordRef } = this.auth
+    const key = await sessionKey(this.ctx, passwordRef)
     if (key === undefined) return false
     const presented = readCookie(req.headers.cookie, AUTH_COOKIE)
     return presented !== undefined && verifyCookie(key, presented)
@@ -390,7 +453,8 @@ class PasswordGate {
     if (url.pathname === LOGIN_PATH && req.method === 'POST') {
       const form = await readForm(req, res)
       if (form === undefined) return // response already answered (413/415)
-      const key = await sessionKey(this.ctx, this.ref)
+      const { passwordRef, ttlMs } = this.auth
+      const key = await sessionKey(this.ctx, passwordRef)
       if (key === undefined) {
         this.ctx.logger.error('auth-tunnel: the access-password credential is no longer configured')
         res.writeHead(503)
@@ -407,7 +471,7 @@ class PasswordGate {
       res.writeHead(303, {
         location: '/',
         'cache-control': 'no-store',
-        'set-cookie': setSessionCookie(secure, mintCookie(key, this.ttlMs), this.ttlMs),
+        'set-cookie': setSessionCookie(secure, mintCookie(key, ttlMs), ttlMs),
       })
       res.end()
       return
@@ -511,9 +575,6 @@ async function spawnTunnel(ctx: Context, config: InternalConfig, target: string)
   if (process.env.TMPDIR !== undefined) env.TMPDIR = process.env.TMPDIR
   /* v8 ignore stop */
   if (config.mode === 'quick') {
-    if (config.tokenRef !== undefined || config.publicHostname !== undefined) {
-      throw new Error('auth-tunnel: tokenRef and publicHostname belong to token mode, not quick')
-    }
     args = ['tunnel', '--url', target, '--no-autoupdate']
   } else {
     const tokenRef = required(config, 'tokenRef', 'token mode requires tokenRef naming the Tunnel Token credential reference')
@@ -605,63 +666,374 @@ function required<TKey extends 'tokenRef' | 'publicHostname'>(config: InternalCo
   return value
 }
 
-/**
- * Start the loopback password gate against the webserver, spawn cloudflared
- * against the gate, and publish the public URL to the shell and the model.
- * Activation completes only once the tunnel is up.
- * @param ctx - plugin context.
- * @param config - validated {@link Config}.
- */
-export async function apply(ctx: Context, config: Config): Promise<void> {
-  // Activation checks the password reference before the gate opens: an
-  // unconfigured credential never fronts a public URL.
-  const key = await sessionKey(ctx, config.passwordRef)
-  if (key === undefined) {
-    throw new Error(`auth-tunnel: credential reference "${config.passwordRef}" is not configured`)
-  }
-  const gate = new PasswordGate(ctx, config, ctx.webServer.port)
-  const { server, port } = await gate.start(config.gatePort)
-  let spawned: { child: ChildProcess; publicUrl: string }
-  try {
-    spawned = await spawnTunnel(ctx, config, `http://127.0.0.1:${String(port)}`)
-  } catch (error) {
-    // A failed boot must not leave the gate listening behind no tunnel. A
-    // close failure only delays teardown; the boot error stays the outcome.
-    server.close()
-    server.closeAllConnections()
-    throw error
-  }
-  const { child, publicUrl } = spawned
-  let disposed = false
-  child.once('exit', (code, signal) => {
-    // Our own teardown kill is no crash; anything else strands the URL.
-    if (disposed) return
-    ctx.logger.error(`auth-tunnel: cloudflared exited (code ${String(code)}, signal ${String(signal)}); the public URL ${publicUrl} is now dead. Restart dsh to bring the tunnel back.`)
-  })
-  ctx.effect(() => async () => {
-    await new Promise<void>((resolve) => {
-      server.close(() => { resolve() })
-      server.closeAllConnections()
-    })
-  }, 'auth-tunnel: gate')
-  ctx.effect(() => async () => {
-    disposed = true
-    await killTree(child)
-  }, 'auth-tunnel: cloudflared')
+export type AuthTunnelRuntimePhase = 'stopped' | 'applying' | 'running' | 'error'
 
-  console.log(`cloudflare tunnel: ${publicUrl}`)
-  ctx.inject(['shellEnv'], (injected) => {
-    injected.shellEnv.register({
+/** Browser-safe runtime state served by {@link AUTH_TUNNEL_STATUS_PATH}. */
+export interface AuthTunnelRuntimeStatus {
+  phase: AuthTunnelRuntimePhase
+  running: boolean
+  revision: number
+  publicUrl?: string
+  message?: string
+}
+
+interface ActiveTunnel {
+  config: InternalConfig
+  gate: PasswordGate
+  server: Server
+  port: number
+  child: ChildProcess
+  publicUrl: string
+  alive: boolean
+}
+
+/** Close one gate and every accepted connection without leaving a listener behind. */
+async function closeGate(server: Server): Promise<void> {
+  if (!server.listening) {
+    server.closeAllConnections()
+    return
+  }
+  await new Promise<void>((resolve) => {
+    server.close(() => { resolve() })
+    server.closeAllConnections()
+  })
+}
+
+function errorMessage(error: unknown): string {
+  /* v8 ignore next -- service and process failures are Errors; String guards exotic rejections */
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** Own the one live gate/tunnel pair and reconcile settings changes serially. */
+class AuthTunnelRuntime {
+  private active: ActiveTunnel | undefined
+  private desired: InternalConfig | undefined
+  private debounce: ReturnType<typeof setTimeout> | undefined
+  private drainTask: Promise<void> | undefined
+  private disposed = false
+  private revision = 0
+  private status: AuthTunnelRuntimeStatus = { phase: 'stopped', running: false, revision: 0 }
+  private readonly intentionalExits = new WeakSet<ChildProcess>()
+  private publishedUrl: string | undefined
+  private shellEnv: ShellEnvRegistry | undefined
+  private shellRegistration: (() => void) | undefined
+  private systemPrompt: SystemPrompt | undefined
+  private promptRegistration: (() => void) | undefined
+
+  constructor(private readonly ctx: Context) {}
+
+  getStatus(): AuthTunnelRuntimeStatus {
+    return this.status
+  }
+
+  /** Attach an optional shell registry while it is present in the composition. */
+  attachShellEnv(service: ShellEnvRegistry): () => void {
+    this.shellEnv = service
+    this.syncShellEnv()
+    return () => {
+      if (this.shellEnv !== service) return
+      this.shellRegistration?.()
+      this.shellRegistration = undefined
+      this.shellEnv = undefined
+    }
+  }
+
+  /** Attach an optional prompt registry while it is present in the composition. */
+  attachSystemPrompt(service: SystemPrompt): () => void {
+    this.systemPrompt = service
+    this.syncSystemPrompt()
+    return () => {
+      if (this.systemPrompt !== service) return
+      this.promptRegistration?.()
+      this.promptRegistration = undefined
+      this.systemPrompt = undefined
+    }
+  }
+
+  /** Apply the boot snapshot synchronously so startup still reports hard failures. */
+  async start(config: InternalConfig): Promise<void> {
+    if (!config.enabled) {
+      this.setStatus('stopped', false)
+      return
+    }
+    this.setStatus('applying', false)
+    try {
+      const candidate = await this.startFull(config)
+      if (this.disposed) {
+        await this.stop(candidate)
+        return
+      }
+      this.adopt(candidate)
+      this.setStatus('running', true, candidate.publicUrl)
+    } catch (error) {
+      this.setStatus('error', false, undefined, errorMessage(error))
+      throw error
+    }
+  }
+
+  /** Coalesce scalar settings writes, then reconcile only the latest snapshot. */
+  request(config: InternalConfig): void {
+    if (this.disposed) return
+    this.desired = config
+    const running = this.active?.alive === true
+    this.setStatus('applying', running, running ? this.active?.publicUrl : undefined)
+    if (this.debounce !== undefined) clearTimeout(this.debounce)
+    this.debounce = setTimeout(() => { this.beginDrain() }, 120)
+  }
+
+  /** Stop queued work and tear down the currently adopted runtime. */
+  async dispose(): Promise<void> {
+    if (this.disposed) return
+    this.disposed = true
+    this.desired = undefined
+    if (this.debounce !== undefined) {
+      clearTimeout(this.debounce)
+      this.debounce = undefined
+    }
+    await this.drainTask
+    const active = this.active
+    this.active = undefined
+    this.publish(undefined)
+    if (active !== undefined) await this.stop(active)
+  }
+
+  private setStatus(
+    phase: AuthTunnelRuntimePhase,
+    running: boolean,
+    publicUrl?: string,
+    message?: string,
+  ): void {
+    this.revision += 1
+    this.status = {
+      phase,
+      running,
+      revision: this.revision,
+      ...(publicUrl === undefined ? {} : { publicUrl }),
+      ...(message === undefined ? {} : { message }),
+    }
+  }
+
+  private beginDrain(): void {
+    this.debounce = undefined
+    if (this.disposed || this.drainTask !== undefined) return
+    this.drainTask = this.drain().finally(() => {
+      this.drainTask = undefined
+      if (this.desired !== undefined && !this.disposed) {
+        this.debounce = setTimeout(() => { this.beginDrain() }, 0)
+      }
+    })
+  }
+
+  private async drain(): Promise<void> {
+    while (this.desired !== undefined && !this.disposed) {
+      const next = this.desired
+      this.desired = undefined
+      try {
+        await this.reconcile(next)
+      } catch (error) {
+        const message = errorMessage(error)
+        const running = this.active?.alive === true
+        this.setStatus('error', running, running ? this.active?.publicUrl : undefined, message)
+        this.ctx.logger.error(`auth-tunnel: could not apply live settings: ${message}`)
+      }
+    }
+  }
+
+  private async reconcile(next: InternalConfig): Promise<void> {
+    validateConfig(next)
+    if (!next.enabled) {
+      const previous = this.active
+      this.active = undefined
+      this.publish(undefined)
+      if (previous !== undefined) await this.stop(previous)
+      this.setStatus('stopped', false)
+      return
+    }
+
+    const current = this.active
+    if (current === undefined) {
+      const candidate = await this.startFull(next)
+      if (this.disposed) {
+        await this.stop(candidate)
+        return
+      }
+      this.adopt(candidate)
+      this.setStatus('running', true, candidate.publicUrl)
+      return
+    }
+
+    await this.requirePassword(next.passwordRef)
+    const replaceGate = current.config.gatePort !== next.gatePort
+    if (replaceGate) {
+      const candidate = await this.startFull(next)
+      if (this.disposed) {
+        await this.stop(candidate)
+        return
+      }
+      const previous = this.active
+      this.adopt(candidate)
+      if (previous !== undefined) await this.stop(previous)
+      this.setStatus('running', true, candidate.publicUrl)
+      return
+    }
+
+    const replaceTunnel = !current.alive
+      || current.config.mode !== next.mode
+      || current.config.executable !== next.executable
+      || (next.mode === 'token' && current.config.tokenRef !== next.tokenRef)
+    if (replaceTunnel) {
+      const spawned = await spawnTunnel(this.ctx, next, `http://127.0.0.1:${String(current.port)}`)
+      if (this.disposed) {
+        this.intentionalExits.add(spawned.child)
+        await killTree(spawned.child)
+        return
+      }
+      const previous = this.active
+      const candidate: ActiveTunnel = {
+        config: next,
+        gate: current.gate,
+        server: current.server,
+        port: current.port,
+        child: spawned.child,
+        publicUrl: spawned.publicUrl,
+        alive: true,
+      }
+      candidate.gate.updateAuth(next)
+      this.adopt(candidate)
+      if (previous !== undefined) await this.stopChild(previous)
+      this.setStatus('running', true, candidate.publicUrl)
+      return
+    }
+
+    current.gate.updateAuth(next)
+    const previousUrl = current.publicUrl
+    current.config = next
+    if (next.mode === 'token') {
+      current.publicUrl = `https://${required(next, 'publicHostname', 'token mode requires publicHostname')}`
+    }
+    if (current.publicUrl !== previousUrl) console.log(`cloudflare tunnel: ${current.publicUrl}`)
+    this.publish(current.publicUrl)
+    this.setStatus('running', true, current.publicUrl)
+  }
+
+  private async requirePassword(ref: string): Promise<void> {
+    if (await sessionKey(this.ctx, ref) === undefined) {
+      throw new Error(`auth-tunnel: credential reference "${ref}" is not configured`)
+    }
+  }
+
+  private async startFull(config: InternalConfig): Promise<ActiveTunnel> {
+    await this.requirePassword(config.passwordRef)
+    const gate = new PasswordGate(this.ctx, config, this.ctx.webServer.port)
+    const { server, port } = await gate.start(config.gatePort)
+    try {
+      const spawned = await spawnTunnel(this.ctx, config, `http://127.0.0.1:${String(port)}`)
+      return {
+        config,
+        gate,
+        server,
+        port,
+        child: spawned.child,
+        publicUrl: spawned.publicUrl,
+        alive: true,
+      }
+    } catch (error) {
+      await closeGate(server)
+      throw error
+    }
+  }
+
+  private adopt(candidate: ActiveTunnel): void {
+    this.active = candidate
+    let observed = false
+    const exited = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (observed) return
+      observed = true
+      candidate.alive = false
+      if (this.disposed || this.intentionalExits.has(candidate.child) || this.active !== candidate) return
+      this.publish(undefined)
+      const message = `auth-tunnel: cloudflared exited (code ${String(code)}, signal ${String(signal)}); the public URL ${candidate.publicUrl} is now dead. Toggle the tunnel off and on to start it again.`
+      this.ctx.logger.error(message)
+      this.setStatus('error', false, undefined, message)
+    }
+    candidate.child.once('exit', exited)
+    if (candidate.child.exitCode !== null || candidate.child.signalCode !== null) {
+      exited(candidate.child.exitCode, candidate.child.signalCode)
+    }
+    console.log(`cloudflare tunnel: ${candidate.publicUrl}`)
+    this.publish(candidate.publicUrl)
+  }
+
+  private async stopChild(active: ActiveTunnel): Promise<void> {
+    this.intentionalExits.add(active.child)
+    await killTree(active.child)
+  }
+
+  private async stop(active: ActiveTunnel): Promise<void> {
+    await Promise.all([this.stopChild(active), closeGate(active.server)])
+  }
+
+  private publish(publicUrl: string | undefined): void {
+    if (this.publishedUrl === publicUrl) return
+    this.publishedUrl = publicUrl
+    this.syncShellEnv()
+    this.syncSystemPrompt()
+  }
+
+  private syncShellEnv(): void {
+    this.shellRegistration?.()
+    this.shellRegistration = undefined
+    if (this.shellEnv === undefined || this.publishedUrl === undefined) return
+    const publicUrl = this.publishedUrl
+    this.shellRegistration = this.shellEnv.register({
       name: 'auth-tunnel',
       variables: { DSH_PUBLIC_URL: { description: 'Public URL of this instance, when the Cloudflare Tunnel is mounted' } },
       resolve: () => ({ DSH_PUBLIC_URL: publicUrl }),
     })
-  })
-  ctx.inject(['systemPrompt'], (injected) => {
-    injected.systemPrompt.section({
+  }
+
+  private syncSystemPrompt(): void {
+    this.promptRegistration?.()
+    this.promptRegistration = undefined
+    if (this.systemPrompt === undefined || this.publishedUrl === undefined) return
+    const publicUrl = this.publishedUrl
+    this.promptRegistration = this.systemPrompt.section({
       name: 'app:public-access',
       order: -97,
       text: () => publicAccessPrompt(publicUrl),
     })
+  }
+}
+
+/**
+ * Install the runtime controller, settings watcher, status route, and optional
+ * model-facing publications. Boot still waits for an initially enabled tunnel.
+ * @param ctx - plugin context.
+ * @param config - validated {@link Config}.
+ */
+export async function apply(ctx: Context, config: Config): Promise<void> {
+  const runtime = new AuthTunnelRuntime(ctx)
+  ctx.effect(() => async () => { await runtime.dispose() }, 'auth-tunnel: runtime')
+  ctx.webServer.register({
+    kind: 'exact',
+    path: AUTH_TUNNEL_STATUS_PATH,
+    handler: (req, res) => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.writeHead(405, { allow: 'GET, HEAD', 'cache-control': 'no-store' })
+        res.end()
+        return
+      }
+      const body = JSON.stringify(runtime.getStatus())
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      res.end(req.method === 'HEAD' ? undefined : body)
+    },
   })
+  ctx.inject(['shellEnv'], (injected) => {
+    injected.effect(() => runtime.attachShellEnv(injected.shellEnv), 'auth-tunnel: shell publication')
+  })
+  ctx.inject(['systemPrompt'], (injected) => {
+    injected.effect(() => runtime.attachSystemPrompt(injected.systemPrompt), 'auth-tunnel: prompt publication')
+  })
+  const active = settingsConfig(ctx, config, next => { runtime.request(next) })
+  await runtime.start(active)
 }

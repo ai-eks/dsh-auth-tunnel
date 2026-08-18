@@ -2,8 +2,9 @@
 # password gate in front of the Web GUI and publishes it through a Cloudflare
 # Tunnel. A public browser cannot operate a native dialog on the Host display,
 # so the bundle pins the in-app browser interaction while the tunnel is mounted.
-# Defaults are the quick mode: no extra keys needed; override by id in a later
-# layer (profile cordis.patch.yml) for token mode or tuning.
+# Defaults enable quick mode. Keep the Loader row mounted and set
+# config.enabled=false to stop public access without removing its settings card;
+# override by id in a later layer (profile cordis.patch.yml) for token mode.
 - id: directory-picker
   disabled: true
 - insert:
@@ -14,5 +15,6 @@
     - id: auth-tunnel
       name: 'dsh-auth-tunnel'
       config:
+        enabled: true
         passwordRef: DSH_WEB_PASSWORD
         mode: quick

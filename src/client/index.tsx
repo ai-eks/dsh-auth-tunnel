@@ -1,0 +1,815 @@
+/** Browser settings card for the Host-side auth-tunnel namespace. */
+
+import { useState, useSyncExternalStore, type CSSProperties } from 'react'
+import type {
+  ClientContext, SettingsScope, SettingsScopeSnapshot,
+} from '@deepseek-ai/dsh-client-runtime/client'
+import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+// Type-only service and slot declarations. Cross-plugin behavior stays on
+// Cordis services, so the lazy client bundle imports no plugin implementation.
+import type {} from '@deepseek-ai/dsh-client-locale/client'
+import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
+import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
+
+const SETTINGS_NAMESPACE = 'auth-tunnel'
+const LOCALE_NAMESPACE = 'settings.auth-tunnel'
+
+type LocaleKey =
+  | 'title' | 'description' | 'unsaved' | 'readOnly' | 'live'
+  | 'enabled' | 'enabledHint' | 'enabledOn' | 'enabledOff'
+  | 'status' | 'statusRunning' | 'statusStopped' | 'statusApplying'
+  | 'statusErrorRunning' | 'statusErrorStopped' | 'statusUnavailable' | 'publicUrl'
+  | 'mode' | 'modeHint' | 'quick' | 'token'
+  | 'passwordRef' | 'passwordRefHint'
+  | 'sessionTtlHours' | 'sessionTtlHoursHint'
+  | 'tokenRef' | 'tokenRefHint'
+  | 'publicHostname' | 'publicHostnameHint'
+  | 'gatePort' | 'gatePortHint'
+  | 'executable' | 'executableHint'
+  | 'startupTimeoutMs' | 'startupTimeoutMsHint'
+  | 'overridden' | 'reset' | 'discard' | 'save' | 'saving' | 'saveFailed'
+  | 'required' | 'invalidNumber' | 'invalidInteger' | 'invalidHostname'
+  | 'tokenRefRequired' | 'hostnameRequired' | 'fixedPortRequired'
+
+declare module '@deepseek-ai/dsh-client-ui-slots' {
+  interface LocaleNamespaceMap {
+    /** Auth Tunnel settings-card copy. */
+    'settings.auth-tunnel': LocaleKey
+  }
+}
+
+const zh: Record<LocaleKey, string> = {
+  title: 'Auth Tunnel',
+  description: '通过 Cloudflare Tunnel 为 Web GUI 提供密码保护的公网访问。',
+  unsaved: '未保存',
+  readOnly: '当前设置存储为只读。',
+  live: '保存后自动应用，无需重启 DeepSeek Harness。隧道级变更可能短暂切换；Token 模式的 Gate 端口仍需与 Cloudflare ingress 一致。',
+  enabled: '启用公网隧道',
+  enabledHint: '保存后立即启动或停止密码门和 cloudflared，设置卡片会继续保留。',
+  enabledOn: '开启',
+  enabledOff: '关闭',
+  status: '运行状态',
+  statusRunning: '运行中',
+  statusStopped: '已停止',
+  statusApplying: '应用中…',
+  statusErrorRunning: '应用失败（旧隧道仍在运行）',
+  statusErrorStopped: '应用失败（隧道未运行）',
+  statusUnavailable: '暂时无法读取',
+  publicUrl: '公网地址',
+  mode: '隧道模式',
+  modeHint: 'Quick 使用临时 trycloudflare.com 地址；Token 使用 Cloudflare 控制台中已配置的命名隧道。',
+  quick: 'Quick（临时隧道）',
+  token: 'Token（命名隧道）',
+  passwordRef: '密码凭据引用',
+  passwordRefHint: '共享访问密码在凭据服务中的引用名，不是密码明文。',
+  sessionTtlHours: '会话时长（小时）',
+  sessionTtlHoursHint: '登录 Cookie 的绝对有效期。',
+  tokenRef: 'Tunnel Token 凭据引用',
+  tokenRefHint: 'Cloudflare Tunnel Token 在凭据服务中的引用名。',
+  publicHostname: '公网主机名',
+  publicHostnameHint: 'Cloudflare 控制台中绑定到命名隧道的域名。',
+  gatePort: 'Gate 端口',
+  gatePortHint: 'Quick 可填 0 自动分配；Token 模式必须与控制台 ingress 中的固定端口一致。',
+  executable: 'cloudflared 可执行文件',
+  executableHint: 'PATH 中的命令名或绝对路径。',
+  startupTimeoutMs: '启动超时（毫秒）',
+  startupTimeoutMsHint: '等待 cloudflared 建立隧道的最长时间。',
+  overridden: '已覆盖',
+  reset: '恢复默认',
+  discard: '放弃修改',
+  save: '保存更改',
+  saving: '保存中…',
+  saveFailed: '设置没有完整保存，已重新读取 Host 状态，请检查后重试。',
+  required: '此项不能为空。',
+  invalidNumber: '请输入有效数字。',
+  invalidInteger: '请输入范围内的整数。',
+  invalidHostname: '请输入有效域名，例如 tunnel.example.com。',
+  tokenRefRequired: 'Token 模式必须填写 Tunnel Token 凭据引用。',
+  hostnameRequired: 'Token 模式必须填写公网主机名。',
+  fixedPortRequired: 'Token 模式必须使用 1–65535 的固定端口。',
+}
+
+const en: Record<LocaleKey, string> = {
+  title: 'Auth Tunnel',
+  description: 'Password-gated public access to the Web GUI through Cloudflare Tunnel.',
+  unsaved: 'Unsaved',
+  readOnly: 'This deployment stores settings read-only.',
+  live: 'Saved changes apply automatically without restarting DeepSeek Harness. Tunnel-level changes may switch briefly; the Token-mode gate port must still match Cloudflare ingress.',
+  enabled: 'Enable public tunnel',
+  enabledHint: 'Saving starts or stops the password gate and cloudflared immediately while keeping this card available.',
+  enabledOn: 'On',
+  enabledOff: 'Off',
+  status: 'Runtime status',
+  statusRunning: 'Running',
+  statusStopped: 'Stopped',
+  statusApplying: 'Applying…',
+  statusErrorRunning: 'Apply failed (previous tunnel still running)',
+  statusErrorStopped: 'Apply failed (tunnel stopped)',
+  statusUnavailable: 'Temporarily unavailable',
+  publicUrl: 'Public URL',
+  mode: 'Tunnel mode',
+  modeHint: 'Quick uses a temporary trycloudflare.com URL; Token uses a named tunnel configured in Cloudflare.',
+  quick: 'Quick (temporary tunnel)',
+  token: 'Token (named tunnel)',
+  passwordRef: 'Password credential reference',
+  passwordRefHint: 'Credential-service reference for the shared access password, not the password itself.',
+  sessionTtlHours: 'Session lifetime (hours)',
+  sessionTtlHoursHint: 'Absolute lifetime of the login cookie.',
+  tokenRef: 'Tunnel Token credential reference',
+  tokenRefHint: 'Credential-service reference for the Cloudflare Tunnel Token.',
+  publicHostname: 'Public hostname',
+  publicHostnameHint: 'Hostname bound to the named tunnel in Cloudflare.',
+  gatePort: 'Gate port',
+  gatePortHint: 'Quick may use 0 for automatic allocation; Token must match the fixed ingress port configured in Cloudflare.',
+  executable: 'cloudflared executable',
+  executableHint: 'A command on PATH or an absolute path.',
+  startupTimeoutMs: 'Startup timeout (ms)',
+  startupTimeoutMsHint: 'Maximum wait for cloudflared to establish the tunnel.',
+  overridden: 'Overridden',
+  reset: 'Reset to default',
+  discard: 'Discard',
+  save: 'Save changes',
+  saving: 'Saving…',
+  saveFailed: 'The settings were not fully saved. Host state was reloaded; check the values and retry.',
+  required: 'This field is required.',
+  invalidNumber: 'Enter a valid number.',
+  invalidInteger: 'Enter an integer in range.',
+  invalidHostname: 'Enter a valid hostname, such as tunnel.example.com.',
+  tokenRefRequired: 'Token mode requires a Tunnel Token credential reference.',
+  hostnameRequired: 'Token mode requires a public hostname.',
+  fixedPortRequired: 'Token mode requires a fixed port from 1 to 65535.',
+}
+
+export type TunnelMode = 'quick' | 'token'
+
+/** Settings values mirrored from the Host schema. Secrets remain credential references. */
+export interface AuthTunnelSettings {
+  enabled: boolean
+  passwordRef: string
+  sessionTtlHours: number
+  mode: TunnelMode
+  tokenRef?: string
+  publicHostname?: string
+  gatePort: number
+  executable: string
+  startupTimeoutMs: number
+}
+
+export type RuntimePhase = 'stopped' | 'applying' | 'running' | 'error' | 'unavailable'
+
+/** Stable external-store snapshot returned by the Host runtime-status route. */
+export interface RuntimeStatusSnapshot {
+  phase: RuntimePhase
+  running: boolean
+  revision: number
+  publicUrl?: string
+  message?: string
+}
+
+type FieldKey = keyof AuthTunnelSettings
+type ValidationIssue = Extract<LocaleKey,
+  'required' | 'invalidNumber' | 'invalidInteger' | 'invalidHostname'
+  | 'tokenRefRequired' | 'hostnameRequired' | 'fixedPortRequired'>
+type DraftAction = 'set' | 'unset'
+
+interface Draft {
+  values: Record<FieldKey, string>
+  edits: Partial<Record<FieldKey, DraftAction>>
+}
+
+export type SettingsWrite =
+  | { field: FieldKey; op: 'set'; value: string | number | boolean }
+  | { field: FieldKey; op: 'unset' }
+
+const FIELD_KEYS: readonly FieldKey[] = [
+  'enabled', 'passwordRef', 'sessionTtlHours', 'mode', 'tokenRef', 'publicHostname',
+  'gatePort', 'executable', 'startupTimeoutMs',
+]
+
+const DEFAULT_VALUES: Record<FieldKey, string | number | boolean | undefined> = {
+  enabled: true,
+  passwordRef: 'DSH_WEB_PASSWORD',
+  sessionTtlHours: 720,
+  mode: 'quick',
+  tokenRef: undefined,
+  publicHostname: undefined,
+  gatePort: 0,
+  executable: 'cloudflared',
+  startupTimeoutMs: 15_000,
+}
+
+const PUBLIC_HOSTNAME_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i
+
+function record(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
+const RUNTIME_STATUS_PATH = '/dsh-auth-tunnel/status'
+const INITIAL_RUNTIME_STATUS: RuntimeStatusSnapshot = {
+  phase: 'unavailable',
+  running: false,
+  revision: 0,
+}
+
+function parseRuntimeStatus(value: unknown): RuntimeStatusSnapshot {
+  const candidate = record(value)
+  const phase = candidate.phase
+  if (phase !== 'stopped' && phase !== 'applying' && phase !== 'running' && phase !== 'error') {
+    throw new Error('invalid auth-tunnel runtime phase')
+  }
+  if (typeof candidate.running !== 'boolean' || !Number.isSafeInteger(candidate.revision)) {
+    throw new Error('invalid auth-tunnel runtime status')
+  }
+  return {
+    phase,
+    running: candidate.running,
+    revision: candidate.revision as number,
+    ...(typeof candidate.publicUrl === 'string' ? { publicUrl: candidate.publicUrl } : {}),
+    ...(typeof candidate.message === 'string' ? { message: candidate.message } : {}),
+  }
+}
+
+async function readRuntimeStatus(): Promise<RuntimeStatusSnapshot> {
+  const response = await fetch(RUNTIME_STATUS_PATH, {
+    cache: 'no-store',
+    headers: { accept: 'application/json' },
+  })
+  if (!response.ok) throw new Error(`auth-tunnel status returned ${String(response.status)}`)
+  return parseRuntimeStatus(await response.json())
+}
+
+function sameRuntimeStatus(left: RuntimeStatusSnapshot, right: RuntimeStatusSnapshot): boolean {
+  return left.phase === right.phase
+    && left.running === right.running
+    && left.revision === right.revision
+    && left.publicUrl === right.publicUrl
+    && left.message === right.message
+}
+
+/** Polling external store used directly by useSyncExternalStore. */
+export class RuntimeStatusStore {
+  private snapshot = INITIAL_RUNTIME_STATUS
+  private readonly listeners = new Set<() => void>()
+  private timer: ReturnType<typeof setTimeout> | undefined
+  private task: Promise<void> | undefined
+  private disposed = false
+
+  constructor(private readonly read: () => Promise<RuntimeStatusSnapshot> = readRuntimeStatus) {}
+
+  readonly getSnapshot = (): RuntimeStatusSnapshot => this.snapshot
+
+  readonly subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener)
+    if (this.listeners.size === 1) void this.refresh()
+    return () => {
+      this.listeners.delete(listener)
+      if (this.listeners.size === 0 && this.timer !== undefined) {
+        clearTimeout(this.timer)
+        this.timer = undefined
+      }
+    }
+  }
+
+  readonly refresh = (): Promise<void> => {
+    if (this.disposed) return Promise.resolve()
+    if (this.task !== undefined) return this.task
+    this.task = this.pull().finally(() => {
+      this.task = undefined
+      this.schedule()
+    })
+    return this.task
+  }
+
+  dispose(): void {
+    this.disposed = true
+    this.listeners.clear()
+    if (this.timer !== undefined) clearTimeout(this.timer)
+    this.timer = undefined
+  }
+
+  private async pull(): Promise<void> {
+    let next: RuntimeStatusSnapshot
+    try {
+      next = await this.read()
+    } catch {
+      next = { phase: 'unavailable', running: false, revision: this.snapshot.revision }
+    }
+    if (sameRuntimeStatus(this.snapshot, next)) return
+    this.snapshot = next
+    for (const listener of this.listeners) listener()
+  }
+
+  private schedule(): void {
+    if (this.disposed || this.listeners.size === 0) return
+    if (this.timer !== undefined) clearTimeout(this.timer)
+    const delay = this.snapshot.phase === 'applying' ? 500 : 3000
+    this.timer = setTimeout(() => {
+      this.timer = undefined
+      void this.refresh()
+    }, delay)
+  }
+}
+
+/** Map one runtime snapshot to its localized summary label. */
+export function runtimeStatusLocaleKey(status: RuntimeStatusSnapshot): LocaleKey {
+  if (status.phase === 'running') return 'statusRunning'
+  if (status.phase === 'stopped') return 'statusStopped'
+  if (status.phase === 'applying') return 'statusApplying'
+  if (status.phase === 'unavailable') return 'statusUnavailable'
+  return status.running ? 'statusErrorRunning' : 'statusErrorStopped'
+}
+
+function owns(value: unknown, field: FieldKey): boolean {
+  return Object.hasOwn(record(value), field)
+}
+
+function display(value: unknown): string {
+  return value === undefined ? '' : String(value)
+}
+
+function inherited(snapshot: SettingsScopeSnapshot<AuthTunnelSettings>, field: FieldKey): unknown {
+  const base = record(snapshot.base)
+  return Object.hasOwn(base, field) ? base[field] : DEFAULT_VALUES[field]
+}
+
+function initialDraft(snapshot: SettingsScopeSnapshot<AuthTunnelSettings>): Draft {
+  const resolved = record(snapshot.value)
+  const values = {} as Record<FieldKey, string>
+  for (const field of FIELD_KEYS) {
+    values[field] = display(Object.hasOwn(resolved, field) ? resolved[field] : DEFAULT_VALUES[field])
+  }
+  return { values, edits: {} }
+}
+
+function numberDraft(text: string): number {
+  return text.trim() === '' ? Number.NaN : Number(text)
+}
+
+function parseDraft(draft: Draft): AuthTunnelSettings {
+  const tokenRef = draft.values.tokenRef.trim()
+  const publicHostname = draft.values.publicHostname.trim()
+  return {
+    enabled: draft.values.enabled === 'true',
+    passwordRef: draft.values.passwordRef.trim(),
+    sessionTtlHours: numberDraft(draft.values.sessionTtlHours),
+    mode: draft.values.mode as TunnelMode,
+    ...(tokenRef === '' ? {} : { tokenRef }),
+    ...(publicHostname === '' ? {} : { publicHostname }),
+    gatePort: numberDraft(draft.values.gatePort),
+    executable: draft.values.executable.trim(),
+    startupTimeoutMs: numberDraft(draft.values.startupTimeoutMs),
+  }
+}
+
+/** Validate the staged card exactly where the user can correct it. */
+export function validateSettingsValues(value: AuthTunnelSettings): Partial<Record<FieldKey, ValidationIssue>> {
+  const errors: Partial<Record<FieldKey, ValidationIssue>> = {}
+  if (value.passwordRef === '') errors.passwordRef = 'required'
+  if (!Number.isFinite(value.sessionTtlHours) || value.sessionTtlHours < 0.01) {
+    errors.sessionTtlHours = 'invalidNumber'
+  }
+  if (value.mode !== 'quick' && value.mode !== 'token') errors.mode = 'required'
+  if (value.publicHostname !== undefined && !PUBLIC_HOSTNAME_PATTERN.test(value.publicHostname)) {
+    errors.publicHostname = 'invalidHostname'
+  }
+  if (!Number.isInteger(value.gatePort) || value.gatePort < 0 || value.gatePort > 65535) {
+    errors.gatePort = 'invalidInteger'
+  }
+  if (value.executable === '') errors.executable = 'required'
+  if (!Number.isInteger(value.startupTimeoutMs) || value.startupTimeoutMs < 1) {
+    errors.startupTimeoutMs = 'invalidInteger'
+  }
+  if (value.enabled && value.mode === 'token') {
+    if (value.tokenRef === undefined) errors.tokenRef = 'tokenRefRequired'
+    if (value.publicHostname === undefined) errors.publicHostname = 'hostnameRequired'
+    if (value.gatePort === 0) errors.gatePort = 'fixedPortRequired'
+  }
+  return errors
+}
+
+/**
+ * Keep every intermediate Host section valid while switching modes or
+ * activation: disable first, and enable only after the target config is valid.
+ */
+export function orderSettingsWrites(
+  writes: readonly SettingsWrite[],
+  target: Pick<AuthTunnelSettings, 'enabled' | 'mode'>,
+): SettingsWrite[] {
+  return [...writes].sort((left, right) => {
+    const rank = (write: SettingsWrite): number => {
+      if (write.field === 'enabled') return target.enabled ? 2 : -2
+      if (!target.enabled) return 0
+      if (write.field !== 'mode') return 0
+      return target.mode === 'quick' ? -1 : 1
+    }
+    return rank(left) - rank(right)
+  })
+}
+
+function savePlan(draft: Draft, target: AuthTunnelSettings): SettingsWrite[] {
+  const writes: SettingsWrite[] = []
+  for (const field of FIELD_KEYS) {
+    const action = draft.edits[field]
+    if (action === undefined) continue
+    if (action === 'unset') {
+      writes.push({ field, op: 'unset' })
+      continue
+    }
+    const value = target[field]
+    if (value === undefined) {
+      writes.push({ field, op: 'unset' })
+    } else {
+      writes.push({ field, op: 'set', value })
+    }
+  }
+  return orderSettingsWrites(writes, target)
+}
+
+function writeSatisfied(snapshot: SettingsScopeSnapshot<AuthTunnelSettings>, write: SettingsWrite): boolean {
+  const user = record(snapshot.user)
+  if (write.op === 'unset') return !Object.hasOwn(user, write.field)
+  return Object.hasOwn(user, write.field) && Object.is(user[write.field], write.value)
+}
+
+const styles: Record<string, CSSProperties> = {
+  card: {
+    listStyle: 'none', border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 12,
+    background: 'var(--dsw-alias-bg-layer-3)', color: 'var(--dsw-alias-label-primary)',
+  },
+  summary: {
+    cursor: 'pointer', padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 12,
+  },
+  heading: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 },
+  title: { fontSize: 15, fontWeight: 600, lineHeight: 1.4 },
+  description: { fontSize: 13, lineHeight: 1.5, color: 'var(--dsw-alias-label-tertiary)' },
+  badge: {
+    borderRadius: 999, padding: '1px 8px', fontSize: 11, lineHeight: '17px', whiteSpace: 'nowrap',
+    background: 'var(--dsw-alias-bg-module-platform)', color: 'var(--dsw-alias-label-secondary)',
+  },
+  body: { borderTop: '1px solid var(--dsw-alias-border-l2)', margin: '0 16px', paddingBottom: 8 },
+  note: { margin: '12px 0 0', fontSize: 12, lineHeight: 1.5, color: 'var(--dsw-alias-label-tertiary)' },
+  runtime: {
+    display: 'flex', flexDirection: 'column', gap: 6, margin: '12px 0 0', padding: '10px 12px',
+    borderRadius: 8, background: 'var(--dsw-alias-bg-module-platform)', fontSize: 12, lineHeight: 1.5,
+  },
+  runtimeRow: { display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 12 },
+  runtimeLabel: { color: 'var(--dsw-alias-label-tertiary)' },
+  runtimeValue: { color: 'var(--dsw-alias-label-primary)', fontWeight: 600, textAlign: 'right' },
+  runtimeLink: { color: 'var(--dsw-alias-label-secondary)', overflowWrap: 'anywhere', textAlign: 'right' },
+  runtimeError: { margin: 0, color: 'var(--dsw-alias-label-error)', overflowWrap: 'anywhere' },
+  field: { display: 'flex', flexDirection: 'column', gap: 6, padding: '12px 0' },
+  fieldHead: { display: 'flex', alignItems: 'center', gap: 8 },
+  label: { flex: 1, minWidth: 0, fontSize: 13, fontWeight: 500, lineHeight: 1.5 },
+  reset: {
+    border: 0, background: 'none', padding: 0, font: 'inherit', fontSize: 12,
+    color: 'var(--dsw-alias-label-secondary)', cursor: 'pointer',
+  },
+  input: {
+    height: 34, boxSizing: 'border-box', padding: '0 12px',
+    border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8,
+    background: 'var(--dsw-alias-bg-layer-3)', color: 'var(--dsw-alias-label-primary)',
+    font: 'inherit', fontSize: 13,
+  },
+  hint: { margin: 0, fontSize: 12, lineHeight: 1.5, color: 'var(--dsw-alias-label-tertiary)' },
+  toggle: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 },
+  checkbox: { width: 18, height: 18, margin: 0, accentColor: 'var(--dsw-alias-label-primary)' },
+  error: { margin: 0, fontSize: 12, lineHeight: 1.5, color: 'var(--dsw-alias-label-error)' },
+  footer: {
+    display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8,
+    padding: '12px 0 4px', borderTop: '1px solid var(--dsw-alias-border-l2)',
+  },
+  failed: { flex: 1, margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-error)' },
+  button: {
+    border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8, padding: '5px 14px',
+    background: 'none', color: 'var(--dsw-alias-label-secondary)', font: 'inherit', fontSize: 13,
+    cursor: 'pointer',
+  },
+  save: {
+    border: '1px solid transparent', borderRadius: 8, padding: '5px 14px',
+    background: 'var(--dsw-alias-label-primary)', color: 'var(--dsw-alias-bg-layer-3)',
+    font: 'inherit', fontSize: 13, cursor: 'pointer',
+  },
+}
+
+type CardProps = PropsRuntime<'settings.plugin.item'> & PropsLocale<typeof LOCALE_NAMESPACE>
+
+interface FieldProps {
+  t: CardProps['t']
+  field: FieldKey
+  label: LocaleKey
+  hint: LocaleKey
+  value: string
+  error?: ValidationIssue
+  overridden: boolean
+  disabled: boolean
+  inputMode?: 'decimal' | 'numeric'
+  onEdit: (text: string) => void
+  onReset: () => void
+}
+
+function Field(props: FieldProps) {
+  return (
+    <div style={styles.field}>
+      <div style={styles.fieldHead}>
+        <label style={styles.label} htmlFor={`auth-tunnel-${props.field}`}>{props.t(props.label)}</label>
+        {props.overridden ? <span style={styles.badge}>{props.t('overridden')}</span> : null}
+        {props.overridden
+          ? <button type="button" style={styles.reset} disabled={props.disabled} onClick={props.onReset}>{props.t('reset')}</button>
+          : null}
+      </div>
+      <input
+        id={`auth-tunnel-${props.field}`}
+        type="text"
+        inputMode={props.inputMode}
+        style={{ ...styles.input, ...(props.error === undefined ? {} : { borderColor: 'var(--dsw-alias-label-error)' }) }}
+        aria-invalid={props.error === undefined ? undefined : true}
+        value={props.value}
+        disabled={props.disabled}
+        onChange={(event) => { props.onEdit(event.target.value) }}
+      />
+      <p style={props.error === undefined ? styles.hint : styles.error}>
+        {props.t(props.error ?? props.hint)}
+      </p>
+    </div>
+  )
+}
+
+interface FormProps {
+  t: CardProps['t']
+  snapshot: SettingsScopeSnapshot<AuthTunnelSettings>
+  dirty: boolean
+  saving: boolean
+  failed: boolean
+  onDirty: (dirty: boolean) => void
+  onSave: (draft: Draft) => void
+  onDiscard: () => void
+}
+
+function SettingsForm(props: FormProps) {
+  const initial = initialDraft(props.snapshot)
+  const [draft, setDraft] = useState(initial)
+  const target = parseDraft(draft)
+  const errors = validateSettingsValues(target)
+  const disabled = !props.snapshot.writable || props.saving
+  const invalid = Object.keys(errors).length !== 0
+
+  const edit = (field: FieldKey, text: string): void => {
+    const edits = { ...draft.edits }
+    if (text === initial.values[field]) delete edits[field]
+    else edits[field] = 'set'
+    const next = { values: { ...draft.values, [field]: text }, edits }
+    setDraft(next)
+    props.onDirty(Object.keys(edits).length !== 0)
+  }
+
+  const reset = (field: FieldKey): void => {
+    const edits = { ...draft.edits }
+    if (owns(props.snapshot.user, field)) edits[field] = 'unset'
+    else delete edits[field]
+    const next = {
+      values: { ...draft.values, [field]: display(inherited(props.snapshot, field)) },
+      edits,
+    }
+    setDraft(next)
+    props.onDirty(Object.keys(edits).length !== 0)
+  }
+
+  const overridden = (field: FieldKey): boolean => {
+    if (draft.edits[field] === 'unset') return false
+    if (draft.edits[field] === 'set') {
+      return target[field] !== undefined
+    }
+    return owns(props.snapshot.user, field)
+  }
+
+  const field = (
+    key: FieldKey,
+    label: LocaleKey,
+    hint: LocaleKey,
+    inputMode?: 'decimal' | 'numeric',
+  ) => (
+    <Field
+      t={props.t}
+      field={key}
+      label={label}
+      hint={hint}
+      value={draft.values[key]}
+      overridden={overridden(key)}
+      disabled={disabled}
+      {...errors[key] === undefined ? {} : { error: errors[key] }}
+      {...inputMode === undefined ? {} : { inputMode }}
+      onEdit={(text) => { edit(key, text) }}
+      onReset={() => { reset(key) }}
+    />
+  )
+
+  return (
+    <>
+      <div style={styles.field}>
+        <div style={styles.fieldHead}>
+          <label style={styles.label} htmlFor="auth-tunnel-enabled">{props.t('enabled')}</label>
+          {overridden('enabled') ? <span style={styles.badge}>{props.t('overridden')}</span> : null}
+          {overridden('enabled')
+            ? <button type="button" style={styles.reset} disabled={disabled} onClick={() => { reset('enabled') }}>{props.t('reset')}</button>
+            : null}
+        </div>
+        <label style={styles.toggle}>
+          <input
+            id="auth-tunnel-enabled"
+            type="checkbox"
+            role="switch"
+            style={styles.checkbox}
+            checked={target.enabled}
+            disabled={disabled}
+            onChange={(event) => { edit('enabled', String(event.target.checked)) }}
+          />
+          <span>{props.t(target.enabled ? 'enabledOn' : 'enabledOff')}</span>
+        </label>
+        <p style={styles.hint}>{props.t('enabledHint')}</p>
+      </div>
+      <div style={styles.field}>
+        <div style={styles.fieldHead}>
+          <label style={styles.label} htmlFor="auth-tunnel-mode">{props.t('mode')}</label>
+          {overridden('mode') ? <span style={styles.badge}>{props.t('overridden')}</span> : null}
+          {overridden('mode')
+            ? <button type="button" style={styles.reset} disabled={disabled} onClick={() => { reset('mode') }}>{props.t('reset')}</button>
+            : null}
+        </div>
+        <select
+          id="auth-tunnel-mode"
+          style={styles.input}
+          value={draft.values.mode}
+          disabled={disabled}
+          onChange={(event) => { edit('mode', event.target.value) }}
+        >
+          <option value="quick">{props.t('quick')}</option>
+          <option value="token">{props.t('token')}</option>
+        </select>
+        <p style={styles.hint}>{props.t('modeHint')}</p>
+      </div>
+      {field('passwordRef', 'passwordRef', 'passwordRefHint')}
+      {field('sessionTtlHours', 'sessionTtlHours', 'sessionTtlHoursHint', 'decimal')}
+      {target.mode === 'token' ? field('tokenRef', 'tokenRef', 'tokenRefHint') : null}
+      {target.mode === 'token' ? field('publicHostname', 'publicHostname', 'publicHostnameHint') : null}
+      {field('gatePort', 'gatePort', 'gatePortHint', 'numeric')}
+      {field('executable', 'executable', 'executableHint')}
+      {field('startupTimeoutMs', 'startupTimeoutMs', 'startupTimeoutMsHint', 'numeric')}
+      <div style={styles.footer}>
+        {props.failed ? <p role="status" style={styles.failed}>{props.t('saveFailed')}</p> : null}
+        <button
+          type="button"
+          style={{ ...styles.button, ...((!props.dirty || props.saving) ? { opacity: 0.4, cursor: 'default' } : {}) }}
+          disabled={!props.dirty || props.saving}
+          onClick={() => {
+            setDraft(initial)
+            props.onDirty(false)
+            props.onDiscard()
+          }}
+        >
+          {props.t('discard')}
+        </button>
+        <button
+          type="button"
+          style={{ ...styles.save, ...((!props.dirty || invalid || disabled) ? { opacity: 0.4, cursor: 'default' } : {}) }}
+          disabled={!props.dirty || invalid || disabled}
+          onClick={() => { props.onSave(draft) }}
+        >
+          {props.t(props.saving ? 'saving' : 'save')}
+        </button>
+      </div>
+    </>
+  )
+}
+
+interface ShellState {
+  revision: number | undefined
+  dirty: boolean
+  saving: boolean
+  failed: boolean
+}
+
+function AuthTunnelCard(props: CardProps & {
+  scope: SettingsScope<AuthTunnelSettings>
+  runtime: RuntimeStatusStore
+}) {
+  const snapshot = useSyncExternalStore(props.scope.subscribe, props.scope.getSnapshot)
+  const runtime = useSyncExternalStore(
+    props.runtime.subscribe,
+    props.runtime.getSnapshot,
+    props.runtime.getSnapshot,
+  )
+  const [shell, setShell] = useState<ShellState>({
+    revision: snapshot.revision,
+    dirty: false,
+    saving: false,
+    failed: false,
+  })
+
+  // A new Host revision is a new form identity. Reset during render rather
+  // than mirroring an external store through an Effect.
+  if (!shell.saving && shell.revision !== snapshot.revision) {
+    setShell({ revision: snapshot.revision, dirty: false, saving: false, failed: false })
+  }
+
+  if (snapshot.status !== 'ready' || snapshot.value === undefined) return null
+
+  const save = async (draft: Draft): Promise<void> => {
+    const target = parseDraft(draft)
+    const writes = savePlan(draft, target)
+    const startingRevision = snapshot.revision
+    setShell(current => ({ ...current, saving: true, failed: false }))
+    let threw = false
+    try {
+      for (const write of writes) {
+        if (write.op === 'set') await props.scope.set(write.field, write.value)
+        else await props.scope.unset(write.field)
+      }
+    } catch {
+      threw = true
+    }
+    const latest = props.scope.getSnapshot()
+    const failed = threw || latest.status !== 'ready' || writes.some(write => !writeSatisfied(latest, write))
+    const draftSurvived = latest.revision === startingRevision
+    setShell({
+      revision: latest.revision,
+      dirty: failed && draftSurvived,
+      saving: false,
+      failed,
+    })
+    void props.runtime.refresh()
+  }
+
+  return (
+    <li style={styles.card}>
+      <details>
+        <summary style={styles.summary}>
+          <span style={styles.heading}>
+            <span style={styles.title}>{props.t('title')}</span>
+            <span style={styles.description}>{props.t('description')}</span>
+          </span>
+          <span style={styles.badge}>{props.t(runtimeStatusLocaleKey(runtime))}</span>
+          {shell.dirty ? <span style={styles.badge}>{props.t('unsaved')}</span> : null}
+        </summary>
+        <div style={styles.body}>
+          {!snapshot.writable ? <p role="status" style={styles.note}>{props.t('readOnly')}</p> : null}
+          <div role="status" style={styles.runtime}>
+            <div style={styles.runtimeRow}>
+              <span style={styles.runtimeLabel}>{props.t('status')}</span>
+              <span style={styles.runtimeValue}>{props.t(runtimeStatusLocaleKey(runtime))}</span>
+            </div>
+            {runtime.publicUrl === undefined ? null : (
+              <div style={styles.runtimeRow}>
+                <span style={styles.runtimeLabel}>{props.t('publicUrl')}</span>
+                <a href={runtime.publicUrl} target="_blank" rel="noreferrer" style={styles.runtimeLink}>{runtime.publicUrl}</a>
+              </div>
+            )}
+            {runtime.message === undefined ? null : <p style={styles.runtimeError}>{runtime.message}</p>}
+          </div>
+          <p role="note" style={styles.note}>{props.t('live')}</p>
+          <SettingsForm
+            key={String(snapshot.revision)}
+            t={props.t}
+            snapshot={snapshot}
+            dirty={shell.dirty}
+            saving={shell.saving}
+            failed={shell.failed}
+            onDirty={(dirty) => {
+              setShell(current => ({ ...current, dirty, failed: false }))
+            }}
+            onSave={(draft) => { void save(draft) }}
+            onDiscard={() => {
+              setShell(current => ({ ...current, dirty: false, failed: false }))
+            }}
+          />
+        </div>
+      </details>
+    </li>
+  )
+}
+
+/** Required browser services for the keyed settings-card contribution. */
+export const inject = ['slots', 'locale', 'connection', 'remote', 'settingsScope']
+
+/** Register the browser half under the Host namespace's key. */
+export function apply(ctx: ClientContext): void {
+  const source = ctx.settingsScope.bind<AuthTunnelSettings>({ namespace: SETTINGS_NAMESPACE })
+  // Methods on the scope controller use `this`; stable wrappers are also the
+  // stable subscribe/getSnapshot pair required by useSyncExternalStore.
+  const scope: SettingsScope<AuthTunnelSettings> = {
+    getSnapshot: () => source.getSnapshot(),
+    subscribe: listener => source.subscribe(listener),
+    set: (field, value) => source.set(field, value),
+    unset: field => source.unset(field),
+  }
+  const runtime = new RuntimeStatusStore()
+  ctx.effect(() => () => { runtime.dispose() }, 'auth-tunnel: runtime status')
+  ctx.effect(() => ctx.locale.register(LOCALE_NAMESPACE, { zh, en }), 'auth-tunnel: settings dictionaries')
+  const Card = (props: CardProps) => <AuthTunnelCard {...props} scope={scope} runtime={runtime} />
+  ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
+    name: 'settings.plugin.item',
+    key: SETTINGS_NAMESPACE,
+    locale: LOCALE_NAMESPACE,
+  }, Card))
+}
