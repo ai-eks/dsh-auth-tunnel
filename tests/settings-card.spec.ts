@@ -212,7 +212,7 @@ describe('auth-tunnel settings card contract', () => {
     expect(order).toEqual(['settings', 'credential'])
   })
 
-  it('rejects a local password write targeting the tunnel token', async () => {
+  it('rejects a passwordless local passwordRef change targeting the tunnel token', async () => {
     const order: string[] = []
     const { api, describe, mutate, set } = successfulCardApi({}, order)
     const current = { ...quick, tokenRef: 'DSH_TUNNEL_TOKEN' }
@@ -223,7 +223,7 @@ describe('auth-tunnel settings card contract', () => {
       [{ field: 'passwordRef', op: 'set', value: 'DSH_TUNNEL_TOKEN' }],
       current,
       { ...current, passwordRef: 'DSH_TUNNEL_TOKEN' },
-      'replacement',
+      '',
     )).rejects.toThrow('conflicts')
 
     expect(describe).not.toHaveBeenCalled()

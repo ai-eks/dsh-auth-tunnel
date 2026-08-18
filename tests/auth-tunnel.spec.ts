@@ -90,7 +90,7 @@ class StubSystemPrompt extends Service {
 
 /** Writable in-memory settings provider exercising the real rc7 service definition. */
 class StubSettings extends SettingsProvider {
-  readonly writable = true
+  writable = true
   failNextPersist = false
   private document: Record<string, unknown>
 
@@ -552,6 +552,55 @@ describe('password gate over the loopback webserver', () => {
       .toMatchObject({ value: 's3kret-passw0rd' })
   })
 
+  it('rejects a passwordless remote passwordRef collision with the tunnel token', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({
+      allowRemoteSettings: true,
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+    }, { seeds: { DSH_TUNNEL_TOKEN: 'tunnel-token' } })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'passwordRef', op: 'set', value: 'DSH_TUNNEL_TOKEN' }],
+        password: '',
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
+  })
+
+  it('rejects password-only remote saves while Host settings are read-only', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    composition.settings().writable = false
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [],
+        password: 'read-only-password',
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(await composition.credentials().resolve('DSH_WEB_PASSWORD'))
+      .toMatchObject({ value: 's3kret-passw0rd' })
+  })
+
   it.each(['DSH_TUNNEL_TOKEN', 'OTHER_HOST_SECRET'])(
     'does not let a remote password write overwrite existing non-access credential %s',
     { timeout: 60_000 },
@@ -932,6 +981,40 @@ describe('upgrade pass-through', () => {
       '',
     ])
     expect(response).toContain('401 Unauthorized')
+  })
+
+  it('closes authenticated upgrades when the access credential rotates', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick()
+    composition.loaded.webServer.registerUpgrade({
+      path: '/events',
+      handler: (_req, socket) => {
+        socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: dsh-echo\r\nConnection: Upgrade\r\n\r\n')
+        socket.on('data', (chunk: Buffer) => { socket.write(chunk) })
+      },
+    })
+    const base = await composition.gateBase()
+    const port = Number(new URL(base).port)
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const socket = connect(port, '127.0.0.1')
+    socket.on('error', () => {})
+    await once(socket, 'connect')
+    socket.write([
+      'GET /events HTTP/1.1',
+      `Host: 127.0.0.1:${String(port)}`,
+      'Connection: Upgrade',
+      'Upgrade: dsh-echo',
+      `Cookie: ${cookie}`,
+      '',
+      '',
+    ].join('\r\n'))
+    const [head] = await once(socket, 'data') as [Buffer]
+    expect(String(head)).toContain('101 Switching Protocols')
+    const closed = once(socket, 'close')
+
+    composition.credentials().set('DSH_WEB_PASSWORD', 'rotated-password')
+
+    await closed
+    expect(socket.destroyed).toBe(true)
   })
 })
 

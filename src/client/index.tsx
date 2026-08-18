@@ -732,10 +732,10 @@ export async function commitCardChanges(
   target: AuthTunnelSettings,
   password: string,
 ): Promise<void> {
+  if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
+    throw new Error('access password credential conflicts with the tunnel token credential')
+  }
   if (password !== '') {
-    if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
-      throw new Error('access password credential conflicts with the tunnel token credential')
-    }
     if (target.passwordRef !== current.passwordRef) {
       const response = await api.credentials.describe({ refs: [target.passwordRef] })
       if (!response.result.ok) throw new Error(response.result.error.message)

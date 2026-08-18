@@ -515,6 +515,7 @@ function writeJson(res: ServerResponse, status: number, value: unknown): void {
  */
 class PasswordGate {
   private auth: { passwordRef: string; ttlMs: number; allowRemoteSettings: boolean }
+  private readonly upgradeDrops = new Set<() => void>()
   private readonly upstreamPort: number
 
   constructor(
@@ -532,11 +533,17 @@ class PasswordGate {
 
   /** Atomically replace the authentication policy used by subsequent requests. */
   updateAuth(config: { passwordRef: string; sessionTtlHours: number; allowRemoteSettings: boolean }): void {
+    if (config.passwordRef !== this.auth.passwordRef) this.revokeAuthenticatedUpgrades()
     this.auth = {
       passwordRef: config.passwordRef,
       ttlMs: config.sessionTtlHours * 3600 * 1000,
       allowRemoteSettings: config.allowRemoteSettings,
     }
+  }
+
+  /** Drop upgraded connections authenticated with the previous credential value. */
+  revokeAuthenticatedUpgrades(): void {
+    for (const drop of [...this.upgradeDrops]) drop()
   }
 
   /** Bind the gate on the configured loopback port (0 asks the OS for one).
@@ -695,7 +702,9 @@ class PasswordGate {
     if (body === undefined) return
     try {
       const request = parseRemoteSettingsWriteRequest(body)
-      const opened = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE).descriptor
+      const openedSettings = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
+      if (!openedSettings.writable) throw new Error('settings provider is read-only')
+      const opened = openedSettings.descriptor
       if (request.expectedRevision !== undefined
         && request.expectedRevision !== opened.revision) {
         throw new Error('settings revision changed')
@@ -706,10 +715,10 @@ class PasswordGate {
       if (password !== '' && current.enabled && changesTunnelRoute(current, target)) {
         throw new Error('rotate the access password separately from tunnel route changes')
       }
+      if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
+        throw new Error('access password credential conflicts with the tunnel token credential')
+      }
       if (password !== '') {
-        if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
-          throw new Error('access password credential conflicts with the tunnel token credential')
-        }
         if (target.passwordRef !== current.passwordRef
           && await this.ctx.credentials.resolve(credentialRef(target.passwordRef)) !== undefined) {
           throw new Error('access password credential already exists')
@@ -854,6 +863,21 @@ class PasswordGate {
       return
     }
     const upstream = netConnect(this.upstreamPort, '127.0.0.1')
+    let dropped = false
+    const drop = (): void => {
+      if (dropped) return
+      dropped = true
+      this.upgradeDrops.delete(drop)
+      upstream.destroy()
+      socket.destroy()
+    }
+    this.upgradeDrops.add(drop)
+    upstream.once('end', drop)
+    socket.once('end', drop)
+    upstream.once('close', drop)
+    socket.once('close', drop)
+    upstream.once('error', drop)
+    socket.once('error', drop)
     await once(upstream, 'connect')
     const headers = upstreamHeaders(req, this.upstreamPort)
     /* v8 ignore next 2 -- IncomingMessage surface entries carry no undefined values; node joins repeats */
@@ -864,17 +888,6 @@ class PasswordGate {
     if (head.length > 0) upstream.write(head)
     upstream.pipe(socket)
     socket.pipe(upstream)
-    // Either half finishing tears the other down right away: waiting for
-    // 'close' on both sides would deadlock (each side's FIN waits on the
-    // other's).
-    const drop = (): void => {
-      upstream.destroy()
-      socket.destroy()
-    }
-    upstream.once('end', drop)
-    socket.once('end', drop)
-    upstream.once('error', drop)
-    socket.once('error', drop)
   }
 }
 
@@ -1152,6 +1165,7 @@ class AuthTunnelRuntime {
     const config = this.configured
     const tokenUpdated = config?.mode === 'token' && config.tokenRef === ref
     if (tokenUpdated) this.tokenCredentialGeneration += 1
+    if (config?.passwordRef === ref) this.active?.gate.revokeAuthenticatedUpgrades()
     if (config?.passwordRef === ref || tokenUpdated) {
       this.request(config)
     }
