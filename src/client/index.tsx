@@ -338,9 +338,10 @@ export class RuntimeStatusStore {
   }
 
   /** Reflect one committed settings write while the Host runtime reconciles it. */
-  settingsCommitted(enabled: boolean): void {
+  settingsCommitted(enabled: boolean, afterRevision = this.snapshot.revision): void {
     this.reliable = true
-    this.pendingAfterRevision = this.snapshot.revision
+    if (this.snapshot.revision > afterRevision) return
+    this.pendingAfterRevision = afterRevision
     this.publish(enabled
       ? {
           phase: 'applying',
@@ -1146,6 +1147,7 @@ function AuthTunnelCard(props: CardProps & {
     const current = snapshotValue
     const runtimeChanged = writes.some(write => !Object.is(current[write.field], target[write.field]))
     const startingRevision = snapshot.revision
+    const runtimeRevision = props.runtime.getSnapshot().revision
     setShell(current => ({ ...current, saving: true, failed: false }))
     let succeeded = false
     try {
@@ -1171,7 +1173,7 @@ function AuthTunnelCard(props: CardProps & {
       saving: false,
       failed,
     }))
-    if (!failed && runtimeChanged) props.runtime.settingsCommitted(target.enabled)
+    if (!failed && runtimeChanged) props.runtime.settingsCommitted(target.enabled, runtimeRevision)
     void props.runtime.refresh()
   }
 

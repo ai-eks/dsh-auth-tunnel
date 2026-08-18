@@ -515,6 +515,7 @@ function writeJson(res: ServerResponse, status: number, value: unknown): void {
 
 /** Resolve only after Node has finished handing the response to the socket. */
 function writeJsonComplete(res: ServerResponse, status: number, value: unknown): Promise<void> {
+  if (res.destroyed || res.writableEnded || res.writableFinished) return Promise.resolve()
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
   return new Promise<void>((resolve) => {
     const done = (): void => {
@@ -595,11 +596,18 @@ class PasswordGate {
   private async remoteSettingsAuthorized(req: IncomingMessage): Promise<boolean> {
     const passwordRef = this.auth.passwordRef
     const authGeneration = this.authGeneration
-    return this.auth.allowRemoteSettings
+    const authenticated = this.auth.allowRemoteSettings
       && await this.authenticated(req)
       && this.auth.allowRemoteSettings
       && this.auth.passwordRef === passwordRef
       && this.authGeneration === authGeneration
+    if (!authenticated) return false
+    try {
+      const { descriptor } = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
+      return Config(objectRecord(descriptor.value) as unknown as InternalConfig).passwordRef === passwordRef
+    } catch {
+      return false
+    }
   }
 
   /** Revalidate authorization after reading a remote mutation body. */
@@ -751,6 +759,10 @@ class PasswordGate {
   /** Read or commit the authenticated plugin settings card. */
   private async handleRemoteSettings(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method === 'GET') {
+      if (!await this.remoteSettingsAuthorized(req)) {
+        writeJson(res, 403, { error: 'remote settings authorization changed' })
+        return
+      }
       try {
         writeJson(res, 200, remoteSettingsDocument(this.ctx))
       } catch {
@@ -1149,7 +1161,7 @@ class AuthTunnelRuntime {
   private finishHandoff: (() => void) | undefined
   private readonly remoteMutations: RemoteMutationFence = { tail: Promise.resolve() }
   private readonly liveGates = new Set<PasswordGate>()
-  private tokenCredentialGeneration = 0
+  private readonly tokenCredentialGenerations = new Map<string, number>()
   private appliedTokenCredentialGeneration = 0
   private configured: InternalConfig | undefined
   private revision = 0
@@ -1204,7 +1216,7 @@ class AuthTunnelRuntime {
       return
     }
     this.setStatus('applying', false)
-    const tokenGeneration = this.tokenCredentialGeneration
+    const tokenGeneration = this.tokenGeneration(config)
     try {
       const candidate = await this.startFull(config)
       if (this.disposed) {
@@ -1255,10 +1267,12 @@ class AuthTunnelRuntime {
   /** Retry the latest desired settings after its access credential is repaired. */
   credentialUpdated(ref: string): void {
     const config = this.configured
-    const tokenUpdated = config?.mode === 'token' && config.tokenRef === ref
-    if (tokenUpdated) this.tokenCredentialGeneration += 1
+    const configuredTokenUpdated = config?.mode === 'token' && config.tokenRef === ref
+    const activeTokenUpdated = this.active?.config.mode === 'token' && this.active.config.tokenRef === ref
+    const tokenUpdated = configuredTokenUpdated || activeTokenUpdated
+    if (tokenUpdated) this.tokenCredentialGenerations.set(ref, (this.tokenCredentialGenerations.get(ref) ?? 0) + 1)
     for (const gate of this.liveGates) gate.credentialUpdated(ref)
-    if (config?.passwordRef === ref || tokenUpdated) {
+    if (config !== undefined && (config.passwordRef === ref || tokenUpdated)) {
       this.request(config)
     }
   }
@@ -1340,8 +1354,8 @@ class AuthTunnelRuntime {
       return
     }
 
-    const tokenGeneration = this.tokenCredentialGeneration
-    const current = this.active
+    const tokenGeneration = this.tokenGeneration(next)
+    let current = this.active
     if (current === undefined) {
       const candidate = await this.startFull(next)
       if (this.disposed) {
@@ -1355,6 +1369,15 @@ class AuthTunnelRuntime {
       this.setStatus('running', true, candidate.publicUrl)
       this.appliedTokenCredentialGeneration = tokenGeneration
       return
+    }
+
+    const activeTokenGeneration = this.tokenGeneration(current.config)
+    if (current.config.mode === 'token'
+      && this.appliedTokenCredentialGeneration !== activeTokenGeneration
+      && (next.mode !== 'token' || next.tokenRef !== current.config.tokenRef)) {
+      const refreshed = await this.refreshRetainedTokenTunnel(current, activeTokenGeneration)
+      if (refreshed === undefined) return
+      current = refreshed
     }
 
     await this.requirePassword(next.passwordRef)
@@ -1467,6 +1490,40 @@ class AuthTunnelRuntime {
     if (await sessionKey(this.ctx, ref) === undefined) {
       throw new Error(`auth-tunnel: credential reference "${ref}" is not configured`)
     }
+  }
+
+  private tokenGeneration(config: InternalConfig): number {
+    if (config.mode !== 'token' || config.tokenRef === undefined) return 0
+    return this.tokenCredentialGenerations.get(config.tokenRef) ?? 0
+  }
+
+  /** Refresh the actually retained token child before retrying a different failed target. */
+  private async refreshRetainedTokenTunnel(
+    current: ActiveTunnel,
+    tokenGeneration: number,
+  ): Promise<ActiveTunnel | undefined> {
+    const spawned = await this.spawnStaged(current.config, `http://127.0.0.1:${String(current.port)}`)
+    if (this.disposed) {
+      this.intentionalExits.add(spawned.child)
+      await killTree(spawned.child)
+      return undefined
+    }
+    const candidate: ActiveTunnel = {
+      config: current.config,
+      gate: current.gate,
+      server: current.server,
+      port: current.port,
+      child: spawned.child,
+      publicUrl: spawned.publicUrl,
+      alive: true,
+    }
+    if (!this.adopt(candidate)) {
+      await this.stopChild(candidate)
+      throw this.exitedBeforeAdoption(candidate)
+    }
+    await this.stopChild(current)
+    this.appliedTokenCredentialGeneration = tokenGeneration
+    return candidate
   }
 
   private async startFull(config: InternalConfig): Promise<ActiveTunnel> {

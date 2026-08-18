@@ -519,6 +519,14 @@ describe('auth-tunnel settings card contract', () => {
     live = { phase: 'running', running: true, revision: 9, publicUrl: 'https://next.example.com' }
     await store.refresh()
     expect(store.getSnapshot()).toBe(live)
+
+    const saveStartedAtRevision = store.getSnapshot().revision
+    live = { phase: 'running', running: true, revision: 10, publicUrl: 'https://saved.example.com' }
+    await store.refresh()
+    store.settingsCommitted(true, saveStartedAtRevision)
+    expect(store.getSnapshot()).toBe(live)
+    await store.refresh()
+    expect(store.getSnapshot()).toBe(live)
     store.dispose()
 
     const unavailable = new RuntimeStatusStore(() => Promise.reject(new Error('offline')))

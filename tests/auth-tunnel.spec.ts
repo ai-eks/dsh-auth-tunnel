@@ -101,6 +101,8 @@ class StubSystemPrompt extends Service {
 class StubSettings extends SettingsProvider {
   writable = true
   failNextPersist = false
+  persistBarrier: Promise<void> | undefined
+  persistStarted: (() => void) | undefined
   private document: Record<string, unknown>
 
   constructor(ctx: Context, config?: { document?: Record<string, unknown> }) {
@@ -112,13 +114,14 @@ class StubSettings extends SettingsProvider {
     return Promise.resolve(structuredClone(this.document))
   }
 
-  protected persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void> {
+  protected async persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void> {
     if (this.failNextPersist) {
       this.failNextPersist = false
-      return Promise.reject(new Error('settings persistence failed'))
+      throw new Error('settings persistence failed')
     }
+    this.persistStarted?.()
+    if (this.persistBarrier !== undefined) await this.persistBarrier
     this.document = { ...this.document, [ns]: structuredClone(section) }
-    return Promise.resolve()
   }
 }
 
@@ -779,6 +782,49 @@ describe('password gate over the loopback webserver', () => {
     })
     expect(response.status).toBe(200)
     expect(await response.json()).toMatchObject({ settings: { value: { enabled: false } } })
+    await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
+    expect(await liveFixturePids()).toEqual([])
+  })
+
+  it('releases the remote mutation fence when the writer disconnects before the response', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const port = Number(new URL(base).port)
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    let releasePersist = (): void => {}
+    composition.settings().persistBarrier = new Promise<void>((resolve) => { releasePersist = resolve })
+    let markPersistStarted = (): void => {}
+    const persistStarted = new Promise<void>((resolve) => { markPersistStarted = resolve })
+    composition.settings().persistStarted = markPersistStarted
+    const body = JSON.stringify({
+      expectedRevision: opened.settings.revision,
+      writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+      password: '',
+    })
+    const socket = connect(port, '127.0.0.1')
+    socket.on('error', () => {})
+    await once(socket, 'connect')
+    socket.write([
+      'POST /dsh-auth-tunnel/settings HTTP/1.1',
+      `Host: 127.0.0.1:${String(port)}`,
+      'Content-Type: application/json',
+      `Content-Length: ${String(Buffer.byteLength(body))}`,
+      `Cookie: ${cookie}`,
+      '',
+      body,
+    ].join('\r\n'))
+    await persistStarted
+    socket.destroy()
+    await sleep(50)
+    composition.settings().persistStarted = undefined
+    composition.settings().persistBarrier = undefined
+    releasePersist()
+    await sleep(50)
+
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
     await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
     expect(await liveFixturePids()).toEqual([])
   })
@@ -1706,7 +1752,7 @@ describe('rc7 plugin settings', () => {
       .rejects.toThrow(/token mode requires tokenRef/)
   })
 
-  it('hot-switches the password reference and preserves the live gate when the new credential is missing', { timeout: 60_000 }, async () => {
+  it('withholds remote settings when a password reference cannot be applied', { timeout: 60_000 }, async () => {
     const composition = await loadComposition({
       allowRemoteSettings: true,
       mode: 'quick',
@@ -1753,19 +1799,8 @@ describe('rc7 plugin settings', () => {
     expect(failed.message).toContain('MISSING_PASSWORD')
     await login(base, undefined, 'next-settings-password')
 
-    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
-      settings: { revision: number }
-    }
-    const repairedResponse = await fetch(`${base}/dsh-auth-tunnel/settings`, {
-      method: 'POST',
-      headers: { cookie, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        expectedRevision: opened.settings.revision,
-        writes: [],
-        password: 'repaired-password',
-      }),
-    })
-    expect(repairedResponse.status).toBe(200)
+    expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
+    composition.credentials().set('MISSING_PASSWORD', 'repaired-password')
     await waitForStatus(
       composition,
       status => status.revision > failed.revision && status.phase === 'running',
@@ -1840,6 +1875,40 @@ describe('rc7 plugin settings', () => {
     const replacementPids = await liveFixturePids()
     expect(replacementPids).toHaveLength(1)
     expect(replacementPids).not.toEqual(originalPids)
+  })
+
+  it('restarts the retained token tunnel after a different configured token fails', { timeout: 60_000 }, async () => {
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const gatePort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const composition = await loadComposition({
+      mode: 'token',
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
+      gatePort,
+      executable: await fixtureExecutable('fake-cloudflared-token-recording.sh'),
+      startupTimeoutMs: 15_000,
+    }, { seeds: { DSH_TUNNEL_TOKEN: 'fixture-token-1' } })
+
+    await composition.settings().update(namespace, { tokenRef: 'MISSING_TUNNEL_TOKEN' })
+    const failed = await waitForStatus(composition, status => status.phase === 'error' && status.running)
+    const originalPids = await liveFixturePids()
+
+    composition.credentials().set('DSH_TUNNEL_TOKEN', 'fixture-token-2')
+    await waitForStatus(
+      composition,
+      status => status.revision > failed.revision && status.phase === 'error' && status.running,
+      7000,
+    )
+
+    const replacementPids = await liveFixturePids()
+    expect(replacementPids).toHaveLength(1)
+    expect(replacementPids).not.toEqual(originalPids)
+    expect(await readFile(join(tmpdir(), `${FAKE_PREFIX}${replacementPids[0]!}.token`), 'utf8'))
+      .toBe('fixture-token-2')
   })
 
   it('applies the latest token when it rotates again during a restart', { timeout: 60_000 }, async () => {
