@@ -20,7 +20,9 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
+import {
+  settingsNamespace, type SettingsDescriptor, type SettingsPathOp,
+} from '@deepseek-ai/dsh-settings'
 // Pulls the Context augmentation typing `ctx.webServer`; no runtime import.
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ShellEnvRegistry } from '@deepseek-ai/dsh-shell-env'
@@ -33,7 +35,7 @@ export type TunnelMode = 'quick' | 'token'
 export interface Config {
   /** Keep the settings surface loaded while deciding whether the public tunnel itself runs. */
   enabled: boolean
-  /** Allow authenticated public pages to read and update Host settings. */
+  /** Allow authenticated public pages to edit this plugin and persist their language choice. */
   allowRemoteSettings: boolean
   /**
    * Credential reference resolving to the shared access password, resolved
@@ -149,10 +151,12 @@ const AUTH_PREFIX = '/dsh-auth-tunnel'
 const LOGIN_PATH = `${AUTH_PREFIX}/login`
 const LOGOUT_PATH = `${AUTH_PREFIX}/logout`
 export const AUTH_TUNNEL_STATUS_PATH = `${AUTH_PREFIX}/status`
+export const AUTH_TUNNEL_REMOTE_SETTINGS_PATH = `${AUTH_PREFIX}/settings`
+export const AUTH_TUNNEL_REMOTE_LOCALE_PATH = `${AUTH_PREFIX}/locale`
 const PUBLIC_MANIFEST_PATH = '/manifest.webmanifest'
 const AUTH_COOKIE = 'dsh_auth_tunnel'
-const SETTINGS_ACCESS_META = '<meta name="dsh-settings-access" content="host">'
 const MAX_LOGIN_BODY_BYTES = 16 * 1024
+const MAX_REMOTE_SETTINGS_BODY_BYTES = 64 * 1024
 const OUTPUT_TAIL_CHARS = 8192
 const KILL_GRACE_MS = 2000
 const TUNNEL_HANDOFF_MS = 750
@@ -168,8 +172,7 @@ const HOP_BY_HOP_HEADERS = new Set([
   'transfer-encoding',
   'upgrade',
 ])
-const REMOTE_SETTINGS_METHODS = new Set([
-  'settings.describe',
+const BLOCKED_REMOTE_CONFIGURATION_METHODS = new Set([
   'settings.openDocument',
   'settings.update',
   'settings.replace',
@@ -180,19 +183,10 @@ const REMOTE_SETTINGS_METHODS = new Set([
   'llm.discoverModels',
 ])
 
-/** Whether this API request belongs to the Host configuration plane. */
-function isRemoteSettingsRequest(url: URL): boolean {
-  if (!url.pathname.startsWith('/api/')) return false
-  return REMOTE_SETTINGS_METHODS.has(url.pathname.slice('/api/'.length))
-}
-
-/** Mark an index response whose authenticated intermediary serves Host settings. */
-export function injectSettingsAccessMeta(html: string): string {
-  if (html.includes(SETTINGS_ACCESS_META)) return html
-  const head = html.indexOf('<head>')
-  return head === -1
-    ? `${SETTINGS_ACCESS_META}${html}`
-    : `${html.slice(0, head + '<head>'.length)}${SETTINGS_ACCESS_META}${html.slice(head + '<head>'.length)}`
+/** Configuration-plane method named by one browser API request, when any. */
+function remoteConfigurationMethod(url: URL): string | undefined {
+  if (!url.pathname.startsWith('/api/')) return undefined
+  return url.pathname.slice('/api/'.length)
 }
 
 /** The model-facing prompt section text for one live public URL.
@@ -344,16 +338,21 @@ ${banner}
 </html>`
 }
 
-/** Read and parse the form body of a login post, answering oversized or wrong-type requests in place. */
-async function readForm(req: IncomingMessage, res: ServerResponse): Promise<URLSearchParams | undefined> {
+/** Read one bounded request body, answering oversized or wrong-type requests in place. */
+async function readBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+  expectedMediaType: string,
+  maxBytes: number,
+): Promise<Buffer | undefined> {
   const mediaType = req.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase()
-  if (mediaType !== 'application/x-www-form-urlencoded') {
+  if (mediaType !== expectedMediaType) {
     res.writeHead(415)
     res.end()
     return undefined
   }
   const declared = req.headers['content-length']
-  if (declared !== undefined && Number(declared) > MAX_LOGIN_BODY_BYTES) {
+  if (declared !== undefined && Number(declared) > maxBytes) {
     res.writeHead(413, { connection: 'close' })
     res.end()
     req.destroy()
@@ -363,7 +362,7 @@ async function readForm(req: IncomingMessage, res: ServerResponse): Promise<URLS
   const chunks: Buffer[] = []
   for await (const chunk of req) {
     received += (chunk as Buffer).byteLength
-    if (received > MAX_LOGIN_BODY_BYTES) {
+    if (received > maxBytes) {
       res.writeHead(413, { connection: 'close' })
       res.end()
       req.destroy()
@@ -371,7 +370,145 @@ async function readForm(req: IncomingMessage, res: ServerResponse): Promise<URLS
     }
     chunks.push(chunk as Buffer)
   }
-  return new URLSearchParams(Buffer.concat(chunks).toString('utf8'))
+  return Buffer.concat(chunks)
+}
+
+/** Read and parse the form body of a login post. */
+async function readForm(req: IncomingMessage, res: ServerResponse): Promise<URLSearchParams | undefined> {
+  const body = await readBody(req, res, 'application/x-www-form-urlencoded', MAX_LOGIN_BODY_BYTES)
+  return body === undefined ? undefined : new URLSearchParams(body.toString('utf8'))
+}
+
+/** Read and parse one plugin-owned JSON request. */
+async function readJson(req: IncomingMessage, res: ServerResponse): Promise<unknown | undefined> {
+  const body = await readBody(req, res, 'application/json', MAX_REMOTE_SETTINGS_BODY_BYTES)
+  if (body === undefined) return undefined
+  try {
+    return JSON.parse(body.toString('utf8')) as unknown
+  } catch {
+    res.writeHead(400, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    res.end('{"error":"invalid json"}')
+    return undefined
+  }
+}
+
+type RemoteSettingsField = keyof InternalConfig
+type RemoteSettingsWrite =
+  | { field: RemoteSettingsField; op: 'set'; value: unknown }
+  | { field: RemoteSettingsField; op: 'unset' }
+
+interface RemoteSettingsWriteRequest {
+  expectedRevision?: number
+  writes: RemoteSettingsWrite[]
+  password: string
+}
+
+const REMOTE_SETTINGS_FIELDS = new Set<string>([
+  'enabled', 'allowRemoteSettings', 'passwordRef', 'sessionTtlHours', 'mode', 'tokenRef', 'publicHostname',
+  'gatePort', 'executable', 'startupTimeoutMs',
+])
+const LOCALE_SETTINGS_NAMESPACE = settingsNamespace('locale')
+
+function objectRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('expected an object')
+  }
+  return value as Record<string, unknown>
+}
+
+function parseRemoteSettingsWriteRequest(value: unknown): RemoteSettingsWriteRequest {
+  const request = objectRecord(value)
+  if (!Array.isArray(request.writes)) throw new TypeError('writes must be an array')
+  const writes = request.writes.map((entry): RemoteSettingsWrite => {
+    const write = objectRecord(entry)
+    if (typeof write.field !== 'string' || !REMOTE_SETTINGS_FIELDS.has(write.field)) {
+      throw new TypeError('unknown settings field')
+    }
+    const field = write.field as RemoteSettingsField
+    if (write.op === 'unset') return { field, op: 'unset' }
+    if (write.op === 'set' && Object.hasOwn(write, 'value')) return { field, op: 'set', value: write.value }
+    throw new TypeError('invalid settings write')
+  })
+  const expectedRevision = request.expectedRevision
+  if (expectedRevision !== undefined && (!Number.isSafeInteger(expectedRevision) || (expectedRevision as number) < 0)) {
+    throw new TypeError('invalid settings revision')
+  }
+  if (request.password !== undefined && typeof request.password !== 'string') {
+    throw new TypeError('password must be a string')
+  }
+  return {
+    ...(expectedRevision === undefined ? {} : { expectedRevision: expectedRevision as number }),
+    writes,
+    password: typeof request.password === 'string' ? request.password : '',
+  }
+}
+
+function descriptorFor(ctx: Context, namespace: string): { descriptor: SettingsDescriptor; writable: boolean } {
+  const settings = ctx.get('settings')
+  if (settings === undefined) throw new Error('settings service is unavailable')
+  const descriptor = settings.describe({ redactSecrets: true }).find(entry => entry.ns === namespace)
+  if (descriptor === undefined) throw new Error(`settings namespace "${namespace}" is unavailable`)
+  return { descriptor, writable: settings.writable }
+}
+
+function remoteSettingsDocument(ctx: Context): Record<string, unknown> {
+  const { descriptor, writable } = descriptorFor(ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
+  const locale = ctx.get('settings')?.describe({ redactSecrets: true })
+    .find(entry => entry.ns === LOCALE_SETTINGS_NAMESPACE)?.value
+  const preference = typeof locale === 'object' && locale !== null && !Array.isArray(locale)
+    ? (locale as Record<string, unknown>).preference
+    : undefined
+  return {
+    settings: {
+      value: descriptor.value,
+      ...(descriptor.base === undefined ? {} : { base: descriptor.base }),
+      ...(descriptor.user === undefined ? {} : { user: descriptor.user }),
+      revision: descriptor.revision,
+      writable,
+    },
+    ...(preference === 'zh' || preference === 'en' ? { locale: preference } : {}),
+  }
+}
+
+function settingsNamespaceView(descriptor: SettingsDescriptor): Record<string, unknown> {
+  return {
+    ns: String(descriptor.ns),
+    schema: descriptor.schema,
+    value: descriptor.value,
+    ...(descriptor.base === undefined ? {} : { base: descriptor.base }),
+    ...(descriptor.user === undefined ? {} : { user: descriptor.user }),
+    applies: descriptor.applies,
+    secrets: (descriptor.secrets ?? []).map(secret => ({ path: [...secret.path], set: secret.set })),
+    revision: descriptor.revision,
+  }
+}
+
+function targetConfig(descriptor: SettingsDescriptor, writes: readonly RemoteSettingsWrite[]): InternalConfig {
+  const target = { ...objectRecord(descriptor.value) }
+  const base = descriptor.base === undefined ? {} : objectRecord(descriptor.base)
+  for (const write of writes) {
+    if (write.op === 'set') {
+      target[write.field] = write.value
+    } else if (Object.hasOwn(base, write.field)) {
+      target[write.field] = base[write.field]
+    } else {
+      delete target[write.field]
+    }
+  }
+  const parsed = Config(target as unknown as InternalConfig)
+  validateConfig(parsed)
+  return parsed
+}
+
+function settingsWriteSatisfied(descriptor: SettingsDescriptor, write: RemoteSettingsWrite): boolean {
+  const user = descriptor.user === undefined ? {} : objectRecord(descriptor.user)
+  if (write.op === 'unset') return !Object.hasOwn(user, write.field)
+  return Object.hasOwn(user, write.field) && Object.is(user[write.field], write.value)
+}
+
+function writeJson(res: ServerResponse, status: number, value: unknown): void {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+  res.end(JSON.stringify(value))
 }
 
 /**
@@ -475,12 +612,155 @@ class PasswordGate {
       await this.challenge(req, res)
       return
     }
-    if (isRemoteSettingsRequest(url) && !this.auth.allowRemoteSettings) {
-      res.writeHead(403, { 'content-type': 'application/json', 'cache-control': 'no-store' })
-      res.end('{"error":"remote settings disabled"}')
+    if (url.pathname === AUTH_TUNNEL_REMOTE_SETTINGS_PATH || url.pathname === AUTH_TUNNEL_REMOTE_LOCALE_PATH) {
+      if (!this.auth.allowRemoteSettings) {
+        writeJson(res, 403, { error: 'remote settings disabled' })
+        return
+      }
+      if (url.pathname === AUTH_TUNNEL_REMOTE_SETTINGS_PATH) await this.handleRemoteSettings(req, res)
+      else await this.handleRemoteLocale(req, res)
+      return
+    }
+    const configurationMethod = remoteConfigurationMethod(url)
+    if (configurationMethod === 'settings.describe' || (configurationMethod !== undefined && BLOCKED_REMOTE_CONFIGURATION_METHODS.has(configurationMethod))) {
+      if (!this.auth.allowRemoteSettings) {
+        writeJson(res, 403, { error: 'remote settings disabled' })
+        return
+      }
+      if (configurationMethod === 'settings.describe') {
+        await this.handleSettingsDescribe(req, res)
+        return
+      }
+      writeJson(res, 403, { error: 'remote configuration method unavailable' })
       return
     }
     this.proxy(req, res)
+  }
+
+  /** Serve the core plugin-directory read with only this plugin's namespace. */
+  private async handleSettingsDescribe(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { allow: 'POST', 'cache-control': 'no-store' })
+      res.end()
+      return
+    }
+    const body = await readJson(req, res)
+    if (body === undefined) return
+    try {
+      const message = objectRecord(body)
+      objectRecord(message.payload)
+      if (message.type !== 'client-request' || message.method !== 'settings.describe' || typeof message.rpcId !== 'string') {
+        throw new TypeError('invalid settings describe envelope')
+      }
+      const settings = this.ctx.get('settings')
+      if (settings === undefined) {
+        writeJson(res, 200, {
+          type: 'server-response',
+          rpcId: message.rpcId,
+          result: { ok: false, error: { code: 'internal', message: 'settings service unavailable', details: {} } },
+        })
+        return
+      }
+      const namespaces = settings.describe({ redactSecrets: true })
+        .filter(entry => entry.ns === AUTH_TUNNEL_SETTINGS_NAMESPACE)
+        .map(settingsNamespaceView)
+      writeJson(res, 200, {
+        type: 'server-response',
+        rpcId: message.rpcId,
+        result: {
+          ok: true,
+          value: {
+            writable: settings.writable,
+            hasDocument: settings.documentPath !== undefined,
+            namespaces,
+          },
+        },
+      })
+    } catch {
+      writeJson(res, 400, { error: 'invalid settings describe request' })
+    }
+  }
+
+  /** Read or commit the authenticated plugin settings card. */
+  private async handleRemoteSettings(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (req.method === 'GET') {
+      try {
+        writeJson(res, 200, remoteSettingsDocument(this.ctx))
+      } catch {
+        writeJson(res, 503, { error: 'plugin settings unavailable' })
+      }
+      return
+    }
+    if (req.method !== 'POST') {
+      res.writeHead(405, { allow: 'GET, POST', 'cache-control': 'no-store' })
+      res.end()
+      return
+    }
+    const body = await readJson(req, res)
+    if (body === undefined) return
+    try {
+      const request = parseRemoteSettingsWriteRequest(body)
+      const opened = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE).descriptor
+      if (request.writes.length !== 0
+        && request.expectedRevision !== undefined
+        && request.expectedRevision !== opened.revision) {
+        throw new Error('settings revision changed')
+      }
+      const current = Config(objectRecord(opened.value) as unknown as InternalConfig)
+      const target = targetConfig(opened, request.writes)
+      const password = request.password
+      const changesActivePassword = password !== ''
+        && current.enabled
+        && current.passwordRef === target.passwordRef
+      if (password !== '' && !changesActivePassword) {
+        await this.ctx.credentials.set(credentialRef(target.passwordRef), password)
+      }
+      if (request.writes.length !== 0) {
+        const settings = this.ctx.get('settings')
+        if (settings === undefined) throw new Error('settings service is unavailable')
+        const ops: SettingsPathOp[] = request.writes.map(write => write.op === 'set'
+          ? { op: 'set', path: [write.field], value: write.value }
+          : { op: 'unset', path: [write.field] })
+        await settings.mutate(
+          AUTH_TUNNEL_SETTINGS_NAMESPACE,
+          ops,
+          request.expectedRevision,
+        )
+        const committed = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE).descriptor
+        if (request.writes.some(write => !settingsWriteSatisfied(committed, write))) {
+          throw new Error('settings write was not committed')
+        }
+      }
+      if (changesActivePassword) {
+        await this.ctx.credentials.set(credentialRef(target.passwordRef), password)
+      }
+      writeJson(res, 200, remoteSettingsDocument(this.ctx))
+    } catch (error) {
+      this.ctx.logger.warn(`auth-tunnel: remote settings write rejected: ${error instanceof Error ? error.message : String(error)}`)
+      writeJson(res, 409, { error: 'plugin settings were not saved' })
+    }
+  }
+
+  /** Persist the public page's language through the Host locale namespace. */
+  private async handleRemoteLocale(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { allow: 'POST', 'cache-control': 'no-store' })
+      res.end()
+      return
+    }
+    const body = await readJson(req, res)
+    if (body === undefined) return
+    try {
+      const locale = objectRecord(body).locale
+      if (locale !== 'zh' && locale !== 'en') throw new TypeError('unsupported locale')
+      const settings = this.ctx.get('settings')
+      if (settings === undefined) throw new Error('settings service is unavailable')
+      await settings.update(LOCALE_SETTINGS_NAMESPACE, { preference: locale })
+      writeJson(res, 200, { locale })
+    } catch (error) {
+      this.ctx.logger.warn(`auth-tunnel: remote locale write rejected: ${error instanceof Error ? error.message : String(error)}`)
+      writeJson(res, 409, { error: 'language was not saved' })
+    }
   }
 
   private async handleHandshake(url: URL, req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -763,11 +1043,6 @@ class AuthTunnelRuntime {
 
   getStatus(): AuthTunnelRuntimeStatus {
     return this.status
-  }
-
-  /** Whether the currently served public page may use Host settings. */
-  allowsRemoteSettings(): boolean {
-    return this.active?.alive === true && this.active.config.allowRemoteSettings
   }
 
   /** Attach an optional shell registry while it is present in the composition. */
@@ -1066,10 +1341,6 @@ class AuthTunnelRuntime {
 export async function apply(ctx: Context, config: Config): Promise<void> {
   const runtime = new AuthTunnelRuntime(ctx)
   ctx.effect(() => async () => { await runtime.dispose() }, 'auth-tunnel: runtime')
-  ctx.effect(
-    () => ctx.webServer.tapIndex(html => runtime.allowsRemoteSettings() ? injectSettingsAccessMeta(html) : html),
-    'auth-tunnel: authenticated settings marker',
-  )
   ctx.webServer.register({
     kind: 'exact',
     path: AUTH_TUNNEL_STATUS_PATH,

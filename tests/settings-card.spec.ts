@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
-  apply, commitCardChanges, commitCredentialWrite, commitSettingsWrites, RuntimeStatusStore,
-  runtimeStatusLocaleKey, validateSettingsValues,
+  apply, commitCardChanges, commitCredentialWrite, commitSettingsWrites, parseRemoteSettingsDocument,
+  RemoteSettingsStore, RuntimeStatusStore, runtimeStatusLocaleKey, validateSettingsValues,
   type AuthTunnelSettings, type RuntimeStatusSnapshot, type SettingsWrite,
 } from '../src/client/index.tsx'
 
@@ -191,7 +191,7 @@ describe('auth-tunnel settings card contract', () => {
       unset: () => Promise.resolve(),
     }
     const ctx = {
-      get: (name: string) => name === 'connection' ? { api: { settings: {} } } : undefined,
+      get: (name: string) => name === 'connection' ? { api: { settings: {} }, isLoopback: true } : undefined,
       settingsScope: { bind: () => scope },
       effect: (install: () => unknown) => install(),
       locale: {
@@ -214,6 +214,45 @@ describe('auth-tunnel settings card contract', () => {
     expect(registeredNamespace).toBe('auth-tunnel')
     expect(registeredLocale).toBe('settings.auth-tunnel')
     expect(dictionaryNamespace).toBe('settings.auth-tunnel')
+  })
+
+  it('loads and commits the authenticated remote scope without Harness settingsScope', async () => {
+    const document = (revision: number, sessionTtlHours: number) => parseRemoteSettingsDocument({
+      settings: {
+        value: { ...quick, allowRemoteSettings: true, sessionTtlHours },
+        base: quick,
+        user: { allowRemoteSettings: true, sessionTtlHours },
+        revision,
+        writable: true,
+      },
+      locale: 'en',
+    })
+    const read = vi.fn(() => Promise.resolve(document(3, 720)))
+    const commit = vi.fn(() => Promise.resolve(document(4, 24)))
+    const store = new RemoteSettingsStore({ read, commit })
+    let notifications = 0
+    const dispose = store.subscribe(() => { notifications += 1 })
+
+    await store.refresh()
+    expect(read).toHaveBeenCalledOnce()
+    expect(store.getSnapshot()).toMatchObject({
+      status: 'ready', revision: 3, writable: true, value: { sessionTtlHours: 720 },
+    })
+
+    await store.commit({
+      expectedRevision: 3,
+      writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+      password: '',
+    })
+    expect(commit).toHaveBeenCalledWith({
+      expectedRevision: 3,
+      writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+      password: '',
+    })
+    expect(store.getSnapshot()).toMatchObject({ revision: 4, value: { sessionTtlHours: 24 } })
+    expect(notifications).toBe(2)
+    dispose()
+    store.dispose()
   })
 
   it('keeps a stable external runtime snapshot and maps every visible state', async () => {

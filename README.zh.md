@@ -64,7 +64,7 @@ cloudflare tunnel: https://<random>.trycloudflare.com
 
 保持 Loader 的 `auth-tunnel` 行启用后,打开 **Settings → Plugins → 插件配置 → Auth Tunnel** 即可编辑全部配置。页面中的 **启用公网隧道** 开关保存后会立即启动或停止密码门和 `cloudflared`,并保留这张设置卡片。页面同时显示应用中、运行中、已停止或失败状态以及当前公网 URL。
 
-**允许远程页面修改设置** 默认关闭。开启后刷新公网页面,已通过访问密码登录的页面即可读取和保存插件配置、语言及其他 Host-backed settings;关闭后,这些页面恢复为仅进程内偏好,其 settings 与 credentials RPC 会被拒绝。DeepSeek Harness `0.1.0-rc.7` 尚不会消费这项已认证 settings marker,因此该开关需要带有对应支持的更新 Harness build。
+**允许远程页面修改设置** 默认关闭。先在本机开启并刷新公网页面后,已通过访问密码登录的页面即可读取和保存 Auth Tunnel 卡片及语言偏好。这些写入走插件自有的鉴权接口,因此兼容未修改的 DeepSeek Harness `0.1.0-rc.7`;通用 Host settings 与 credentials RPC 仍保持关闭。从远程页面关闭该开关时,本次保存会完整返回后再关闭访问;重新开启必须使用本机页面或设置文件。
 
 页面可以把新的访问密码一次性写入 `passwordRef` 指向的凭据:输入框保存后立即清空,Host 和页面都不会回传或展示明文。这里的“一次性”指只输入一次;密码本身仍可重复登录,直到再次替换,不是登录一次即作废的 OTP。Tunnel Token 仍应先写入凭据服务,页面的 `tokenRef` 只填写对应引用名。
 
@@ -108,7 +108,7 @@ DSH_TUNNEL_TOKEN: 'eyJhIjo...'
 | 键 | 类型 | 默认值 | 作用 |
 |---|---|---|---|
 | `enabled` | boolean | `true` | 是否运行密码门和 `cloudflared`;页面保存 `false` 后立即停止公网访问但保留设置页面。 |
-| `allowRemoteSettings` | boolean | `false` | 是否允许已认证公网页面读取和更新 Host settings 与凭据。 |
+| `allowRemoteSettings` | boolean | `false` | 是否允许已认证公网页面更新 Auth Tunnel 配置、只写访问密码和语言偏好。 |
 | `passwordRef` | string(credential-ref) | `DSH_WEB_PASSWORD` | 解析共享访问密码的凭据引用;未配置会导致启动失败。 |
 | `sessionTtlHours` | number ≥ 0.01 | `720` | Cookie 有效期,单位为小时,默认 30 天。 |
 | `mode` | `quick` \| `token` | `quick` | 临时 quick 隧道或命名 token 隧道。 |
@@ -120,7 +120,7 @@ DSH_TUNNEL_TOKEN: 'eyJhIjo...'
 
 ## 已知限制
 
-- **共享密码、单用户信任**:每个密码持有者都可以访问完整 Web GUI;开启 `allowRemoteSettings` 后还会获得 Host 配置面。当前没有速率限制、锁定、按用户会话或服务端吊销表。轮换密码会使所有会话失效;更严肃的部署应使用 Cloudflare Access 或其他身份感知代理。
+- **共享密码、单用户信任**:每个密码持有者都可以访问完整 Web GUI;开启 `allowRemoteSettings` 后还可使用 Auth Tunnel 卡片、只写密码输入和语言偏好,其他 Host 配置方法仍被拦截。当前没有速率限制、锁定、按用户会话或服务端吊销表。轮换密码会使所有会话失效;更严肃的部署应使用 Cloudflare Access 或其他身份感知代理。
 - **单隧道、无自动重启**:`cloudflared` 意外退出时会记录并显示错误,但不会自动重启;在页面关闭再开启隧道即可恢复。
 - **Quick URL 每次启动都会变化**:需要固定 URL 时应使用 token 模式和自有域名。
 - **Loopback 保持未认证**:密码只保护隧道路径;本机浏览器和进程仍可直接访问原始 Web GUI。

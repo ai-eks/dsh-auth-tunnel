@@ -19,6 +19,7 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
 import { SettingsProvider, settingsNamespace, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
+import z from '@deepseek-ai/schemastery'
 
 /** Minimal in-memory credentials service for the composition (rotate via set). */
 class StubCredentials extends Service {
@@ -352,7 +353,7 @@ async function waitForStatus(
 }
 
 describe('password gate over the loopback webserver', () => {
-  it('keeps Host settings local until the live remote-settings switch is enabled', { timeout: 60_000 }, async () => {
+  it('exposes only plugin-owned remote settings after the live switch is enabled', { timeout: 60_000 }, async () => {
     const composition = await bootQuick()
     let settingsRequests = 0
     composition.loaded.webServer.register({
@@ -362,34 +363,124 @@ describe('password gate over the loopback webserver', () => {
         res.end('{"ok":true}')
       },
     })
-    composition.loaded.webServer.registerFallback((_req, res) => {
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-      res.end(composition.loaded.webServer.applyIndexTaps('<html><head></head><body>Harness</body></html>'))
-    })
+    composition.settings().register(settingsNamespace('locale'), z.object({
+      preference: z.union(['zh', 'en']).required(false),
+    }))
     const base = await composition.gateBase()
     const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const rpc = (method: string, payload: object = {}): RequestInit => ({
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'client-request', rpcId: `rpc-${method}`, method, payload }),
+    })
 
-    const denied = await fetch(`${base}/api/settings.describe`, { method: 'POST', headers: { cookie } })
+    const denied = await fetch(`${base}/api/settings.describe`, rpc('settings.describe'))
     expect(denied.status).toBe(403)
     expect(await denied.json()).toEqual({ error: 'remote settings disabled' })
     expect(settingsRequests).toBe(0)
-    expect(await (await fetch(`${base}/`, { headers: { cookie } })).text())
-      .not.toContain('<meta name="dsh-settings-access" content="host">')
+    expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
 
     const beforeEnable = await composition.runtimeStatus()
     await composition.settings().update(settingsNamespace('auth-tunnel'), { allowRemoteSettings: true })
     await waitForStatus(composition, status => status.revision > beforeEnable.revision && status.phase === 'running')
 
-    const allowed = await fetch(`${base}/api/settings.describe`, { method: 'POST', headers: { cookie } })
+    const allowed = await fetch(`${base}/api/settings.describe`, rpc('settings.describe'))
     expect(allowed.status).toBe(200)
-    expect(settingsRequests).toBe(1)
-    expect(await (await fetch(`${base}/`, { headers: { cookie } })).text())
-      .toContain('<meta name="dsh-settings-access" content="host">')
+    expect(settingsRequests).toBe(0)
+    expect(await allowed.json()).toMatchObject({
+      type: 'server-response',
+      rpcId: 'rpc-settings.describe',
+      result: { ok: true, value: { namespaces: [{ ns: 'auth-tunnel' }] } },
+    })
+    expect((await fetch(`${base}/api/settings.mutate`, rpc('settings.mutate', {
+      ns: 'auth-tunnel', ops: [],
+    }))).status).toBe(403)
+
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number; value: { allowRemoteSettings: boolean; sessionTtlHours: number } }
+    }
+    expect(opened.settings.value.allowRemoteSettings).toBe(true)
+    const updated = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+        password: '',
+      }),
+    })
+    expect(updated.status).toBe(200)
+    const committed = await updated.json() as {
+      settings: { revision: number; value: { sessionTtlHours: number } }
+    }
+    expect(committed.settings.value.sessionTtlHours).toBe(24)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel'))).toMatchObject({ sessionTtlHours: 24 })
+
+    const locale = await fetch(`${base}/dsh-auth-tunnel/locale`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ locale: 'en' }),
+    })
+    expect(locale.status).toBe(200)
+    expect(composition.settings().get(settingsNamespace('locale'))).toEqual({ preference: 'en' })
 
     const beforeDisable = await composition.runtimeStatus()
-    await composition.settings().update(settingsNamespace('auth-tunnel'), { allowRemoteSettings: false })
+    const disabled = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: committed.settings.revision,
+        writes: [{ field: 'allowRemoteSettings', op: 'set', value: false }],
+        password: '',
+      }),
+    })
+    expect(disabled.status).toBe(200)
+    expect(await disabled.json()).toMatchObject({ settings: { value: { allowRemoteSettings: false } } })
     await waitForStatus(composition, status => status.revision > beforeDisable.revision && status.phase === 'running')
-    expect((await fetch(`${base}/api/settings.describe`, { method: 'POST', headers: { cookie } })).status).toBe(403)
+    expect((await fetch(`${base}/api/settings.describe`, rpc('settings.describe'))).status).toBe(403)
+    expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
+  })
+
+  it('rotates the long-lived access password through the plugin endpoint without echoing it', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision: opened.settings.revision, writes: [], password: 'replacement-password' }),
+    })
+    expect(response.status).toBe(200)
+    expect(await response.text()).not.toContain('replacement-password')
+    expect(await composition.credentials().resolve('DSH_WEB_PASSWORD')).toMatchObject({ value: 'replacement-password' })
+    expect((await login(base, undefined, 'replacement-password')).get('set-cookie')).toContain('dsh_auth_tunnel=')
+  })
+
+  it('returns the complete remote save before stopping the active tunnel', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'enabled', op: 'set', value: false }],
+        password: '',
+      }),
+    })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ settings: { value: { enabled: false } } })
+    await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
+    expect(await liveFixturePids()).toEqual([])
   })
 
   it('serves the public Web App Manifest without opening other unauthenticated paths', { timeout: 60_000 }, async () => {

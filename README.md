@@ -64,7 +64,7 @@ Open that URL and enter `DSH_WEB_PASSWORD` on the login page. Share the URL, not
 
 With the Loader `auth-tunnel` row enabled, open **Settings → Plugins → Plugin configuration → Auth Tunnel** to edit every option. Saving the **Enable public tunnel** switch immediately starts or stops the gate and `cloudflared` while keeping this card available. The card also shows applying, running, stopped, or failed state and the current public URL.
 
-**Allow remote pages to change settings** is disabled by default. Enable it and refresh the public page to let pages that passed the access-password login read and save Plugin configuration, Language, and other Host-backed settings; disabling it returns those pages to process-local preferences and rejects their settings and credential RPCs. DeepSeek Harness `0.1.0-rc.7` does not consume the authenticated settings marker, so this option requires a newer Harness build carrying that support.
+**Allow remote pages to change settings** is disabled by default. Enable it locally and refresh the public page to let pages that passed the access-password login read and save the Auth Tunnel card and Language preference. These writes use authenticated endpoints owned by this plugin, so they work with the unmodified DeepSeek Harness `0.1.0-rc.7`; generic Host settings and credential RPCs remain blocked. Turning the switch off remotely completes that save before access closes, and enabling it again must be done from a local page or the settings document.
 
 The card can write a new access password once to the credential named by `passwordRef`: the input clears after saving, and neither the Host nor the page returns or displays the literal. "Once" describes the write-only input; the password remains reusable until replaced and is not a login-once OTP. Store the Tunnel Token in the credential service first; `tokenRef` names that stored credential.
 
@@ -108,7 +108,7 @@ Override the bundle row in `$DSH_HOME/profiles/web/cordis.patch.yml`:
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `enabled` | boolean | `true` | Whether the password gate and `cloudflared` run; saving `false` immediately stops public access while keeping settings available. |
-| `allowRemoteSettings` | boolean | `false` | Whether authenticated public pages may read and update Host settings and credentials. |
+| `allowRemoteSettings` | boolean | `false` | Whether authenticated public pages may update Auth Tunnel settings, its write-only access password, and the Language preference. |
 | `passwordRef` | string (credential-ref) | `DSH_WEB_PASSWORD` | Credential reference resolving to the shared access password; unconfigured fails the boot. |
 | `sessionTtlHours` | number ≥ 0.01 | `720` | Cookie lifetime in hours (30 days). |
 | `mode` | `quick` \| `token` | `quick` | Ephemeral quick tunnel or named token tunnel. |
@@ -120,7 +120,7 @@ Override the bundle row in `$DSH_HOME/profiles/web/cordis.patch.yml`:
 
 ## Known limitations
 
-- **Shared password, single-user trust**: every password holder receives the whole Web GUI; enabling `allowRemoteSettings` also grants its Host configuration plane. There is no rate limiting, lockout, per-user session, or server-side revocation list. Password rotation invalidates every session; stronger deployments should use Cloudflare Access or another identity-aware proxy.
+- **Shared password, single-user trust**: every password holder receives the whole Web GUI; enabling `allowRemoteSettings` also grants the Auth Tunnel card, its write-only password input, and Language preference. Other Host configuration methods stay blocked. There is no rate limiting, lockout, per-user session, or server-side revocation list. Password rotation invalidates every session; stronger deployments should use Cloudflare Access or another identity-aware proxy.
 - **Single tunnel, no automatic restart**: an unexpected `cloudflared` exit is logged and shown in settings, but the tunnel does not restart automatically; toggle it off and on to recover.
 - **Quick URLs change on every start**: use token mode and a domain when a stable URL is required.
 - **Loopback remains unauthenticated**: the password protects the tunnel path only. Local browsers and processes can still reach the original Web GUI directly.

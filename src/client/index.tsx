@@ -55,7 +55,7 @@ const zh: Record<LocaleKey, string> = {
   enabledOn: '开启',
   enabledOff: '关闭',
   allowRemoteSettings: '允许远程页面修改设置',
-  allowRemoteSettingsHint: '仅对通过访问密码登录的公网页面生效。开启后刷新公网页面，即可读取并保存插件配置、语言和其他 Host 设置；默认关闭。',
+  allowRemoteSettingsHint: '仅对通过访问密码登录的公网页面生效。开启后刷新公网页面，即可读取并保存 Auth Tunnel 配置和语言；其他 Host 配置仍保持关闭。默认关闭。',
   status: '运行状态',
   statusRunning: '运行中',
   statusStopped: '已停止',
@@ -120,7 +120,7 @@ const en: Record<LocaleKey, string> = {
   enabledOn: 'On',
   enabledOff: 'Off',
   allowRemoteSettings: 'Allow remote pages to change settings',
-  allowRemoteSettingsHint: 'Applies only to public pages signed in with the access password. After enabling it, refresh the public page to read and save plugin configuration, language, and other Host settings. Disabled by default.',
+  allowRemoteSettingsHint: 'Applies only to public pages signed in with the access password. After enabling it, refresh the public page to read and save Auth Tunnel configuration and language; other Host configuration remains blocked. Disabled by default.',
   status: 'Runtime status',
   statusRunning: 'Running',
   statusStopped: 'Stopped',
@@ -217,6 +217,17 @@ export type SettingsWrite =
   | { field: FieldKey; op: 'set'; value: string | number | boolean }
   | { field: FieldKey; op: 'unset' }
 
+export interface RemoteSettingsCommitRequest {
+  expectedRevision?: number
+  writes: readonly SettingsWrite[]
+  password: string
+}
+
+interface RemoteSettingsDocument {
+  snapshot: SettingsScopeSnapshot<AuthTunnelSettings>
+  locale?: 'zh' | 'en'
+}
+
 const FIELD_KEYS: readonly FieldKey[] = [
   'enabled', 'allowRemoteSettings', 'passwordRef', 'sessionTtlHours', 'mode', 'tokenRef', 'publicHostname',
   'gatePort', 'executable', 'startupTimeoutMs',
@@ -244,6 +255,8 @@ function record(value: unknown): Record<string, unknown> {
 }
 
 const RUNTIME_STATUS_PATH = '/dsh-auth-tunnel/status'
+const REMOTE_SETTINGS_PATH = '/dsh-auth-tunnel/settings'
+const REMOTE_LOCALE_PATH = '/dsh-auth-tunnel/locale'
 const INITIAL_RUNTIME_STATUS: RuntimeStatusSnapshot = {
   phase: 'unavailable',
   running: false,
@@ -460,6 +473,155 @@ export function validateSettingsValues(value: AuthTunnelSettings): Partial<Recor
   return errors
 }
 
+/** Decode the plugin-owned remote settings document without trusting its JSON shape. */
+export function parseRemoteSettingsDocument(input: unknown): RemoteSettingsDocument {
+  const root = record(input)
+  const section = record(root.settings)
+  const raw = record(section.value)
+  if (typeof raw.enabled !== 'boolean'
+    || typeof raw.allowRemoteSettings !== 'boolean'
+    || typeof raw.passwordRef !== 'string'
+    || typeof raw.sessionTtlHours !== 'number'
+    || (raw.mode !== 'quick' && raw.mode !== 'token')
+    || (raw.tokenRef !== undefined && typeof raw.tokenRef !== 'string')
+    || (raw.publicHostname !== undefined && typeof raw.publicHostname !== 'string')
+    || typeof raw.gatePort !== 'number'
+    || typeof raw.executable !== 'string'
+    || typeof raw.startupTimeoutMs !== 'number') {
+    throw new Error('invalid auth-tunnel settings document')
+  }
+  const value: AuthTunnelSettings = {
+    enabled: raw.enabled,
+    allowRemoteSettings: raw.allowRemoteSettings,
+    passwordRef: raw.passwordRef,
+    sessionTtlHours: raw.sessionTtlHours,
+    mode: raw.mode,
+    ...(raw.tokenRef === undefined ? {} : { tokenRef: raw.tokenRef }),
+    ...(raw.publicHostname === undefined ? {} : { publicHostname: raw.publicHostname }),
+    gatePort: raw.gatePort,
+    executable: raw.executable,
+    startupTimeoutMs: raw.startupTimeoutMs,
+  }
+  if (Object.keys(validateSettingsValues(value)).length !== 0
+    || !Number.isSafeInteger(section.revision)
+    || typeof section.writable !== 'boolean') {
+    throw new Error('invalid auth-tunnel settings document')
+  }
+  if (root.locale !== undefined && root.locale !== 'zh' && root.locale !== 'en') {
+    throw new Error('invalid auth-tunnel locale preference')
+  }
+  return {
+    snapshot: {
+      status: 'ready',
+      value,
+      base: section.base,
+      user: section.user,
+      revision: section.revision as number,
+      writable: section.writable,
+      mode: 'host',
+    },
+    ...(root.locale === 'zh' || root.locale === 'en' ? { locale: root.locale } : {}),
+  }
+}
+
+async function readRemoteSettings(): Promise<RemoteSettingsDocument> {
+  const response = await fetch(REMOTE_SETTINGS_PATH, {
+    cache: 'no-store',
+    headers: { accept: 'application/json' },
+  })
+  if (!response.ok) throw new Error(`auth-tunnel settings returned ${String(response.status)}`)
+  return parseRemoteSettingsDocument(await response.json())
+}
+
+async function commitRemoteSettings(request: RemoteSettingsCommitRequest): Promise<RemoteSettingsDocument> {
+  const response = await fetch(REMOTE_SETTINGS_PATH, {
+    method: 'POST',
+    cache: 'no-store',
+    headers: { accept: 'application/json', 'content-type': 'application/json' },
+    body: JSON.stringify(request),
+  })
+  if (!response.ok) throw new Error(`auth-tunnel settings returned ${String(response.status)}`)
+  return parseRemoteSettingsDocument(await response.json())
+}
+
+export async function persistRemoteLocale(locale: 'zh' | 'en'): Promise<void> {
+  const response = await fetch(REMOTE_LOCALE_PATH, {
+    method: 'POST',
+    cache: 'no-store',
+    headers: { accept: 'application/json', 'content-type': 'application/json' },
+    body: JSON.stringify({ locale }),
+  })
+  if (!response.ok) throw new Error(`auth-tunnel locale returned ${String(response.status)}`)
+}
+
+const INITIAL_REMOTE_SETTINGS_SNAPSHOT: SettingsScopeSnapshot<AuthTunnelSettings> = {
+  status: 'loading',
+  value: undefined,
+  base: undefined,
+  user: undefined,
+  revision: undefined,
+  writable: false,
+  mode: 'host',
+}
+
+interface RemoteSettingsTransport {
+  read(): Promise<RemoteSettingsDocument>
+  commit(request: RemoteSettingsCommitRequest): Promise<RemoteSettingsDocument>
+}
+
+/** Durable remote scope backed by the authenticated plugin endpoint, not Harness settings RPCs. */
+export class RemoteSettingsStore {
+  private snapshot = INITIAL_REMOTE_SETTINGS_SNAPSHOT
+  private readonly listeners = new Set<() => void>()
+  private task: Promise<RemoteSettingsDocument | undefined> | undefined
+  private disposed = false
+
+  constructor(private readonly transport: RemoteSettingsTransport = {
+    read: readRemoteSettings,
+    commit: commitRemoteSettings,
+  }) {}
+
+  readonly getSnapshot = (): SettingsScopeSnapshot<AuthTunnelSettings> => this.snapshot
+
+  readonly subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener)
+    if (this.listeners.size === 1) void this.refresh()
+    return () => { this.listeners.delete(listener) }
+  }
+
+  readonly refresh = (): Promise<RemoteSettingsDocument | undefined> => {
+    if (this.disposed) return Promise.resolve(undefined)
+    if (this.task !== undefined) return this.task
+    this.task = this.transport.read().then((document) => {
+      if (!this.disposed) this.publish(document.snapshot)
+      return document
+    }, () => {
+      if (!this.disposed && this.snapshot.status === 'loading') {
+        this.publish({ ...INITIAL_REMOTE_SETTINGS_SNAPSHOT, status: 'unavailable' })
+      }
+      return undefined
+    }).finally(() => { this.task = undefined })
+    return this.task
+  }
+
+  async commit(request: RemoteSettingsCommitRequest): Promise<void> {
+    if (this.disposed) return
+    const document = await this.transport.commit(request)
+    if (!this.disposed) this.publish(document.snapshot)
+  }
+
+  dispose(): void {
+    this.disposed = true
+    this.listeners.clear()
+  }
+
+  private publish(snapshot: SettingsScopeSnapshot<AuthTunnelSettings>): void {
+    if (Object.is(this.snapshot, snapshot)) return
+    this.snapshot = snapshot
+    for (const listener of this.listeners) listener()
+  }
+}
+
 function savePlan(draft: Draft, target: AuthTunnelSettings): SettingsWrite[] {
   const writes: SettingsWrite[] = []
   for (const field of FIELD_KEYS) {
@@ -486,6 +648,14 @@ function writeSatisfied(source: { user?: unknown }, write: SettingsWrite): boole
 }
 
 type CardApi = Pick<IApiClient, 'settings' | 'credentials'>
+type CardCommit = (
+  revision: number | undefined,
+  writes: readonly SettingsWrite[],
+  currentEnabled: boolean,
+  currentPasswordRef: string,
+  targetPasswordRef: string,
+  password: string,
+) => Promise<void>
 
 /** Write a secret in the credential plane; it never enters settings YAML or a response payload. */
 export async function commitCredentialWrite(
@@ -885,7 +1055,7 @@ interface ShellState {
 
 function AuthTunnelCard(props: CardProps & {
   scope: Pick<SettingsScope<AuthTunnelSettings>, 'getSnapshot' | 'subscribe'>
-  api: CardApi
+  commit: CardCommit
   runtime: RuntimeStatusStore
 }) {
   const snapshot = useSyncExternalStore(props.scope.subscribe, props.scope.getSnapshot)
@@ -923,8 +1093,7 @@ function AuthTunnelCard(props: CardProps & {
     setShell(current => ({ ...current, saving: true, failed: false }))
     let succeeded = false
     try {
-      await commitCardChanges(
-        props.api,
+      await props.commit(
         startingRevision,
         writes,
         current.enabled === true,
@@ -1002,20 +1171,77 @@ function AuthTunnelCard(props: CardProps & {
 /** Required browser services for the keyed settings-card contribution. */
 export const inject = ['slots', 'locale', 'connection', 'remote', 'settingsScope']
 
+/** Adopt and serialize the public page's language through the plugin endpoint. */
+function installRemoteLocalePersistence(ctx: ClientContext, store: RemoteSettingsStore): () => void {
+  let disposed = false
+  let loaded = false
+  let adopting = false
+  let pending: 'zh' | 'en' | undefined
+  let tail = Promise.resolve()
+  const persist = (locale: 'zh' | 'en'): void => {
+    tail = tail.catch(() => undefined).then(async () => {
+      if (!disposed) await persistRemoteLocale(locale)
+    }).catch(() => undefined)
+  }
+  const stop = ctx.on('locale/change', (snapshot) => {
+    if (adopting) return
+    if (!loaded) {
+      pending = snapshot.active
+      return
+    }
+    persist(snapshot.active)
+  })
+  void store.refresh().then((document) => {
+    if (disposed) return
+    loaded = true
+    if (pending !== undefined) {
+      persist(pending)
+      pending = undefined
+      return
+    }
+    if (document?.locale === undefined) return
+    adopting = true
+    try {
+      ctx.locale.setLocale(document.locale)
+    } finally {
+      adopting = false
+    }
+  })
+  return () => {
+    disposed = true
+    stop()
+  }
+}
+
 /** Register the browser half under the Host namespace's key. */
 export function apply(ctx: ClientContext): void {
-  const source = ctx.settingsScope.bind<AuthTunnelSettings>({ namespace: SETTINGS_NAMESPACE })
-  // Methods on the scope controller use `this`; stable wrappers are also the
-  // stable subscribe/getSnapshot pair required by useSyncExternalStore.
-  const scope: Pick<SettingsScope<AuthTunnelSettings>, 'getSnapshot' | 'subscribe'> = {
-    getSnapshot: () => source.getSnapshot(),
-    subscribe: listener => source.subscribe(listener),
+  const connection = ctx.get('connection') as ConnectionHandle
+  let scope: Pick<SettingsScope<AuthTunnelSettings>, 'getSnapshot' | 'subscribe'>
+  let commit: CardCommit
+  if (connection.isLoopback) {
+    const source = ctx.settingsScope.bind<AuthTunnelSettings>({ namespace: SETTINGS_NAMESPACE })
+    // Methods on the scope controller use `this`; stable wrappers are also the
+    // stable subscribe/getSnapshot pair required by useSyncExternalStore.
+    scope = {
+      getSnapshot: () => source.getSnapshot(),
+      subscribe: listener => source.subscribe(listener),
+    }
+    commit = (...args) => commitCardChanges(connection.api, ...args)
+  } else {
+    const remote = new RemoteSettingsStore()
+    scope = remote
+    commit = (revision, writes, _currentEnabled, _currentPasswordRef, _targetPasswordRef, password) => remote.commit({
+      ...(revision === undefined ? {} : { expectedRevision: revision }),
+      writes,
+      password,
+    })
+    ctx.effect(() => installRemoteLocalePersistence(ctx, remote), 'auth-tunnel: remote locale persistence')
+    ctx.effect(() => () => { remote.dispose() }, 'auth-tunnel: remote settings')
   }
-  const api = (ctx.get('connection') as ConnectionHandle).api
   const runtime = new RuntimeStatusStore()
   ctx.effect(() => () => { runtime.dispose() }, 'auth-tunnel: runtime status')
   ctx.effect(() => ctx.locale.register(LOCALE_NAMESPACE, { zh, en }), 'auth-tunnel: settings dictionaries')
-  const Card = (props: CardProps) => <AuthTunnelCard {...props} scope={scope} api={api} runtime={runtime} />
+  const Card = (props: CardProps) => <AuthTunnelCard {...props} scope={scope} commit={commit} runtime={runtime} />
   ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
     name: 'settings.plugin.item',
     key: SETTINGS_NAMESPACE,
