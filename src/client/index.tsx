@@ -423,7 +423,7 @@ function initialDraft(snapshot: SettingsScopeSnapshot<AuthTunnelSettings>): Draf
 }
 
 function draftDirty(draft: Draft): boolean {
-  return Object.keys(draft.edits).length !== 0 || draft.password.trim() !== ''
+  return Object.keys(draft.edits).length !== 0 || draft.password !== ''
 }
 
 function numberDraft(text: string): number {
@@ -1083,7 +1083,7 @@ function AuthTunnelCard(props: CardProps & {
   const save = async (draft: Draft): Promise<void> => {
     const target = parseDraft(draft)
     const writes = savePlan(draft, target)
-    const password = draft.password.trim()
+    const password = draft.password
     const current = record(snapshot.value)
     const currentPasswordRef = typeof current.passwordRef === 'string'
       ? current.passwordRef

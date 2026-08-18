@@ -441,7 +441,7 @@ describe('password gate over the loopback webserver', () => {
     expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
   })
 
-  it('rotates the long-lived access password through the plugin endpoint without echoing it', { timeout: 60_000 }, async () => {
+  it('rotates the long-lived access password verbatim through the plugin endpoint without echoing it', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     const base = await composition.gateBase()
     const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
@@ -452,13 +452,49 @@ describe('password gate over the loopback webserver', () => {
     const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
       method: 'POST',
       headers: { cookie, 'content-type': 'application/json' },
-      body: JSON.stringify({ expectedRevision: opened.settings.revision, writes: [], password: 'replacement-password' }),
+      body: JSON.stringify({ expectedRevision: opened.settings.revision, writes: [], password: '  replacement-password  ' }),
     })
     expect(response.status).toBe(200)
     expect(await response.text()).not.toContain('replacement-password')
-    expect(await composition.credentials().resolve('DSH_WEB_PASSWORD')).toMatchObject({ value: 'replacement-password' })
-    expect((await login(base, undefined, 'replacement-password')).get('set-cookie')).toContain('dsh_auth_tunnel=')
+    expect(await composition.credentials().resolve('DSH_WEB_PASSWORD')).toMatchObject({ value: '  replacement-password  ' })
+    expect((await login(base, undefined, '  replacement-password  ')).get('set-cookie')).toContain('dsh_auth_tunnel=')
   })
+
+  it.each(['DSH_TUNNEL_TOKEN', 'OTHER_HOST_SECRET'])(
+    'does not let a remote password write overwrite existing non-access credential %s',
+    { timeout: 60_000 },
+    async (targetRef) => {
+      const composition = await bootQuick({
+        allowRemoteSettings: true,
+        tokenRef: 'DSH_TUNNEL_TOKEN',
+      }, {
+        seeds: {
+          DSH_TUNNEL_TOKEN: 'tunnel-token',
+          OTHER_HOST_SECRET: 'other-secret',
+        },
+      })
+      const base = await composition.gateBase()
+      const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+      const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+        settings: { revision: number }
+      }
+
+      const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          expectedRevision: opened.settings.revision,
+          writes: [{ field: 'passwordRef', op: 'set', value: targetRef }],
+          password: 'attacker-selected-password',
+        }),
+      })
+
+      expect(response.status).toBe(409)
+      expect(await composition.credentials().resolve('DSH_TUNNEL_TOKEN')).toMatchObject({ value: 'tunnel-token' })
+      expect(await composition.credentials().resolve('OTHER_HOST_SECRET')).toMatchObject({ value: 'other-secret' })
+      expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
+    },
+  )
 
   it('returns the complete remote save before stopping the active tunnel', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
@@ -970,6 +1006,29 @@ describe('tunnel lifecycle', () => {
     await expect(fetch(`${base}/dsh-auth-tunnel/login`)).rejects.toThrow()
   })
 
+  it('teardown cancels a staged startup without waiting for its timeout', { timeout: 60_000 }, async () => {
+    const quickExecutable = await fixtureExecutable('fake-cloudflared-quick.sh')
+    const silentExecutable = await fixtureExecutable('fake-cloudflared-silent.sh')
+    const composition = await bootQuick({ executable: quickExecutable, startupTimeoutMs: 10_000 })
+    const base = await composition.gateBase()
+
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { executable: silentExecutable })
+    const deadline = Date.now() + 5000
+    while ((await liveFixturePids()).length < 2) {
+      if (Date.now() >= deadline) throw new Error('staged cloudflared did not start')
+      await sleep(25)
+    }
+
+    const startedAt = Date.now()
+    await context!.fiber.dispose()
+    const elapsed = Date.now() - startedAt
+    context = undefined
+
+    expect(elapsed).toBeLessThan(4000)
+    expect(await liveFixturePids()).toEqual([])
+    await expect(fetch(`${base}/dsh-auth-tunnel/login`)).rejects.toThrow()
+  })
+
   it('escalates a stubborn cloudflared to SIGKILL after the grace', { timeout: 60_000 }, async () => {
     await bootQuick({ executable: await fixtureExecutable('fake-cloudflared-stubborn.sh') })
     expect((await liveFixturePids()).length).toBe(1)
@@ -1321,6 +1380,27 @@ describe('rc7 plugin settings', () => {
 
     await composition.settings().update(namespace, { executable: quickExecutable })
     await waitForStatus(composition, status => status.phase === 'running')
+  })
+
+  it('restores the previous tunnel when a ready replacement dies during handoff', { timeout: 60_000 }, async () => {
+    const quickExecutable = await fixtureExecutable('fake-cloudflared-quick.sh')
+    const crashingExecutable = await fixtureExecutable('fake-cloudflared-ready-crash.sh')
+    const composition = await bootQuick({ executable: quickExecutable })
+    const base = await composition.gateBase()
+    const originalPids = await liveFixturePids()
+
+    await composition.settings().update(namespace, { executable: crashingExecutable })
+    const recovered = await waitForStatus(
+      composition,
+      status => status.phase === 'error' && status.running,
+      7000,
+    )
+
+    expect(recovered.publicUrl).toBe(QUICK_URL)
+    expect(recovered.message).toContain('kept the previous public URL')
+    expect(await liveFixturePids()).toEqual(originalPids)
+    expect((await fetch(`${base}/dsh-auth-tunnel/login`)).status).toBe(200)
+    expect(composition.shellEnv().contributors[0]?.resolve().DSH_PUBLIC_URL).toBe(QUICK_URL)
   })
 
   it('keeps the original composition working when no settings provider is mounted', { timeout: 60_000 }, async () => {

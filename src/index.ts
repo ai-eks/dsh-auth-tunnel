@@ -709,6 +709,15 @@ class PasswordGate {
       const current = Config(objectRecord(opened.value) as unknown as InternalConfig)
       const target = targetConfig(opened, request.writes)
       const password = request.password
+      if (password !== '') {
+        if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
+          throw new Error('access password credential conflicts with the tunnel token credential')
+        }
+        if (target.passwordRef !== current.passwordRef
+          && await this.ctx.credentials.resolve(credentialRef(target.passwordRef)) !== undefined) {
+          throw new Error('access password credential already exists')
+        }
+      }
       const changesActivePassword = password !== ''
         && current.enabled
         && current.passwordRef === target.passwordRef
@@ -879,7 +888,14 @@ class PasswordGate {
 }
 
 /** Spawn one cloudflared and resolve once the tunnel is up; any failure kills the child. */
-async function spawnTunnel(ctx: Context, config: InternalConfig, target: string): Promise<{ child: ChildProcess; publicUrl: string }> {
+async function spawnTunnel(
+  ctx: Context,
+  config: InternalConfig,
+  target: string,
+  signal?: AbortSignal,
+): Promise<{ child: ChildProcess; publicUrl: string }> {
+  const cancelled = (): boolean => signal?.aborted === true
+  if (cancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
   let args: string[]
   let publicUrlHint: string | undefined
   let tokenValue: string | undefined
@@ -912,7 +928,11 @@ async function spawnTunnel(ctx: Context, config: InternalConfig, target: string)
     args = ['tunnel', '--no-autoupdate', 'run']
   }
 
+  if (cancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
   const child = spawn(config.executable, args, { env, stdio: ['ignore', 'pipe', 'pipe'] })
+  const cancel = (): void => { void killTree(child) }
+  signal?.addEventListener('abort', cancel, { once: true })
+  if (cancelled()) cancel()
   // A bounded rolling tail of cloudflared output for diagnostics; the
   // console gets only the one URL line, not the child's chatter.
   let tail = ''
@@ -965,6 +985,8 @@ async function spawnTunnel(ctx: Context, config: InternalConfig, target: string)
   } catch (error) {
     await killTree(child)
     throw error
+  } finally {
+    signal?.removeEventListener('abort', cancel)
   }
 }
 
@@ -1030,6 +1052,7 @@ class AuthTunnelRuntime {
   private debounce: ReturnType<typeof setTimeout> | undefined
   private drainTask: Promise<void> | undefined
   private disposed = false
+  private readonly shutdown = new AbortController()
   private revision = 0
   private status: AuthTunnelRuntimeStatus = { phase: 'stopped', running: false, revision: 0 }
   private readonly intentionalExits = new WeakSet<ChildProcess>()
@@ -1109,11 +1132,14 @@ class AuthTunnelRuntime {
       clearTimeout(this.debounce)
       this.debounce = undefined
     }
-    await this.drainTask
     const active = this.active
     this.active = undefined
     this.publish(undefined)
-    if (active !== undefined) await this.stop(active)
+    this.shutdown.abort()
+    await Promise.all([
+      this.drainTask,
+      active === undefined ? Promise.resolve() : this.stop(active),
+    ])
   }
 
   private setStatus(
@@ -1150,6 +1176,7 @@ class AuthTunnelRuntime {
       try {
         await this.reconcile(next)
       } catch (error) {
+        if (this.disposed) return
         const message = errorMessage(error)
         const running = this.active?.alive === true
         this.setStatus('error', running, running ? this.active?.publicUrl : undefined, message)
@@ -1195,7 +1222,17 @@ class AuthTunnelRuntime {
       // Keep the old public path alive long enough for its page to observe the
       // new runtime URL before the browser's current tunnel is retired.
       if (previous !== undefined) {
-        await new Promise<void>(resolve => { setTimeout(resolve, TUNNEL_HANDOFF_MS) })
+        await this.waitForHandoff()
+        if (this.disposed) {
+          await this.stop(previous)
+          return
+        }
+        if (!candidate.alive) {
+          const restored = this.restorePreviousAfterFailedHandoff(candidate, previous)
+          await this.stop(candidate)
+          if (!restored) await this.stop(previous)
+          return
+        }
         await this.stop(previous)
       }
       return
@@ -1206,7 +1243,12 @@ class AuthTunnelRuntime {
       || current.config.executable !== next.executable
       || (next.mode === 'token' && current.config.tokenRef !== next.tokenRef)
     if (replaceTunnel) {
-      const spawned = await spawnTunnel(this.ctx, next, `http://127.0.0.1:${String(current.port)}`)
+      const spawned = await spawnTunnel(
+        this.ctx,
+        next,
+        `http://127.0.0.1:${String(current.port)}`,
+        this.shutdown.signal,
+      )
       if (this.disposed) {
         this.intentionalExits.add(spawned.child)
         await killTree(spawned.child)
@@ -1226,7 +1268,15 @@ class AuthTunnelRuntime {
       this.adopt(candidate)
       this.setStatus('running', true, candidate.publicUrl)
       if (previous !== undefined) {
-        await new Promise<void>(resolve => { setTimeout(resolve, TUNNEL_HANDOFF_MS) })
+        await this.waitForHandoff()
+        if (this.disposed) {
+          await this.stopChild(previous)
+          return
+        }
+        if (!candidate.alive) {
+          this.restorePreviousAfterFailedHandoff(candidate, previous)
+          return
+        }
         await this.stopChild(previous)
       }
       return
@@ -1254,7 +1304,12 @@ class AuthTunnelRuntime {
     const gate = new PasswordGate(this.ctx, config, this.ctx.webServer.port)
     const { server, port } = await gate.start(config.gatePort)
     try {
-      const spawned = await spawnTunnel(this.ctx, config, `http://127.0.0.1:${String(port)}`)
+      const spawned = await spawnTunnel(
+        this.ctx,
+        config,
+        `http://127.0.0.1:${String(port)}`,
+        this.shutdown.signal,
+      )
       return {
         config,
         gate,
@@ -1289,6 +1344,34 @@ class AuthTunnelRuntime {
     }
     console.log(`cloudflare tunnel: ${candidate.publicUrl}`)
     this.publish(candidate.publicUrl)
+  }
+
+  private waitForHandoff(): Promise<void> {
+    const signal = this.shutdown.signal
+    if (signal.aborted) return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      let settled = false
+      const finish = (): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeout)
+        signal.removeEventListener('abort', finish)
+        resolve()
+      }
+      const timeout = setTimeout(finish, TUNNEL_HANDOFF_MS)
+      signal.addEventListener('abort', finish, { once: true })
+      if (signal.aborted) finish()
+    })
+  }
+
+  private restorePreviousAfterFailedHandoff(candidate: ActiveTunnel, previous: ActiveTunnel): boolean {
+    if (candidate.alive || !previous.alive || this.disposed) return false
+    const failure = this.status.message ?? 'auth-tunnel: replacement cloudflared exited during handoff.'
+    this.active = previous
+    previous.gate.updateAuth(previous.config)
+    this.publish(previous.publicUrl)
+    this.setStatus('error', true, previous.publicUrl, `${failure} The plugin kept the previous public URL.`)
+    return true
   }
 
   private async stopChild(active: ActiveTunnel): Promise<void> {

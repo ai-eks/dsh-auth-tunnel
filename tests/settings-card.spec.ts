@@ -123,7 +123,7 @@ describe('auth-tunnel settings card contract', () => {
 
   it('commits settings before rotating the active password so a public session can finish saving', async () => {
     const order: string[] = []
-    const { api } = successfulCardApi({ sessionTtlHours: 24 }, order)
+    const { api, set } = successfulCardApi({ sessionTtlHours: 24 }, order)
 
     await commitCardChanges(
       api,
@@ -132,10 +132,11 @@ describe('auth-tunnel settings card contract', () => {
       true,
       'DSH_WEB_PASSWORD',
       'DSH_WEB_PASSWORD',
-      'rotated-password',
+      '  rotated-password  ',
     )
 
     expect(order).toEqual(['settings', 'credential'])
+    expect(set).toHaveBeenCalledWith({ ref: 'DSH_WEB_PASSWORD', value: '  rotated-password  ' })
   })
 
   it('populates a newly selected password reference before settings activate it', async () => {
