@@ -688,8 +688,7 @@ class PasswordGate {
     try {
       const request = parseRemoteSettingsWriteRequest(body)
       const opened = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE).descriptor
-      if (request.writes.length !== 0
-        && request.expectedRevision !== undefined
+      if (request.expectedRevision !== undefined
         && request.expectedRevision !== opened.revision) {
         throw new Error('settings revision changed')
       }
@@ -1050,6 +1049,7 @@ class AuthTunnelRuntime {
   private disposed = false
   private readonly shutdown = new AbortController()
   private stagedStartup: AbortController | undefined
+  private tokenRestartPending = false
   private configured: InternalConfig | undefined
   private revision = 0
   private status: AuthTunnelRuntimeStatus = { phase: 'stopped', running: false, revision: 0 }
@@ -1126,6 +1126,11 @@ class AuthTunnelRuntime {
   request(config: InternalConfig): void {
     if (this.disposed) return
     if (!config.enabled) this.stagedStartup?.abort()
+    if (!config.allowRemoteSettings && this.active?.config.allowRemoteSettings === true) {
+      const revoked = { ...this.active.config, allowRemoteSettings: false }
+      this.active.config = revoked
+      this.active.gate.updateAuth(revoked)
+    }
     this.configured = config
     this.desired = config
     const running = this.active?.alive === true
@@ -1137,7 +1142,9 @@ class AuthTunnelRuntime {
   /** Retry the latest desired settings after its access credential is repaired. */
   credentialUpdated(ref: string): void {
     const config = this.configured
-    if (config?.passwordRef === ref || (config?.mode === 'token' && config.tokenRef === ref)) {
+    const tokenUpdated = config?.mode === 'token' && config.tokenRef === ref
+    if (tokenUpdated) this.tokenRestartPending = true
+    if (config?.passwordRef === ref || tokenUpdated) {
       this.request(config)
     }
   }
@@ -1230,6 +1237,7 @@ class AuthTunnelRuntime {
         throw this.exitedBeforeAdoption(candidate)
       }
       this.setStatus('running', true, candidate.publicUrl)
+      this.tokenRestartPending = false
       return
     }
 
@@ -1263,6 +1271,7 @@ class AuthTunnelRuntime {
         }
         await this.stop(previous)
       }
+      this.tokenRestartPending = false
       return
     }
 
@@ -1270,6 +1279,7 @@ class AuthTunnelRuntime {
       || current.config.mode !== next.mode
       || current.config.executable !== next.executable
       || (next.mode === 'token' && current.config.tokenRef !== next.tokenRef)
+      || this.tokenRestartPending
     if (replaceTunnel) {
       const spawned = await this.spawnStaged(next, `http://127.0.0.1:${String(current.port)}`)
       if (this.disposed) {
@@ -1305,6 +1315,7 @@ class AuthTunnelRuntime {
         }
         await this.stopChild(previous)
       }
+      this.tokenRestartPending = false
       return
     }
 

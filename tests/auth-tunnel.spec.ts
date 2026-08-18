@@ -465,6 +465,32 @@ describe('password gate over the loopback webserver', () => {
     expect((await login(base, undefined, '  replacement-password  ')).get('set-cookie')).toContain('dsh_auth_tunnel=')
   })
 
+  it('rejects a stale password-only remote save before rotating the current credential', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true }, {
+      seeds: { ALT_WEB_PASSWORD: 'alternate-password' },
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { passwordRef: 'ALT_WEB_PASSWORD' })
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [],
+        password: 'stale-page-password',
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(await composition.credentials().resolve('ALT_WEB_PASSWORD'))
+      .toMatchObject({ value: 'alternate-password' })
+  })
+
   it.each(['DSH_TUNNEL_TOKEN', 'OTHER_HOST_SECRET'])(
     'does not let a remote password write overwrite existing non-access credential %s',
     { timeout: 60_000 },
@@ -1417,6 +1443,37 @@ describe('rc7 plugin settings', () => {
     expect((await fetch(`http://127.0.0.1:${String(gatePort)}/dsh-auth-tunnel/login`)).status).toBe(200)
   })
 
+  it('restarts an active token tunnel when its credential rotates', { timeout: 60_000 }, async () => {
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const gatePort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const composition = await loadComposition({
+      mode: 'token',
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
+      gatePort,
+      executable: await fixtureExecutable('fake-cloudflared-token.sh'),
+      startupTimeoutMs: 15_000,
+    }, { seeds: { DSH_TUNNEL_TOKEN: 'fixture-token-1' } })
+    const originalPids = await liveFixturePids()
+    const before = await composition.runtimeStatus()
+
+    composition.credentials().set('DSH_TUNNEL_TOKEN', 'fixture-token-2')
+    await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'running',
+      7000,
+    )
+    await sleep(900)
+
+    const replacementPids = await liveFixturePids()
+    expect(replacementPids).toHaveLength(1)
+    expect(replacementPids).not.toEqual(originalPids)
+  })
+
   it('starts and stops the gate and cloudflared from the live enabled switch', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ enabled: false })
     expect(await composition.runtimeStatus()).toMatchObject({ phase: 'stopped', running: false })
@@ -1491,6 +1548,24 @@ describe('rc7 plugin settings', () => {
 
     await composition.settings().update(namespace, { executable: quickExecutable })
     await waitForStatus(composition, status => status.phase === 'running')
+  })
+
+  it('revokes remote settings on the old gate before a replacement can fail', { timeout: 60_000 }, async () => {
+    const silentExecutable = await fixtureExecutable('fake-cloudflared-silent.sh')
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(200)
+
+    await composition.settings().update(namespace, {
+      allowRemoteSettings: false,
+      executable: silentExecutable,
+      startupTimeoutMs: 50,
+    })
+    const failed = await waitForStatus(composition, status => status.phase === 'error', 7000)
+
+    expect(failed).toMatchObject({ running: true, publicUrl: QUICK_URL })
+    expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
   })
 
   it('restores the previous tunnel when a ready replacement dies during handoff', { timeout: 60_000 }, async () => {
