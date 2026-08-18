@@ -413,12 +413,15 @@ function objectRecord(value: unknown): Record<string, unknown> {
 function parseRemoteSettingsWriteRequest(value: unknown): RemoteSettingsWriteRequest {
   const request = objectRecord(value)
   if (!Array.isArray(request.writes)) throw new TypeError('writes must be an array')
+  const fields = new Set<RemoteSettingsField>()
   const writes = request.writes.map((entry): RemoteSettingsWrite => {
     const write = objectRecord(entry)
     if (typeof write.field !== 'string' || !REMOTE_SETTINGS_FIELDS.has(write.field)) {
       throw new TypeError('unknown settings field')
     }
     const field = write.field as RemoteSettingsField
+    if (fields.has(field)) throw new TypeError('duplicate settings field')
+    fields.add(field)
     if (write.op === 'unset') return { field, op: 'unset' }
     if (write.op === 'set' && Object.hasOwn(write, 'value')) return { field, op: 'set', value: write.value }
     throw new TypeError('invalid settings write')
@@ -796,9 +799,14 @@ class PasswordGate {
           if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
             throw new Error('access password credential conflicts with the tunnel token credential')
           }
-          if (password !== '' && target.passwordRef !== current.passwordRef
-            && await this.ctx.credentials.resolve(credentialRef(target.passwordRef)) !== undefined) {
-            throw new Error('access password credential already exists')
+          if (target.passwordRef !== current.passwordRef) {
+            const targetCredential = await this.ctx.credentials.resolve(credentialRef(target.passwordRef))
+            if (password === '' && targetCredential === undefined) {
+              throw new Error('access password credential is not configured')
+            }
+            if (password !== '' && targetCredential !== undefined) {
+              throw new Error('access password credential already exists')
+            }
           }
           if (!current.allowRemoteSettings) throw new Error('remote settings disabled')
           await this.requireRemoteMutationAuthorization(req)
@@ -1642,8 +1650,11 @@ class AuthTunnelRuntime {
   private restorePreviousAfterFailedHandoff(candidate: ActiveTunnel, previous: ActiveTunnel): boolean {
     if (candidate.alive || !previous.alive || this.disposed) return false
     const failure = this.status.message ?? 'auth-tunnel: replacement cloudflared exited during handoff.'
-    if (!candidate.config.allowRemoteSettings && previous.config.allowRemoteSettings) {
-      previous.config = { ...previous.config, allowRemoteSettings: false }
+    previous.config = {
+      ...previous.config,
+      passwordRef: candidate.config.passwordRef,
+      sessionTtlHours: candidate.config.sessionTtlHours,
+      allowRemoteSettings: candidate.config.allowRemoteSettings,
     }
     this.active = previous
     previous.gate.updateAuth(previous.config)

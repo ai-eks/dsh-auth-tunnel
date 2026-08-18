@@ -703,6 +703,53 @@ describe('password gate over the loopback webserver', () => {
     expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
   })
 
+  it('rejects a passwordless switch to an unconfigured access credential', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'passwordRef', op: 'set', value: 'MISSING_PASSWORD' }],
+        password: '',
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
+  })
+
+  it('rejects duplicate remote writes without committing their final value', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [
+          { field: 'sessionTtlHours', op: 'set', value: 24 },
+          { field: 'sessionTtlHours', op: 'set', value: 48 },
+        ],
+        password: '',
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).sessionTtlHours).toBe(720)
+  })
+
   it('rejects password-only remote saves while Host settings are read-only', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     const base = await composition.gateBase()
@@ -2260,6 +2307,32 @@ describe('rc7 plugin settings', () => {
 
     expect(restored.message).toContain('kept the previous public URL')
     expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
+  })
+
+  it('keeps the candidate password policy when a tunnel handoff rolls back', { timeout: 60_000 }, async () => {
+    const crashingExecutable = await fixtureExecutable('fake-cloudflared-ready-crash.sh')
+    const composition = await bootQuick(undefined, {
+      seeds: { ALT_WEB_PASSWORD: 'alternate-password' },
+    })
+    const base = await composition.gateBase()
+
+    await composition.settings().update(namespace, {
+      passwordRef: 'ALT_WEB_PASSWORD',
+      executable: crashingExecutable,
+    })
+    await waitForStatus(
+      composition,
+      status => status.phase === 'error' && status.running && status.publicUrl === QUICK_URL,
+      7000,
+    )
+
+    const oldPassword = await fetch(`${base}/dsh-auth-tunnel/login`, {
+      method: 'POST', redirect: 'manual',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'password=s3kret-passw0rd',
+    })
+    expect(oldPassword.headers.get('location')).toBe('/dsh-auth-tunnel/login?error=1')
+    await login(base, undefined, 'alternate-password')
   })
 
   it('restores the previous tunnel when a ready replacement dies during handoff', { timeout: 60_000 }, async () => {
