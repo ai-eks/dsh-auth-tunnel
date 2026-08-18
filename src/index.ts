@@ -146,7 +146,7 @@ const MAX_REMOTE_SETTINGS_BODY_BYTES = 64 * 1024
 const OUTPUT_TAIL_CHARS = 8192
 const KILL_GRACE_MS = 2000
 const TUNNEL_ADOPTION_CHECK_MS = 25
-const TUNNEL_HANDOFF_MS = 750
+const TUNNEL_HANDOFF_MS = 3500
 const QUICK_URL_PATTERN = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',
@@ -515,6 +515,7 @@ function writeJson(res: ServerResponse, status: number, value: unknown): void {
  */
 class PasswordGate {
   private auth: { passwordRef: string; ttlMs: number; allowRemoteSettings: boolean }
+  private remoteMutationTail: Promise<void> = Promise.resolve()
   private readonly upgradeDrops = new Set<() => void>()
   private readonly upstreamPort: number
 
@@ -544,6 +545,23 @@ class PasswordGate {
   /** Drop upgraded connections authenticated with the previous credential value. */
   revokeAuthenticatedUpgrades(): void {
     for (const drop of [...this.upgradeDrops]) drop()
+  }
+
+  /** Keep authenticated remote writes ordered across concurrent browser tabs. */
+  private serializeRemoteMutation<T>(mutation: () => Promise<T>): Promise<T> {
+    const queued = this.remoteMutationTail.then(mutation)
+    this.remoteMutationTail = queued.then(() => undefined, () => undefined)
+    return queued
+  }
+
+  /** Revalidate the current credential and live permission after reading a request body. */
+  private async requireRemoteMutationAuthorization(req: IncomingMessage): Promise<void> {
+    const passwordRef = this.auth.passwordRef
+    if (!await this.authenticated(req)
+      || !this.auth.allowRemoteSettings
+      || this.auth.passwordRef !== passwordRef) {
+      throw new Error('remote settings authorization changed')
+    }
   }
 
   /** Bind the gate on the configured loopback port (0 asks the OS for one).
@@ -702,48 +720,51 @@ class PasswordGate {
     if (body === undefined) return
     try {
       const request = parseRemoteSettingsWriteRequest(body)
-      const openedSettings = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
-      if (!openedSettings.writable) throw new Error('settings provider is read-only')
-      const opened = openedSettings.descriptor
-      if (request.expectedRevision !== undefined
-        && request.expectedRevision !== opened.revision) {
-        throw new Error('settings revision changed')
-      }
-      const current = Config(objectRecord(opened.value) as unknown as InternalConfig)
-      const target = targetConfig(opened, request.writes)
-      const password = request.password
-      if (password !== '' && current.enabled && changesTunnelRoute(current, target)) {
-        throw new Error('rotate the access password separately from tunnel route changes')
-      }
-      if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
-        throw new Error('access password credential conflicts with the tunnel token credential')
-      }
-      if (password !== '') {
-        if (target.passwordRef !== current.passwordRef
+      const document = await this.serializeRemoteMutation(async () => {
+        const openedSettings = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
+        if (!openedSettings.writable) throw new Error('settings provider is read-only')
+        const opened = openedSettings.descriptor
+        if (request.expectedRevision !== undefined
+          && request.expectedRevision !== opened.revision) {
+          throw new Error('settings revision changed')
+        }
+        const current = Config(objectRecord(opened.value) as unknown as InternalConfig)
+        const target = targetConfig(opened, request.writes)
+        const password = request.password
+        if (password !== '' && current.enabled && changesTunnelRoute(current, target)) {
+          throw new Error('rotate the access password separately from tunnel route changes')
+        }
+        if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
+          throw new Error('access password credential conflicts with the tunnel token credential')
+        }
+        if (password !== '' && target.passwordRef !== current.passwordRef
           && await this.ctx.credentials.resolve(credentialRef(target.passwordRef)) !== undefined) {
           throw new Error('access password credential already exists')
         }
-      }
-      if (request.writes.length !== 0) {
-        const settings = this.ctx.get('settings')
-        if (settings === undefined) throw new Error('settings service is unavailable')
-        const ops: SettingsPathOp[] = request.writes.map(write => write.op === 'set'
-          ? { op: 'set', path: [write.field], value: write.value }
-          : { op: 'unset', path: [write.field] })
-        await settings.mutate(
-          AUTH_TUNNEL_SETTINGS_NAMESPACE,
-          ops,
-          request.expectedRevision,
-        )
-        const committed = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE).descriptor
-        if (request.writes.some(write => !settingsWriteSatisfied(committed, write))) {
-          throw new Error('settings write was not committed')
+        if (!current.allowRemoteSettings) throw new Error('remote settings disabled')
+        await this.requireRemoteMutationAuthorization(req)
+        if (request.writes.length !== 0) {
+          const settings = this.ctx.get('settings')
+          if (settings === undefined) throw new Error('settings service is unavailable')
+          const ops: SettingsPathOp[] = request.writes.map(write => write.op === 'set'
+            ? { op: 'set', path: [write.field], value: write.value }
+            : { op: 'unset', path: [write.field] })
+          await settings.mutate(
+            AUTH_TUNNEL_SETTINGS_NAMESPACE,
+            ops,
+            request.expectedRevision,
+          )
+          const committed = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE).descriptor
+          if (request.writes.some(write => !settingsWriteSatisfied(committed, write))) {
+            throw new Error('settings write was not committed')
+          }
         }
-      }
-      if (password !== '') {
-        await this.ctx.credentials.set(credentialRef(target.passwordRef), password)
-      }
-      writeJson(res, 200, remoteSettingsDocument(this.ctx))
+        if (password !== '') {
+          await this.ctx.credentials.set(credentialRef(target.passwordRef), password)
+        }
+        return remoteSettingsDocument(this.ctx)
+      })
+      writeJson(res, 200, document)
     } catch (error) {
       this.ctx.logger.warn(`auth-tunnel: remote settings write rejected: ${error instanceof Error ? error.message : String(error)}`)
       writeJson(res, 409, { error: 'plugin settings were not saved' })
@@ -762,9 +783,12 @@ class PasswordGate {
     try {
       const locale = objectRecord(body).locale
       if (locale !== 'zh' && locale !== 'en') throw new TypeError('unsupported locale')
-      const settings = this.ctx.get('settings')
-      if (settings === undefined) throw new Error('settings service is unavailable')
-      await settings.update(LOCALE_SETTINGS_NAMESPACE, { preference: locale })
+      await this.serializeRemoteMutation(async () => {
+        await this.requireRemoteMutationAuthorization(req)
+        const settings = this.ctx.get('settings')
+        if (settings === undefined) throw new Error('settings service is unavailable')
+        await settings.update(LOCALE_SETTINGS_NAMESPACE, { preference: locale })
+      })
       writeJson(res, 200, { locale })
     } catch (error) {
       this.ctx.logger.warn(`auth-tunnel: remote locale write rejected: ${error instanceof Error ? error.message : String(error)}`)

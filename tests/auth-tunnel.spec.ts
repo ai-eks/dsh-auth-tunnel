@@ -348,6 +348,35 @@ async function rawRequest(port: number, request: string[]): Promise<string> {
   return String(data)
 }
 
+/** Start an authenticated JSON request but hold its body incomplete until finish(). */
+async function beginJsonPost(
+  port: number,
+  path: string,
+  cookie: string,
+  body: Record<string, unknown>,
+): Promise<() => Promise<string>> {
+  const serialized = JSON.stringify(body)
+  const socket = connect(port, '127.0.0.1')
+  socket.on('error', () => {})
+  await once(socket, 'connect')
+  const response = once(socket, 'data') as Promise<[Buffer]>
+  socket.write([
+    `POST ${path} HTTP/1.1`,
+    `Host: 127.0.0.1:${String(port)}`,
+    'Content-Type: application/json',
+    `Content-Length: ${String(Buffer.byteLength(serialized))}`,
+    `Cookie: ${cookie}`,
+    '',
+    serialized.slice(0, 1),
+  ].join('\r\n'))
+  return async () => {
+    socket.write(serialized.slice(1))
+    const [data] = await response
+    socket.end()
+    return String(data)
+  }
+}
+
 /** Wait one bounded interval in real time. */
 async function sleep(ms: number): Promise<void> {
   await new Promise<void>((resolve) => {
@@ -477,6 +506,49 @@ describe('password gate over the loopback webserver', () => {
     expect(await response.text()).not.toContain('replacement-password')
     expect(await composition.credentials().resolve('DSH_WEB_PASSWORD')).toMatchObject({ value: '  replacement-password  ' })
     expect((await login(base, undefined, '  replacement-password  ')).get('set-cookie')).toContain('dsh_auth_tunnel=')
+  })
+
+  it('serializes concurrent password-only rotations from the same session', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const port = Number(new URL(base).port)
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    const request = (password: string) => ({
+      expectedRevision: opened.settings.revision,
+      writes: [],
+      password,
+    })
+    const finishFirst = await beginJsonPost(port, '/dsh-auth-tunnel/settings', cookie, request('first-password'))
+    const finishSecond = await beginJsonPost(port, '/dsh-auth-tunnel/settings', cookie, request('second-password'))
+    await sleep(50)
+
+    const responses = await Promise.all([finishFirst(), finishSecond()])
+
+    expect(responses.filter(response => response.includes(' 200 '))).toHaveLength(1)
+    expect(responses.filter(response => response.includes(' 409 '))).toHaveLength(1)
+  })
+
+  it('rejects a pending remote save after remote settings are revoked', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const port = Number(new URL(base).port)
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const before = await composition.runtimeStatus()
+    const finish = await beginJsonPost(port, '/dsh-auth-tunnel/settings', cookie, {
+      writes: [{ field: 'allowRemoteSettings', op: 'set', value: true }],
+      password: '',
+    })
+    await sleep(50)
+
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { allowRemoteSettings: false })
+    await waitForStatus(composition, status => status.revision > before.revision)
+    expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
+
+    expect(await finish()).toContain(' 409 ')
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).allowRemoteSettings).toBe(false)
   })
 
   it('rejects a stale password-only remote save before rotating the current credential', { timeout: 60_000 }, async () => {
@@ -1629,7 +1701,11 @@ describe('rc7 plugin settings', () => {
       status => status.revision > before.revision && status.phase === 'running',
       7000,
     )
-    await sleep(900)
+    const handoffDeadline = Date.now() + 6000
+    while ((await liveFixturePids()).length > 1) {
+      if (Date.now() >= handoffDeadline) throw new Error('token replacement handoff did not finish')
+      await sleep(25)
+    }
 
     const replacementPids = await liveFixturePids()
     expect(replacementPids).toHaveLength(1)
@@ -1660,7 +1736,7 @@ describe('rc7 plugin settings', () => {
     }
     composition.credentials().set('DSH_TUNNEL_TOKEN', 'fixture-token-3')
 
-    const appliedDeadline = Date.now() + 7000
+    const appliedDeadline = Date.now() + 12_000
     let applied = ''
     while (Date.now() < appliedDeadline) {
       const pids = await liveFixturePids()
@@ -1720,7 +1796,9 @@ describe('rc7 plugin settings', () => {
     expect((await fetch(`${previousGate}/dsh-auth-tunnel/status`, { headers: { cookie } })).status).toBe(200)
     expect((await fetch(`http://127.0.0.1:${String(nextPort)}/dsh-auth-tunnel/login`)).status).toBe(200)
 
-    await sleep(900)
+    await sleep(3000)
+    expect((await fetch(`${previousGate}/dsh-auth-tunnel/status`, { headers: { cookie } })).status).toBe(200)
+    await sleep(700)
     await expect(fetch(`${previousGate}/dsh-auth-tunnel/status`, { headers: { cookie } })).rejects.toThrow()
   })
 
