@@ -750,22 +750,16 @@ export async function commitCardChanges(
       throw new Error('settings password reference changed')
     }
   }
-  const changesActivePassword = password !== ''
-    && current.enabled
-    && current.passwordRef === target.passwordRef
-  // Rotating the active credential invalidates the public page's cookie, so
-  // ordinary settings must cross the gate first. A newly selected reference
-  // is populated first so Host reconciliation never sees it unconfigured.
-  if (password !== '' && !changesActivePassword) {
-    await commitCredentialWrite(api, target.passwordRef, password)
-  }
+  // Commit the revision-fenced settings first. If the new credential is not
+  // ready when live reconciliation observes them, credentials/updated retries
+  // the retained configuration after the following write succeeds.
   if (writes.length !== 0) {
     const committed = await commitSettingsWrites(api, revision, writes)
     if (writes.some(write => !writeSatisfied(committed, write))) {
       throw new Error('settings write was not committed')
     }
   }
-  if (changesActivePassword) await commitCredentialWrite(api, target.passwordRef, password)
+  if (password !== '') await commitCredentialWrite(api, target.passwordRef, password)
 }
 
 const styles: Record<string, CSSProperties> = {

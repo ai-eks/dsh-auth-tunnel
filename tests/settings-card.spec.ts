@@ -154,7 +154,7 @@ describe('auth-tunnel settings card contract', () => {
     expect(set).toHaveBeenCalledWith({ ref: 'DSH_WEB_PASSWORD', value: '  rotated-password  ' })
   })
 
-  it('populates a newly selected password reference before settings activate it', async () => {
+  it('commits a newly selected password reference before writing its credential', async () => {
     const order: string[] = []
     const { api } = successfulCardApi({ passwordRef: 'NEXT_WEB_PASSWORD' }, order)
 
@@ -167,7 +167,33 @@ describe('auth-tunnel settings card contract', () => {
       'next-password',
     )
 
-    expect(order).toEqual(['credential-check', 'credential', 'settings'])
+    expect(order).toEqual(['credential-check', 'settings', 'credential'])
+  })
+
+  it('does not create a new local credential when the settings mutation fails', async () => {
+    const set = vi.fn()
+    const mutate = vi.fn(() => Promise.resolve({
+      rpcId: 'test',
+      result: { ok: false as const, error: { code: 'conflict', message: 'settings revision changed' } },
+    }))
+    const describe = vi.fn(() => Promise.resolve({
+      rpcId: 'test',
+      result: {
+        ok: true as const,
+        value: { credentials: { NEXT_WEB_PASSWORD: { configured: false, writable: true } } },
+      },
+    }))
+
+    await expect(commitCardChanges(
+      { settings: { mutate }, credentials: { describe, set } } as never,
+      7,
+      [{ field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' }],
+      quick,
+      { ...quick, passwordRef: 'NEXT_WEB_PASSWORD' },
+      'next-password',
+    )).rejects.toThrow('settings revision changed')
+
+    expect(set).not.toHaveBeenCalled()
   })
 
   it('stores the password before enabling a currently stopped tunnel', async () => {
@@ -183,7 +209,7 @@ describe('auth-tunnel settings card contract', () => {
       'first-password',
     )
 
-    expect(order).toEqual(['credential', 'settings'])
+    expect(order).toEqual(['settings', 'credential'])
   })
 
   it('rejects a local password write targeting the tunnel token', async () => {

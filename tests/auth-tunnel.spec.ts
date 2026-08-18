@@ -28,14 +28,20 @@ class StubCredentials extends Service {
     super(ctx, 'credentials')
   }
 
-  resolve(request: string): Promise<{ value: string; source: string } | undefined> {
+  async resolve(request: string): Promise<{ value: string; source: string } | undefined> {
+    if (this.resolveDelayMs > 0) {
+      await new Promise<void>(resolve => { setTimeout(resolve, this.resolveDelayMs) })
+    }
     if (this.fault) return Promise.reject(new Error('credential store exploded'))
     const hit = this.values.get(request)
-    return Promise.resolve(hit === undefined ? undefined : { value: hit, source: 'test' })
+    return hit === undefined ? undefined : { value: hit, source: 'test' }
   }
 
   /** Test knob: make every resolve throw (per-request error containment). */
   fault = false
+
+  /** Test knob: hold credential resolution before startup creates a controller. */
+  resolveDelayMs = 0
 
   /** Test knob: set or delete one credential. */
   set(ref: string, value: string | undefined): void {
@@ -85,6 +91,7 @@ class StubSystemPrompt extends Service {
 /** Writable in-memory settings provider exercising the real rc7 service definition. */
 class StubSettings extends SettingsProvider {
   readonly writable = true
+  failNextPersist = false
   private document: Record<string, unknown>
 
   constructor(ctx: Context, config?: { document?: Record<string, unknown> }) {
@@ -97,6 +104,10 @@ class StubSettings extends SettingsProvider {
   }
 
   protected persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void> {
+    if (this.failNextPersist) {
+      this.failNextPersist = false
+      return Promise.reject(new Error('settings persistence failed'))
+    }
     this.document = { ...this.document, [ns]: structuredClone(section) }
     return Promise.resolve()
   }
@@ -193,6 +204,8 @@ interface CompositionOptions {
   withPassword?: boolean
   /** Extra seeded credentials. */
   seeds?: Record<string, string>
+  /** Delay every credential resolution. */
+  credentialResolveDelayMs?: number
   /** Skip the loader resolution wait (boot-failure tests). */
   wait?: boolean
 }
@@ -246,6 +259,7 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
   // activation reads the password reference at load, never afterwards.
   const credentialsPlugin = (ctx2: Context, config?: { seeds?: Record<string, string> }): void => {
     const service = new StubCredentials(ctx2)
+    service.resolveDelayMs = options?.credentialResolveDelayMs ?? 0
     for (const [ref, value] of Object.entries(config?.seeds ?? {})) service.set(ref, value)
   }
   credentialsPlugin.inject = options?.credentialsAfterWebServer === true ? ['webServer'] : []
@@ -489,6 +503,53 @@ describe('password gate over the loopback webserver', () => {
     expect(response.status).toBe(409)
     expect(await composition.credentials().resolve('ALT_WEB_PASSWORD'))
       .toMatchObject({ value: 'alternate-password' })
+  })
+
+  it('does not leave a new remote credential when settings persistence fails', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    composition.settings().failNextPersist = true
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'passwordRef', op: 'set', value: 'NEW_REMOTE_PASSWORD' }],
+        password: 'new-password',
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(await composition.credentials().resolve('NEW_REMOTE_PASSWORD')).toBeUndefined()
+  })
+
+  it('rejects a remote save that rotates the active password and tunnel route together', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'gatePort', op: 'set', value: 32_345 }],
+        password: 'combined-password',
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).gatePort).toBe(0)
+    expect(await composition.credentials().resolve('DSH_WEB_PASSWORD'))
+      .toMatchObject({ value: 's3kret-passw0rd' })
   })
 
   it.each(['DSH_TUNNEL_TOKEN', 'OTHER_HOST_SECRET'])(
@@ -1100,6 +1161,24 @@ describe('tunnel lifecycle', () => {
     expect(await liveFixturePids()).toEqual([])
   })
 
+  it('a live disable stays latched before staged startup is created', { timeout: 60_000 }, async () => {
+    const composition = await loadComposition({
+      mode: 'quick',
+      executable: await fixtureExecutable('fake-cloudflared-silent.sh'),
+      startupTimeoutMs: 10_000,
+    }, { wait: false, credentialResolveDelayMs: 500 })
+
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
+    const outcome = await Promise.race([
+      composition.loaded.loader.await().then(() => 'loaded'),
+      sleep(3000).then(() => 'timeout'),
+    ])
+
+    expect(outcome).toBe('loaded')
+    await waitForStatus(composition, status => status.phase === 'stopped')
+    expect(await liveFixturePids()).toEqual([])
+  })
+
   it('escalates a stubborn cloudflared to SIGKILL after the grace', { timeout: 60_000 }, async () => {
     await bootQuick({ executable: await fixtureExecutable('fake-cloudflared-stubborn.sh') })
     expect((await liveFixturePids()).length).toBe(1)
@@ -1474,6 +1553,43 @@ describe('rc7 plugin settings', () => {
     expect(replacementPids).not.toEqual(originalPids)
   })
 
+  it('applies the latest token when it rotates again during a restart', { timeout: 60_000 }, async () => {
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const gatePort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const composition = await loadComposition({
+      mode: 'token',
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
+      gatePort,
+      executable: await fixtureExecutable('fake-cloudflared-token-recording.sh'),
+      startupTimeoutMs: 15_000,
+    }, { seeds: { DSH_TUNNEL_TOKEN: 'fixture-token-1' } })
+
+    composition.credentials().set('DSH_TUNNEL_TOKEN', 'fixture-token-2')
+    const stagingDeadline = Date.now() + 5000
+    while ((await liveFixturePids()).length < 2) {
+      if (Date.now() >= stagingDeadline) throw new Error('first token replacement did not start')
+      await sleep(25)
+    }
+    composition.credentials().set('DSH_TUNNEL_TOKEN', 'fixture-token-3')
+
+    const appliedDeadline = Date.now() + 7000
+    let applied = ''
+    while (Date.now() < appliedDeadline) {
+      const pids = await liveFixturePids()
+      if (pids.length === 1) {
+        applied = await readFile(join(tmpdir(), `${FAKE_PREFIX}${pids[0]!}.token`), 'utf8').catch(() => '')
+        if (applied === 'fixture-token-3') break
+      }
+      await sleep(25)
+    }
+    expect(applied).toBe('fixture-token-3')
+  })
+
   it('starts and stops the gate and cloudflared from the live enabled switch', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ enabled: false })
     expect(await composition.runtimeStatus()).toMatchObject({ phase: 'stopped', running: false })
@@ -1565,6 +1681,28 @@ describe('rc7 plugin settings', () => {
     const failed = await waitForStatus(composition, status => status.phase === 'error', 7000)
 
     expect(failed).toMatchObject({ running: true, publicUrl: QUICK_URL })
+    expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
+  })
+
+  it('keeps a concurrent remote-settings revocation when a handoff rolls back', { timeout: 60_000 }, async () => {
+    const crashingExecutable = await fixtureExecutable('fake-cloudflared-ready-crash.sh')
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+
+    await composition.settings().update(namespace, { executable: crashingExecutable })
+    await waitForStatus(
+      composition,
+      status => status.phase === 'running' && status.publicUrl?.includes('ready-then-crash') === true,
+    )
+    await composition.settings().update(namespace, { allowRemoteSettings: false })
+    const restored = await waitForStatus(
+      composition,
+      status => status.phase === 'error' && status.running && status.publicUrl === QUICK_URL,
+      7000,
+    )
+
+    expect(restored.message).toContain('kept the previous public URL')
     expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
   })
 

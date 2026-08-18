@@ -493,6 +493,14 @@ function settingsWriteSatisfied(descriptor: SettingsDescriptor, write: RemoteSet
   return Object.hasOwn(user, write.field) && Object.is(user[write.field], write.value)
 }
 
+function changesTunnelRoute(current: InternalConfig, target: InternalConfig): boolean {
+  return current.mode !== target.mode
+    || current.gatePort !== target.gatePort
+    || current.executable !== target.executable
+    || current.tokenRef !== target.tokenRef
+    || current.publicHostname !== target.publicHostname
+}
+
 function writeJson(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
   res.end(JSON.stringify(value))
@@ -695,6 +703,9 @@ class PasswordGate {
       const current = Config(objectRecord(opened.value) as unknown as InternalConfig)
       const target = targetConfig(opened, request.writes)
       const password = request.password
+      if (password !== '' && current.enabled && changesTunnelRoute(current, target)) {
+        throw new Error('rotate the access password separately from tunnel route changes')
+      }
       if (password !== '') {
         if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
           throw new Error('access password credential conflicts with the tunnel token credential')
@@ -703,12 +714,6 @@ class PasswordGate {
           && await this.ctx.credentials.resolve(credentialRef(target.passwordRef)) !== undefined) {
           throw new Error('access password credential already exists')
         }
-      }
-      const changesActivePassword = password !== ''
-        && current.enabled
-        && current.passwordRef === target.passwordRef
-      if (password !== '' && !changesActivePassword) {
-        await this.ctx.credentials.set(credentialRef(target.passwordRef), password)
       }
       if (request.writes.length !== 0) {
         const settings = this.ctx.get('settings')
@@ -726,7 +731,7 @@ class PasswordGate {
           throw new Error('settings write was not committed')
         }
       }
-      if (changesActivePassword) {
+      if (password !== '') {
         await this.ctx.credentials.set(credentialRef(target.passwordRef), password)
       }
       writeJson(res, 200, remoteSettingsDocument(this.ctx))
@@ -1049,7 +1054,8 @@ class AuthTunnelRuntime {
   private disposed = false
   private readonly shutdown = new AbortController()
   private stagedStartup: AbortController | undefined
-  private tokenRestartPending = false
+  private tokenCredentialGeneration = 0
+  private appliedTokenCredentialGeneration = 0
   private configured: InternalConfig | undefined
   private revision = 0
   private status: AuthTunnelRuntimeStatus = { phase: 'stopped', running: false, revision: 0 }
@@ -1103,6 +1109,7 @@ class AuthTunnelRuntime {
       return
     }
     this.setStatus('applying', false)
+    const tokenGeneration = this.tokenCredentialGeneration
     try {
       const candidate = await this.startFull(config)
       if (this.disposed) {
@@ -1114,6 +1121,7 @@ class AuthTunnelRuntime {
         throw this.exitedBeforeAdoption(candidate)
       }
       this.setStatus('running', true, candidate.publicUrl)
+      this.appliedTokenCredentialGeneration = tokenGeneration
     } catch (error) {
       if (this.disposed) return
       if (this.desired !== undefined) return
@@ -1143,7 +1151,7 @@ class AuthTunnelRuntime {
   credentialUpdated(ref: string): void {
     const config = this.configured
     const tokenUpdated = config?.mode === 'token' && config.tokenRef === ref
-    if (tokenUpdated) this.tokenRestartPending = true
+    if (tokenUpdated) this.tokenCredentialGeneration += 1
     if (config?.passwordRef === ref || tokenUpdated) {
       this.request(config)
     }
@@ -1225,6 +1233,7 @@ class AuthTunnelRuntime {
       return
     }
 
+    const tokenGeneration = this.tokenCredentialGeneration
     const current = this.active
     if (current === undefined) {
       const candidate = await this.startFull(next)
@@ -1237,7 +1246,7 @@ class AuthTunnelRuntime {
         throw this.exitedBeforeAdoption(candidate)
       }
       this.setStatus('running', true, candidate.publicUrl)
-      this.tokenRestartPending = false
+      this.appliedTokenCredentialGeneration = tokenGeneration
       return
     }
 
@@ -1271,7 +1280,7 @@ class AuthTunnelRuntime {
         }
         await this.stop(previous)
       }
-      this.tokenRestartPending = false
+      this.appliedTokenCredentialGeneration = tokenGeneration
       return
     }
 
@@ -1279,7 +1288,7 @@ class AuthTunnelRuntime {
       || current.config.mode !== next.mode
       || current.config.executable !== next.executable
       || (next.mode === 'token' && current.config.tokenRef !== next.tokenRef)
-      || this.tokenRestartPending
+      || this.appliedTokenCredentialGeneration !== tokenGeneration
     if (replaceTunnel) {
       const spawned = await this.spawnStaged(next, `http://127.0.0.1:${String(current.port)}`)
       if (this.disposed) {
@@ -1315,7 +1324,7 @@ class AuthTunnelRuntime {
         }
         await this.stopChild(previous)
       }
-      this.tokenRestartPending = false
+      this.appliedTokenCredentialGeneration = tokenGeneration
       return
     }
 
@@ -1337,7 +1346,9 @@ class AuthTunnelRuntime {
   }
 
   private async startFull(config: InternalConfig): Promise<ActiveTunnel> {
+    if (this.startupCancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
     await this.requirePassword(config.passwordRef)
+    if (this.startupCancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
     const gate = new PasswordGate(this.ctx, config, this.ctx.webServer.port)
     const { server, port } = await gate.start(config.gatePort)
     try {
@@ -1392,11 +1403,16 @@ class AuthTunnelRuntime {
   ): Promise<{ child: ChildProcess; publicUrl: string }> {
     const startup = new AbortController()
     this.stagedStartup = startup
+    if (this.startupCancelled()) startup.abort()
     try {
       return await spawnTunnel(this.ctx, config, target, startup.signal)
     } finally {
       if (this.stagedStartup === startup) this.stagedStartup = undefined
     }
+  }
+
+  private startupCancelled(): boolean {
+    return this.disposed || this.shutdown.signal.aborted || this.desired?.enabled === false
   }
 
   private waitForHandoff(): Promise<void> {
@@ -1420,6 +1436,9 @@ class AuthTunnelRuntime {
   private restorePreviousAfterFailedHandoff(candidate: ActiveTunnel, previous: ActiveTunnel): boolean {
     if (candidate.alive || !previous.alive || this.disposed) return false
     const failure = this.status.message ?? 'auth-tunnel: replacement cloudflared exited during handoff.'
+    if (!candidate.config.allowRemoteSettings && previous.config.allowRemoteSettings) {
+      previous.config = { ...previous.config, allowRemoteSettings: false }
+    }
     this.active = previous
     previous.gate.updateAuth(previous.config)
     this.publish(previous.publicUrl)
