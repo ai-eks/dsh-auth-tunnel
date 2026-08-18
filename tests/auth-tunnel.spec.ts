@@ -1911,6 +1911,36 @@ describe('rc7 plugin settings', () => {
       .toBe('fixture-token-2')
   })
 
+  it('restores the retained token tunnel when its refreshed child crashes during handoff', { timeout: 60_000 }, async () => {
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const gatePort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const composition = await loadComposition({
+      mode: 'token',
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
+      gatePort,
+      executable: await fixtureExecutable('fake-cloudflared-token-rotated-crash.sh'),
+      startupTimeoutMs: 15_000,
+    }, { seeds: { DSH_TUNNEL_TOKEN: 'fixture-token-1' } })
+    const originalPids = await liveFixturePids()
+
+    await composition.settings().update(namespace, { tokenRef: 'MISSING_TUNNEL_TOKEN' })
+    const failed = await waitForStatus(composition, status => status.phase === 'error' && status.running)
+    composition.credentials().set('DSH_TUNNEL_TOKEN', 'fixture-token-2')
+
+    const restored = await waitForStatus(
+      composition,
+      status => status.revision > failed.revision && status.phase === 'error' && status.running,
+      7000,
+    )
+    expect(restored.publicUrl).toBe('https://gui.example.com')
+    expect(await liveFixturePids()).toEqual(originalPids)
+  })
+
   it('applies the latest token when it rotates again during a restart', { timeout: 60_000 }, async () => {
     const probeServer = createNetServer()
     probeServer.listen(0, '127.0.0.1')

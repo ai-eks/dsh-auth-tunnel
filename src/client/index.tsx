@@ -537,7 +537,11 @@ async function readRemoteSettings(): Promise<RemoteSettingsDocument> {
     cache: 'no-store',
     headers: { accept: 'application/json' },
   })
-  if (!response.ok) throw new Error(`auth-tunnel settings returned ${String(response.status)}`)
+  if (!response.ok) {
+    throw Object.assign(new Error(`auth-tunnel settings returned ${String(response.status)}`), {
+      status: response.status,
+    })
+  }
   return parseRemoteSettingsDocument(await response.json())
 }
 
@@ -620,9 +624,16 @@ export class RemoteSettingsStore {
         this.publish(document.snapshot)
       }
       return document
-    }, () => {
-      if (!this.disposed && this.snapshot.status === 'loading') {
-        this.publish({ ...INITIAL_REMOTE_SETTINGS_SNAPSHOT, status: 'unavailable' })
+    }, (error: unknown) => {
+      if (!this.disposed) {
+        const status = record(error).status
+        if ((status === 401 || status === 403) && this.snapshot.status === 'ready') {
+          const snapshot = { ...this.snapshot, writable: false }
+          if (this.document !== undefined) this.document = { ...this.document, snapshot }
+          this.publish(snapshot)
+        } else if (this.snapshot.status === 'loading') {
+          this.publish({ ...INITIAL_REMOTE_SETTINGS_SNAPSHOT, status: 'unavailable' })
+        }
       }
       return undefined
     }).finally(() => {

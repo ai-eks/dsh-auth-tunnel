@@ -1521,6 +1521,22 @@ class AuthTunnelRuntime {
       await this.stopChild(candidate)
       throw this.exitedBeforeAdoption(candidate)
     }
+    await this.waitForHandoff()
+    if (this.disposed) {
+      await this.stopChild(current)
+      return undefined
+    }
+    if (this.desired?.enabled === false) {
+      this.active = undefined
+      this.publish(undefined)
+      await Promise.all([this.stop(candidate), this.stopChild(current)])
+      return undefined
+    }
+    if (!candidate.alive) {
+      this.restorePreviousAfterFailedHandoff(candidate, current)
+      await this.stopChild(candidate)
+      return current
+    }
     await this.stopChild(current)
     this.appliedTokenCredentialGeneration = tokenGeneration
     return candidate

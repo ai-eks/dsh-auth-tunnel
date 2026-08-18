@@ -391,6 +391,34 @@ describe('auth-tunnel settings card contract', () => {
     store.dispose()
   })
 
+  it('makes a loaded remote scope read-only after external authorization is revoked', async () => {
+    const document = parseRemoteSettingsDocument({
+      settings: {
+        value: { ...quick, allowRemoteSettings: true },
+        base: quick,
+        user: { allowRemoteSettings: true },
+        revision: 3,
+        writable: true,
+      },
+    })
+    const forbidden = Object.assign(new Error('forbidden'), { status: 403 })
+    const read = vi.fn()
+      .mockResolvedValueOnce(document)
+      .mockRejectedValue(forbidden)
+    const store = new RemoteSettingsStore({
+      read,
+      commit: vi.fn(() => Promise.reject(new Error('save rejected'))),
+    })
+
+    await store.refresh()
+    await expect(store.commit({ expectedRevision: 3, writes: [], password: '' }))
+      .rejects.toThrow('save rejected')
+
+    expect(store.getSnapshot()).toMatchObject({ status: 'ready', revision: 3, writable: false })
+    expect(store.getDocument()?.snapshot.writable).toBe(false)
+    store.dispose()
+  })
+
   it('retries an unavailable initial remote settings read while subscribed', async () => {
     vi.useFakeTimers()
     try {
