@@ -820,20 +820,10 @@ export async function commitCardChanges(
       }
       throw error
     }
-    try {
-      const enabled = await commitSettingsWrites(api, prepared.revision, [enableWrite])
-      if (!writeSatisfied(enabled, enableWrite)) throw new Error('settings write was not committed')
-    } catch (error) {
-      // A newly selected reference was known to be absent before this save, so
-      // remove the value we just created if the enable fence loses a race. An
-      // existing reference stays a valid password update on the prepared,
-      // disabled configuration and can be enabled on the next save.
-      if (target.passwordRef !== current.passwordRef) {
-        const removed = await api.credentials.unset({ ref: target.passwordRef })
-        if (!removed.result.ok) throw new Error(removed.result.error.message)
-      }
-      throw error
-    }
+    // A failed enable leaves the credential in place: the API has no compare-
+    // and-unset operation, so deleting it could erase a concurrent replacement.
+    const enabled = await commitSettingsWrites(api, prepared.revision, [enableWrite])
+    if (!writeSatisfied(enabled, enableWrite)) throw new Error('settings write was not committed')
     return
   }
   if (password !== '' && writes.length === 0) {

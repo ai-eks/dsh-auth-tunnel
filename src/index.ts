@@ -598,6 +598,11 @@ class PasswordGate {
     for (const socket of [...this.upgradeSockets]) socket.destroy()
   }
 
+  /** Invalidate pending authentication before shutting down the gate server. */
+  closeConnections(): void {
+    this.revokeAuthenticatedConnections()
+  }
+
   /** Revoke the settings surface immediately without disturbing ordinary sessions. */
   revokeRemoteSettings(): void {
     this.auth = { ...this.auth, allowRemoteSettings: false }
@@ -828,6 +833,7 @@ class PasswordGate {
           if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
             throw new Error('access password credential conflicts with the tunnel token credential')
           }
+          const authorizationCredentialGeneration = this.credentialGeneration(current.passwordRef)
           const credentialGeneration = this.credentialGeneration(target.passwordRef)
           if (target.passwordRef !== current.passwordRef) {
             const targetCredential = await this.ctx.credentials.resolve(credentialRef(target.passwordRef))
@@ -882,6 +888,9 @@ class PasswordGate {
               const latest = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
               if (!latest.writable) throw new Error('settings provider is read-only')
               if (latest.descriptor.revision !== credentialRevision) throw new Error('settings revision changed')
+              if (this.credentialGeneration(current.passwordRef) !== authorizationCredentialGeneration) {
+                throw new Error('authorizing access password credential changed')
+              }
               if (this.credentialGeneration(target.passwordRef) !== credentialGeneration) {
                 throw new Error('access password credential changed')
               }
@@ -1500,6 +1509,8 @@ class AuthTunnelRuntime {
       // new runtime URL before the browser's current tunnel is retired.
       if (previous !== undefined) {
         await this.waitForHandoffWithFallback(previous)
+        previous.gate.revokeRemoteSettings()
+        await this.remoteMutations.tail
         if (this.disposed) {
           await this.stop(previous)
           return
@@ -1662,7 +1673,7 @@ class AuthTunnelRuntime {
         alive: true,
       }
     } catch (error) {
-      gate.closeUpgradedConnections()
+      gate.closeConnections()
       this.liveGates.delete(gate)
       await closeGate(server)
       throw error
@@ -1778,7 +1789,7 @@ class AuthTunnelRuntime {
   }
 
   private async stop(active: ActiveTunnel): Promise<void> {
-    active.gate.closeUpgradedConnections()
+    active.gate.closeConnections()
     this.liveGates.delete(active.gate)
     await Promise.all([this.stopChild(active), closeGate(active.server)])
   }

@@ -760,6 +760,41 @@ describe('password gate over the loopback webserver', () => {
       .toMatchObject({ value: 'local-admin-password' })
   })
 
+  it('fences the credential that authorized a reference-changing remote save', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    let releasePersist = (): void => {}
+    composition.settings().persistBarrier = new Promise<void>((resolve) => { releasePersist = resolve })
+    let markPersistStarted = (): void => {}
+    const persistStarted = new Promise<void>((resolve) => { markPersistStarted = resolve })
+    composition.settings().persistStarted = markPersistStarted
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' }],
+        password: 'stale-remote-password',
+      }),
+    })
+    await persistStarted
+    composition.credentials().set('DSH_WEB_PASSWORD', 'local-admin-password')
+    composition.settings().persistStarted = undefined
+    composition.settings().persistBarrier = undefined
+    releasePersist()
+
+    expect((await responseTask).status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
+    expect(await composition.credentials().resolve('DSH_WEB_PASSWORD'))
+      .toMatchObject({ value: 'local-admin-password' })
+    expect(await composition.credentials().resolve('NEXT_WEB_PASSWORD')).toBeUndefined()
+  })
+
   it('rejects a remote save that rotates the active password and tunnel route together', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     const base = await composition.gateBase()
@@ -984,6 +1019,58 @@ describe('password gate over the loopback webserver', () => {
     expect(await response.json()).toMatchObject({ settings: { value: { enabled: false } } })
     await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
     expect(await liveFixturePids()).toEqual([])
+  })
+
+  it('keeps the previous gate alive until a route-changing save response finishes', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    const before = await composition.runtimeStatus()
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const nextPort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const originalEnd = ServerResponse.prototype.end
+    let releaseResponse = (): void => {}
+    let markResponseHeld = (): void => {}
+    const responseHeld = new Promise<void>((resolve) => { markResponseHeld = resolve })
+    let held = false
+    vi.spyOn(ServerResponse.prototype, 'end').mockImplementation((function (
+      this: ServerResponse,
+      ...args: unknown[]
+    ): ServerResponse {
+      if (!held && this.req.url === '/dsh-auth-tunnel/settings') {
+        held = true
+        releaseResponse = () => { Reflect.apply(originalEnd, this, args) }
+        markResponseHeld()
+        return this
+      }
+      return Reflect.apply(originalEnd, this, args) as ServerResponse
+    }) as typeof ServerResponse.prototype.end)
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'gatePort', op: 'set', value: nextPort }],
+        password: '',
+      }),
+    }).catch(() => undefined)
+    await responseHeld
+    await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'running',
+    )
+    await sleep(3700)
+    releaseResponse()
+
+    expect((await responseTask)?.status).toBe(200)
   })
 
   it('returns the complete locale response before a local disable stops the tunnel', { timeout: 60_000 }, async () => {
@@ -1368,6 +1455,39 @@ describe('password gate over the loopback webserver', () => {
       cancelled,
       sleep(3000).then(() => { throw new Error('upstream request survived the credential rotation') }),
     ])
+    expect(executed).toBe(false)
+  })
+
+  it('invalidates pending authentication before closing a gate', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick()
+    let executed = false
+    composition.loaded.webServer.register({
+      kind: 'exact', path: '/shutdown-action', handler: (_req, res) => {
+        executed = true
+        res.end('completed')
+      },
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    let releaseResolve = (): void => {}
+    composition.credentials().resolveBarrier = new Promise<void>((resolve) => { releaseResolve = resolve })
+    let markResolveStarted = (): void => {}
+    const resolveStarted = new Promise<void>((resolve) => { markResolveStarted = resolve })
+    composition.credentials().resolveStarted = (ref) => {
+      if (ref !== 'DSH_WEB_PASSWORD') return
+      composition.credentials().resolveStarted = undefined
+      markResolveStarted()
+    }
+
+    const responseTask = fetch(`${base}/shutdown-action`, { headers: { cookie } }).catch(() => undefined)
+    await resolveStarted
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
+    await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
+    composition.credentials().resolveBarrier = undefined
+    releaseResolve()
+    await responseTask
+    await sleep(250)
+
     expect(executed).toBe(false)
   })
 

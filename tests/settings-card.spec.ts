@@ -232,7 +232,7 @@ describe('auth-tunnel settings card contract', () => {
     })
   })
 
-  it('removes a newly created credential when enabling loses its revision fence', async () => {
+  it('preserves a newly created credential when enabling loses its revision fence', async () => {
     const mutate = vi.fn()
       .mockResolvedValueOnce({
         rpcId: 'test',
@@ -282,7 +282,7 @@ describe('auth-tunnel settings card contract', () => {
       ops: [{ op: 'set', path: ['passwordRef'], value: 'NEXT_WEB_PASSWORD' }],
     })
     expect(set).toHaveBeenCalledWith({ ref: 'NEXT_WEB_PASSWORD', value: 'first-password' })
-    expect(unset).toHaveBeenCalledWith({ ref: 'NEXT_WEB_PASSWORD' })
+    expect(unset).not.toHaveBeenCalled()
     expect(mutate).toHaveBeenNthCalledWith(2, {
       ns: 'auth-tunnel',
       expectedRevision: 8,
