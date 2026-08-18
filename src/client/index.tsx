@@ -798,9 +798,11 @@ export async function commitCardChanges(
       throw new Error('settings password reference changed')
     }
   }
-  // Commit the revision-fenced settings first so live reconciliation can see
-  // the selected reference. A failed credential write restores the exact
-  // user-layer values that this save replaced.
+  // A stopped tunnel receives its replacement credential before settings can
+  // publish it. Other saves keep the active request path alive by committing
+  // settings first and restoring their exact user-layer values on failure.
+  const passwordBeforeEnable = password !== '' && !current.enabled && target.enabled
+  if (passwordBeforeEnable) await commitCredentialWrite(api, target.passwordRef, password)
   let committed: SettingsNamespaceView | undefined
   let rollbackWrites: SettingsWrite[] | undefined
   if (writes.length !== 0) {
@@ -818,7 +820,7 @@ export async function commitCardChanges(
     }
     committed = result
   }
-  if (password !== '') {
+  if (password !== '' && !passwordBeforeEnable) {
     try {
       await commitCredentialWrite(api, target.passwordRef, password)
     } catch (error) {

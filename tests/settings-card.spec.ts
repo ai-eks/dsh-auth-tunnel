@@ -219,7 +219,7 @@ describe('auth-tunnel settings card contract', () => {
       {},
     )
 
-    expect(order).toEqual(['settings', 'credential'])
+    expect(order).toEqual(['credential', 'settings'])
   })
 
   it('rejects a passwordless local passwordRef change targeting the tunnel token', async () => {

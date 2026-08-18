@@ -1,6 +1,7 @@
 #!/bin/sh
 # Token fixture whose rotated child becomes ready and then crashes in handoff.
 echo $$ > "${TMPDIR:-/tmp}/fake-cloudflared-$$.pid"
+printf '%s' "$TUNNEL_TOKEN" > "${TMPDIR:-/tmp}/fake-cloudflared-$$.token"
 if [ -z "$TUNNEL_TOKEN" ]; then
   exit 3
 fi

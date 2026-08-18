@@ -1128,6 +1128,26 @@ describe('password gate over the loopback webserver', () => {
     expect((await fetch(`${base}/`, { redirect: 'manual', headers: { cookie: fresh } })).status).not.toBe(302)
   })
 
+  it('does not mint a session when the login policy changes during credential resolution', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick()
+    const base = await composition.gateBase()
+    composition.credentials().afterResolve = (ref) => {
+      if (ref !== 'DSH_WEB_PASSWORD') return
+      composition.credentials().afterResolve = undefined
+      composition.credentials().set(ref, 'rotated-password')
+    }
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/login`, {
+      method: 'POST', redirect: 'manual',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'password=s3kret-passw0rd',
+    })
+
+    expect(response.status).toBe(303)
+    expect(response.headers.get('location')).toBe('/dsh-auth-tunnel/login?error=1')
+    expect(response.headers.get('set-cookie')).toBeNull()
+  })
+
   it('rejects an HTTP request when the access credential rotates during authentication', { timeout: 60_000 }, async () => {
     const composition = await bootQuick()
     let proxied = 0
@@ -2183,6 +2203,44 @@ describe('rc7 plugin settings', () => {
       await sleep(25)
     }
     expect(applied).toBe('fixture-token-3')
+  })
+
+  it('refreshes a rotated fallback token after the replacement crashes during handoff', { timeout: 60_000 }, async () => {
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const gatePort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const composition = await loadComposition({
+      mode: 'token',
+      tokenRef: 'TOKEN_A',
+      publicHostname: 'gui.example.com',
+      gatePort,
+      executable: await fixtureExecutable('fake-cloudflared-token-rotated-crash.sh'),
+      startupTimeoutMs: 15_000,
+    }, { seeds: { TOKEN_A: 'fixture-token-1', TOKEN_B: 'fixture-token-2' } })
+    const before = await composition.runtimeStatus()
+
+    await composition.settings().update(namespace, { tokenRef: 'TOKEN_B' })
+    await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'running',
+      5000,
+    )
+    composition.credentials().set('TOKEN_A', 'fixture-token-3')
+
+    const deadline = Date.now() + 12_000
+    let retainedToken = ''
+    while (Date.now() < deadline) {
+      const pids = await liveFixturePids()
+      if (pids.length === 1) {
+        retainedToken = await readFile(join(tmpdir(), `${FAKE_PREFIX}${pids[0]!}.token`), 'utf8').catch(() => '')
+        if (retainedToken === 'fixture-token-3') break
+      }
+      await sleep(25)
+    }
+    expect(retainedToken).toBe('fixture-token-3')
   })
 
   it('starts and stops the gate and cloudflared from the live enabled switch', { timeout: 60_000 }, async () => {

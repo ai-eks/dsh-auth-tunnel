@@ -919,8 +919,14 @@ class PasswordGate {
     if (url.pathname === LOGIN_PATH && req.method === 'POST') {
       const form = await readForm(req, res)
       if (form === undefined) return // response already answered (413/415)
-      const { passwordRef, ttlMs } = this.auth
-      const key = await sessionKey(this.ctx, passwordRef)
+      const auth = this.auth
+      const authGeneration = this.authGeneration
+      const key = await sessionKey(this.ctx, auth.passwordRef)
+      if (auth !== this.auth || authGeneration !== this.authGeneration) {
+        res.writeHead(303, { location: `${LOGIN_PATH}?error=1`, 'cache-control': 'no-store' })
+        res.end()
+        return
+      }
       if (key === undefined) {
         this.ctx.logger.error('auth-tunnel: the access-password credential is no longer configured')
         res.writeHead(503)
@@ -937,7 +943,7 @@ class PasswordGate {
       res.writeHead(303, {
         location: '/',
         'cache-control': 'no-store',
-        'set-cookie': setSessionCookie(secure, mintCookie(key, ttlMs), ttlMs),
+        'set-cookie': setSessionCookie(secure, mintCookie(key, auth.ttlMs), auth.ttlMs),
       })
       res.end()
       return
@@ -1213,6 +1219,7 @@ class AuthTunnelRuntime {
   private finishHandoff: (() => void) | undefined
   private readonly remoteMutations: RemoteMutationFence = { tail: Promise.resolve() }
   private readonly liveGates = new Set<PasswordGate>()
+  private readonly handoffFallbacks = new Set<ActiveTunnel>()
   private readonly tokenCredentialGenerations = new Map<string, number>()
   private appliedTokenCredentialGeneration = 0
   private configured: InternalConfig | undefined
@@ -1332,7 +1339,10 @@ class AuthTunnelRuntime {
     const config = this.configured
     const configuredTokenUpdated = config?.mode === 'token' && config.tokenRef === ref
     const activeTokenUpdated = this.active?.config.mode === 'token' && this.active.config.tokenRef === ref
-    const tokenUpdated = configuredTokenUpdated || activeTokenUpdated
+    const fallbackTokenUpdated = [...this.handoffFallbacks].some(
+      fallback => fallback.config.mode === 'token' && fallback.config.tokenRef === ref,
+    )
+    const tokenUpdated = configuredTokenUpdated || activeTokenUpdated || fallbackTokenUpdated
     if (tokenUpdated) this.tokenCredentialGenerations.set(ref, (this.tokenCredentialGenerations.get(ref) ?? 0) + 1)
     for (const gate of this.liveGates) gate.credentialUpdated(ref)
     if (config !== undefined && (config.passwordRef === ref || tokenUpdated)) {
@@ -1461,7 +1471,7 @@ class AuthTunnelRuntime {
       // Keep the old public path alive long enough for its page to observe the
       // new runtime URL before the browser's current tunnel is retired.
       if (previous !== undefined) {
-        await this.waitForHandoff()
+        await this.waitForHandoffWithFallback(previous)
         if (this.disposed) {
           await this.stop(previous)
           return
@@ -1517,7 +1527,7 @@ class AuthTunnelRuntime {
       candidate.gate.updateAuth(candidate.config)
       this.setStatus('running', true, candidate.publicUrl)
       if (previous !== undefined) {
-        await this.waitForHandoff()
+        await this.waitForHandoffWithFallback(previous)
         if (this.disposed) {
           await this.stopChild(previous)
           return
@@ -1584,7 +1594,7 @@ class AuthTunnelRuntime {
       await this.stopChild(candidate)
       throw this.exitedBeforeAdoption(candidate)
     }
-    await this.waitForHandoff()
+    await this.waitForHandoffWithFallback(current)
     if (this.disposed) {
       await this.stopChild(current)
       return undefined
@@ -1706,6 +1716,16 @@ class AuthTunnelRuntime {
       signal.addEventListener('abort', finish, { once: true })
       if (signal.aborted) finish()
     })
+  }
+
+  /** Expose the retained rollback child to credential-update tracking while it is waiting. */
+  private async waitForHandoffWithFallback(fallback: ActiveTunnel): Promise<void> {
+    this.handoffFallbacks.add(fallback)
+    try {
+      await this.waitForHandoff()
+    } finally {
+      this.handoffFallbacks.delete(fallback)
+    }
   }
 
   private restorePreviousAfterFailedHandoff(candidate: ActiveTunnel, previous: ActiveTunnel): boolean {
