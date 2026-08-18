@@ -145,6 +145,7 @@ const MAX_LOGIN_BODY_BYTES = 16 * 1024
 const MAX_REMOTE_SETTINGS_BODY_BYTES = 64 * 1024
 const OUTPUT_TAIL_CHARS = 8192
 const KILL_GRACE_MS = 2000
+const TUNNEL_ADOPTION_CHECK_MS = 25
 const TUNNEL_HANDOFF_MS = 750
 const QUICK_URL_PATTERN = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/
 const HOP_BY_HOP_HEADERS = new Set([
@@ -967,6 +968,15 @@ async function spawnTunnel(
       child.stdout.on('data', (chunk: Buffer) => { stdoutReadinessTail = scan(stdoutReadinessTail, chunk) })
     })
     const publicUrl = await ready
+    // Let an immediate post-readiness process exit reach ChildProcess before
+    // the runtime adopts and publishes the candidate.
+    await new Promise<void>(resolve => { setTimeout(resolve, TUNNEL_ADOPTION_CHECK_MS) })
+    if (cancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(
+        `auth-tunnel: cloudflared exited before adoption (code ${String(child.exitCode)}, signal ${String(child.signalCode)})`,
+      )
+    }
     return { child, publicUrl }
   } catch (error) {
     await killTree(child)
@@ -1039,6 +1049,7 @@ class AuthTunnelRuntime {
   private drainTask: Promise<void> | undefined
   private disposed = false
   private readonly shutdown = new AbortController()
+  private stagedStartup: AbortController | undefined
   private configured: InternalConfig | undefined
   private revision = 0
   private status: AuthTunnelRuntimeStatus = { phase: 'stopped', running: false, revision: 0 }
@@ -1098,10 +1109,14 @@ class AuthTunnelRuntime {
         await this.stop(candidate)
         return
       }
-      this.adopt(candidate)
+      if (!this.adopt(candidate)) {
+        await this.stop(candidate)
+        throw this.exitedBeforeAdoption(candidate)
+      }
       this.setStatus('running', true, candidate.publicUrl)
     } catch (error) {
       if (this.disposed) return
+      if (this.desired !== undefined) return
       this.setStatus('error', false, undefined, errorMessage(error))
       throw error
     }
@@ -1110,6 +1125,7 @@ class AuthTunnelRuntime {
   /** Coalesce scalar settings writes, then reconcile only the latest snapshot. */
   request(config: InternalConfig): void {
     if (this.disposed) return
+    if (!config.enabled) this.stagedStartup?.abort()
     this.configured = config
     this.desired = config
     const running = this.active?.alive === true
@@ -1120,7 +1136,10 @@ class AuthTunnelRuntime {
 
   /** Retry the latest desired settings after its access credential is repaired. */
   credentialUpdated(ref: string): void {
-    if (this.configured?.passwordRef === ref) this.request(this.configured)
+    const config = this.configured
+    if (config?.passwordRef === ref || (config?.mode === 'token' && config.tokenRef === ref)) {
+      this.request(config)
+    }
   }
 
   /** Stop queued work and tear down the currently adopted runtime. */
@@ -1136,6 +1155,7 @@ class AuthTunnelRuntime {
     this.active = undefined
     this.publish(undefined)
     this.shutdown.abort()
+    this.stagedStartup?.abort()
     await Promise.all([
       this.drainTask,
       active === undefined ? Promise.resolve() : this.stop(active),
@@ -1205,7 +1225,10 @@ class AuthTunnelRuntime {
         await this.stop(candidate)
         return
       }
-      this.adopt(candidate)
+      if (!this.adopt(candidate)) {
+        await this.stop(candidate)
+        throw this.exitedBeforeAdoption(candidate)
+      }
       this.setStatus('running', true, candidate.publicUrl)
       return
     }
@@ -1219,7 +1242,10 @@ class AuthTunnelRuntime {
         return
       }
       const previous = this.active
-      this.adopt(candidate)
+      if (!this.adopt(candidate)) {
+        await this.stop(candidate)
+        throw this.exitedBeforeAdoption(candidate)
+      }
       this.setStatus('running', true, candidate.publicUrl)
       // Keep the old public path alive long enough for its page to observe the
       // new runtime URL before the browser's current tunnel is retired.
@@ -1245,12 +1271,7 @@ class AuthTunnelRuntime {
       || current.config.executable !== next.executable
       || (next.mode === 'token' && current.config.tokenRef !== next.tokenRef)
     if (replaceTunnel) {
-      const spawned = await spawnTunnel(
-        this.ctx,
-        next,
-        `http://127.0.0.1:${String(current.port)}`,
-        this.shutdown.signal,
-      )
+      const spawned = await this.spawnStaged(next, `http://127.0.0.1:${String(current.port)}`)
       if (this.disposed) {
         this.intentionalExits.add(spawned.child)
         await killTree(spawned.child)
@@ -1266,8 +1287,11 @@ class AuthTunnelRuntime {
         publicUrl: spawned.publicUrl,
         alive: true,
       }
+      if (!this.adopt(candidate)) {
+        await this.stopChild(candidate)
+        throw this.exitedBeforeAdoption(candidate)
+      }
       candidate.gate.updateAuth(next)
-      this.adopt(candidate)
       this.setStatus('running', true, candidate.publicUrl)
       if (previous !== undefined) {
         await this.waitForHandoff()
@@ -1306,12 +1330,7 @@ class AuthTunnelRuntime {
     const gate = new PasswordGate(this.ctx, config, this.ctx.webServer.port)
     const { server, port } = await gate.start(config.gatePort)
     try {
-      const spawned = await spawnTunnel(
-        this.ctx,
-        config,
-        `http://127.0.0.1:${String(port)}`,
-        this.shutdown.signal,
-      )
+      const spawned = await this.spawnStaged(config, `http://127.0.0.1:${String(port)}`)
       return {
         config,
         gate,
@@ -1327,8 +1346,7 @@ class AuthTunnelRuntime {
     }
   }
 
-  private adopt(candidate: ActiveTunnel): void {
-    this.active = candidate
+  private adopt(candidate: ActiveTunnel): boolean {
     let observed = false
     const exited = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (observed) return
@@ -1342,10 +1360,32 @@ class AuthTunnelRuntime {
     }
     candidate.child.once('exit', exited)
     if (candidate.child.exitCode !== null || candidate.child.signalCode !== null) {
-      exited(candidate.child.exitCode, candidate.child.signalCode)
+      candidate.alive = false
     }
+    if (!candidate.alive) return false
+    this.active = candidate
     console.log(`cloudflare tunnel: ${candidate.publicUrl}`)
     this.publish(candidate.publicUrl)
+    return true
+  }
+
+  private exitedBeforeAdoption(candidate: ActiveTunnel): Error {
+    return new Error(
+      `auth-tunnel: cloudflared exited before adoption (code ${String(candidate.child.exitCode)}, signal ${String(candidate.child.signalCode)})`,
+    )
+  }
+
+  private async spawnStaged(
+    config: InternalConfig,
+    target: string,
+  ): Promise<{ child: ChildProcess; publicUrl: string }> {
+    const startup = new AbortController()
+    this.stagedStartup = startup
+    try {
+      return await spawnTunnel(this.ctx, config, target, startup.signal)
+    } finally {
+      if (this.stagedStartup === startup) this.stagedStartup = undefined
+    }
   }
 
   private waitForHandoff(): Promise<void> {

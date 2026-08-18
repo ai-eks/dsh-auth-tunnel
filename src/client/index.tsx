@@ -573,6 +573,7 @@ interface RemoteSettingsTransport {
 /** Durable remote scope backed by the authenticated plugin endpoint, not Harness settings RPCs. */
 export class RemoteSettingsStore {
   private snapshot = INITIAL_REMOTE_SETTINGS_SNAPSHOT
+  private document: RemoteSettingsDocument | undefined
   private readonly listeners = new Set<() => void>()
   private task: Promise<RemoteSettingsDocument | undefined> | undefined
   private retryTimer: ReturnType<typeof setTimeout> | undefined
@@ -584,6 +585,8 @@ export class RemoteSettingsStore {
   }) {}
 
   readonly getSnapshot = (): SettingsScopeSnapshot<AuthTunnelSettings> => this.snapshot
+
+  readonly getDocument = (): RemoteSettingsDocument | undefined => this.document
 
   readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
@@ -605,7 +608,10 @@ export class RemoteSettingsStore {
       this.retryTimer = undefined
     }
     this.task = this.transport.read().then((document) => {
-      if (!this.disposed) this.publish(document.snapshot)
+      if (!this.disposed) {
+        this.document = document
+        this.publish(document.snapshot)
+      }
       return document
     }, () => {
       if (!this.disposed && this.snapshot.status === 'loading') {
@@ -621,8 +627,16 @@ export class RemoteSettingsStore {
 
   async commit(request: RemoteSettingsCommitRequest): Promise<void> {
     if (this.disposed) return
-    const document = await this.transport.commit(request)
-    if (!this.disposed) this.publish(document.snapshot)
+    try {
+      const document = await this.transport.commit(request)
+      if (!this.disposed) {
+        this.document = document
+        this.publish(document.snapshot)
+      }
+    } catch (error) {
+      await this.refresh()
+      throw error
+    }
   }
 
   dispose(): void {
@@ -728,6 +742,12 @@ export async function commitCardChanges(
       if (response.result.value.credentials[target.passwordRef]?.configured !== false) {
         throw new Error('access password credential already exists')
       }
+    }
+  }
+  if (password !== '' && writes.length === 0) {
+    const committed = await commitSettingsWrites(api, revision, [])
+    if (record(committed.value).passwordRef !== target.passwordRef) {
+      throw new Error('settings password reference changed')
     }
   }
   const changesActivePassword = password !== ''
@@ -1204,7 +1224,7 @@ function AuthTunnelCard(props: CardProps & {
 export const inject = ['slots', 'locale', 'connection', 'remote', 'settingsScope']
 
 /** Adopt and serialize the public page's language through the plugin endpoint. */
-function installRemoteLocalePersistence(ctx: ClientContext, store: RemoteSettingsStore): () => void {
+export function installRemoteLocalePersistence(ctx: ClientContext, store: RemoteSettingsStore): () => void {
   let disposed = false
   let loaded = false
   let adopting = false
@@ -1223,9 +1243,14 @@ function installRemoteLocalePersistence(ctx: ClientContext, store: RemoteSetting
     }
     persist(snapshot.active)
   })
-  void store.refresh().then((document) => {
-    if (disposed) return
+  let stopStore: (() => void) | undefined
+  const adoptLoadedDocument = (): void => {
+    if (disposed || loaded) return
+    const document = store.getDocument()
+    if (document === undefined) return
     loaded = true
+    stopStore?.()
+    stopStore = undefined
     if (pending !== undefined) {
       persist(pending)
       pending = undefined
@@ -1238,9 +1263,12 @@ function installRemoteLocalePersistence(ctx: ClientContext, store: RemoteSetting
     } finally {
       adopting = false
     }
-  })
+  }
+  stopStore = store.subscribe(adoptLoadedDocument)
+  adoptLoadedDocument()
   return () => {
     disposed = true
+    stopStore?.()
     stop()
   }
 }

@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   apply, commitCardChanges, commitCredentialWrite, commitSettingsWrites, parseRemoteSettingsDocument,
-  RemoteSettingsStore, RuntimeStatusStore, runtimeStatusLocaleKey, validateSettingsValues,
+  installRemoteLocalePersistence, RemoteSettingsStore, RuntimeStatusStore, runtimeStatusLocaleKey,
+  validateSettingsValues,
   type AuthTunnelSettings, type RuntimeStatusSnapshot, type SettingsWrite,
 } from '../src/client/index.tsx'
 
@@ -222,6 +223,30 @@ describe('auth-tunnel settings card contract', () => {
     expect(mutate).not.toHaveBeenCalled()
   })
 
+  it('revision-fences a password-only local save before writing the credential', async () => {
+    const mutate = vi.fn(() => Promise.resolve({
+      rpcId: 'test',
+      result: { ok: false as const, error: { code: 'conflict', message: 'settings revision changed' } },
+    }))
+    const set = vi.fn()
+
+    await expect(commitCardChanges(
+      { settings: { mutate }, credentials: { describe: vi.fn(), set } } as never,
+      7,
+      [],
+      quick,
+      quick,
+      'replacement',
+    )).rejects.toThrow('settings revision changed')
+
+    expect(mutate).toHaveBeenCalledWith({
+      ns: 'auth-tunnel',
+      expectedRevision: 7,
+      ops: [],
+    })
+    expect(set).not.toHaveBeenCalled()
+  })
+
   it('registers its browser card under the Host settings namespace', () => {
     let registeredNamespace = ''
     let registeredLocale = ''
@@ -334,6 +359,64 @@ describe('auth-tunnel settings card contract', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('adopts the persisted locale after an unavailable initial remote read recovers', async () => {
+    vi.useFakeTimers()
+    try {
+      const document = parseRemoteSettingsDocument({
+        settings: {
+          value: { ...quick, allowRemoteSettings: true },
+          base: quick,
+          user: { allowRemoteSettings: true },
+          revision: 3,
+          writable: true,
+        },
+        locale: 'en',
+      })
+      const read = vi.fn()
+        .mockRejectedValueOnce(new Error('handoff'))
+        .mockResolvedValue(document)
+      const store = new RemoteSettingsStore({ read, commit: vi.fn() })
+      const setLocale = vi.fn()
+      const dispose = installRemoteLocalePersistence({
+        on: vi.fn(() => () => {}),
+        locale: { setLocale },
+      } as never, store)
+
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(read).toHaveBeenCalledTimes(2)
+      expect(setLocale).toHaveBeenCalledWith('en')
+
+      dispose()
+      store.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('refreshes the remote settings snapshot after a rejected commit', async () => {
+    const latest = parseRemoteSettingsDocument({
+      settings: {
+        value: { ...quick, allowRemoteSettings: true, sessionTtlHours: 24 },
+        base: quick,
+        user: { allowRemoteSettings: true, sessionTtlHours: 24 },
+        revision: 4,
+        writable: true,
+      },
+    })
+    const read = vi.fn(() => Promise.resolve(latest))
+    const store = new RemoteSettingsStore({
+      read,
+      commit: vi.fn(() => Promise.reject(new Error('settings revision changed'))),
+    })
+
+    await expect(store.commit({ expectedRevision: 3, writes: [], password: '' }))
+      .rejects.toThrow('settings revision changed')
+    expect(read).toHaveBeenCalledOnce()
+    expect(store.getSnapshot()).toMatchObject({ revision: 4, value: { sessionTtlHours: 24 } })
+
+    store.dispose()
   })
 
   it('keeps a stable external runtime snapshot and maps every visible state', async () => {

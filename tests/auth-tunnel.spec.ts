@@ -1054,6 +1054,26 @@ describe('tunnel lifecycle', () => {
     await expect(fetch(`${base}/dsh-auth-tunnel/login`)).rejects.toThrow()
   })
 
+  it('a live disable cancels a staged startup without waiting for its timeout', { timeout: 60_000 }, async () => {
+    const quickExecutable = await fixtureExecutable('fake-cloudflared-quick.sh')
+    const silentExecutable = await fixtureExecutable('fake-cloudflared-silent.sh')
+    const composition = await bootQuick({ executable: quickExecutable, startupTimeoutMs: 10_000 })
+
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { executable: silentExecutable })
+    const deadline = Date.now() + 5000
+    while ((await liveFixturePids()).length < 2) {
+      if (Date.now() >= deadline) throw new Error('staged cloudflared did not start')
+      await sleep(25)
+    }
+
+    const startedAt = Date.now()
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
+    await waitForStatus(composition, status => status.phase === 'stopped', 4000)
+
+    expect(Date.now() - startedAt).toBeLessThan(4000)
+    expect(await liveFixturePids()).toEqual([])
+  })
+
   it('escalates a stubborn cloudflared to SIGKILL after the grace', { timeout: 60_000 }, async () => {
     await bootQuick({ executable: await fixtureExecutable('fake-cloudflared-stubborn.sh') })
     expect((await liveFixturePids()).length).toBe(1)
@@ -1141,6 +1161,19 @@ describe('activation dependencies and boot failures', () => {
         // the failure message inside one line budget plus the prefix.
         && message.length < 9_200
     })
+  })
+
+  it('does not publish a tunnel that exits immediately after reporting readiness', { timeout: 60_000 }, async () => {
+    const composition = await loadComposition({
+      mode: 'quick',
+      executable: await fixtureExecutable('fake-cloudflared-ready-exit.sh'),
+      startupTimeoutMs: 15_000,
+    }, { wait: false })
+
+    await expect(composition.loaded.loader.await()).rejects.toThrow(/exited before adoption/)
+    expect(composition.shellEnv().contributors).toEqual([])
+    expect(composition.systemPrompt().sections).toEqual([])
+    expect(await liveFixturePids()).toEqual([])
   })
 
   it('redacts the named-tunnel token from early-exit diagnostics', { timeout: 60_000 }, async () => {
@@ -1349,6 +1382,39 @@ describe('rc7 plugin settings', () => {
     )
     await login(base, undefined, 'repaired-password')
     expect((await liveFixturePids()).length).toBe(1)
+  })
+
+  it('starts the configured token tunnel when its missing credential is repaired', { timeout: 60_000 }, async () => {
+    const quickExecutable = await fixtureExecutable('fake-cloudflared-quick.sh')
+    const tokenExecutable = await fixtureExecutable('fake-cloudflared-token.sh')
+    const composition = await bootQuick({ executable: quickExecutable })
+    const previousGate = await composition.gateBase()
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const gatePort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+
+    await composition.settings().update(namespace, {
+      mode: 'token',
+      tokenRef: 'MISSING_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
+      gatePort,
+      executable: tokenExecutable,
+    })
+    const failed = await waitForStatus(composition, status => status.phase === 'error')
+    expect(failed).toMatchObject({ running: true, publicUrl: QUICK_URL })
+    expect((await fetch(`${previousGate}/dsh-auth-tunnel/login`)).status).toBe(200)
+
+    composition.credentials().set('MISSING_TUNNEL_TOKEN', 'fixture-token')
+    const recovered = await waitForStatus(
+      composition,
+      status => status.revision > failed.revision && status.phase === 'running',
+      7000,
+    )
+    expect(recovered.publicUrl).toBe('https://gui.example.com')
+    expect((await fetch(`http://127.0.0.1:${String(gatePort)}/dsh-auth-tunnel/login`)).status).toBe(200)
   })
 
   it('starts and stops the gate and cloudflared from the live enabled switch', { timeout: 60_000 }, async () => {
