@@ -392,7 +392,7 @@ type RemoteSettingsWrite =
   | { field: RemoteSettingsField; op: 'unset' }
 
 interface RemoteSettingsWriteRequest {
-  expectedRevision?: number
+  expectedRevision: number
   writes: RemoteSettingsWrite[]
   password: string
 }
@@ -424,14 +424,14 @@ function parseRemoteSettingsWriteRequest(value: unknown): RemoteSettingsWriteReq
     throw new TypeError('invalid settings write')
   })
   const expectedRevision = request.expectedRevision
-  if (expectedRevision !== undefined && (!Number.isSafeInteger(expectedRevision) || (expectedRevision as number) < 0)) {
+  if (typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
     throw new TypeError('invalid settings revision')
   }
   if (request.password !== undefined && typeof request.password !== 'string') {
     throw new TypeError('password must be a string')
   }
   return {
-    ...(expectedRevision === undefined ? {} : { expectedRevision: expectedRevision as number }),
+    expectedRevision,
     writes,
     password: typeof request.password === 'string' ? request.password : '',
   }
@@ -734,8 +734,7 @@ class PasswordGate {
         const openedSettings = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
         if (!openedSettings.writable) throw new Error('settings provider is read-only')
         const opened = openedSettings.descriptor
-        if (request.expectedRevision !== undefined
-          && request.expectedRevision !== opened.revision) {
+        if (request.expectedRevision !== opened.revision) {
           throw new Error('settings revision changed')
         }
         const current = Config(objectRecord(opened.value) as unknown as InternalConfig)
@@ -1204,7 +1203,7 @@ class AuthTunnelRuntime {
     const config = this.configured
     const tokenUpdated = config?.mode === 'token' && config.tokenRef === ref
     if (tokenUpdated) this.tokenCredentialGeneration += 1
-    if (config?.passwordRef === ref) this.active?.gate.revokeAuthenticatedUpgrades()
+    if (this.active?.config.passwordRef === ref) this.active.gate.revokeAuthenticatedUpgrades()
     if (config?.passwordRef === ref || tokenUpdated) {
       this.request(config)
     }

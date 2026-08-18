@@ -556,6 +556,26 @@ describe('password gate over the loopback webserver', () => {
     expect(composition.settings().get(settingsNamespace('auth-tunnel')).allowRemoteSettings).toBe(false)
   })
 
+  it('requires a revision fence while the live gate still uses the previous password reference', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true }, {
+      seeds: { ALT_WEB_PASSWORD: 'alternate-password' },
+    })
+    const base = await composition.gateBase()
+    const port = Number(new URL(base).port)
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const finish = await beginJsonPost(port, '/dsh-auth-tunnel/settings', cookie, {
+      writes: [],
+      password: 'overwritten-password',
+    })
+    await sleep(50)
+
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { passwordRef: 'ALT_WEB_PASSWORD' })
+
+    expect(await finish()).toContain(' 409 ')
+    expect(await composition.credentials().resolve('ALT_WEB_PASSWORD'))
+      .toMatchObject({ value: 'alternate-password' })
+  })
+
   it('rejects a stale password-only remote save before rotating the current credential', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true }, {
       seeds: { ALT_WEB_PASSWORD: 'alternate-password' },
@@ -1092,6 +1112,43 @@ describe('upgrade pass-through', () => {
 
     await closed
     expect(socket.destroyed).toBe(true)
+  })
+
+  it('closes upgrades on the retained gate after a passwordRef update fails', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick()
+    composition.loaded.webServer.registerUpgrade({
+      path: '/events',
+      handler: (_req, socket) => {
+        socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: dsh-echo\r\nConnection: Upgrade\r\n\r\n')
+        socket.on('data', (chunk: Buffer) => { socket.write(chunk) })
+      },
+    })
+    const base = await composition.gateBase()
+    const port = Number(new URL(base).port)
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const socket = connect(port, '127.0.0.1')
+    socket.on('error', () => {})
+    await once(socket, 'connect')
+    socket.write([
+      'GET /events HTTP/1.1',
+      `Host: 127.0.0.1:${String(port)}`,
+      'Connection: Upgrade',
+      'Upgrade: dsh-echo',
+      `Cookie: ${cookie}`,
+      '',
+      '',
+    ].join('\r\n'))
+    const [head] = await once(socket, 'data') as [Buffer]
+    expect(String(head)).toContain('101 Switching Protocols')
+
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { passwordRef: 'MISSING_PASSWORD' })
+    await waitForStatus(composition, status => status.phase === 'error' && status.running)
+    const closed = once(socket, 'close').then(() => 'closed')
+    composition.credentials().set('DSH_WEB_PASSWORD', 'rotated-password')
+
+    const outcome = await Promise.race([closed, sleep(750).then(() => 'timeout')])
+    socket.destroy()
+    expect(outcome).toBe('closed')
   })
 })
 

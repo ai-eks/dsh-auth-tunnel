@@ -218,7 +218,7 @@ export type SettingsWrite =
   | { field: FieldKey; op: 'unset' }
 
 export interface RemoteSettingsCommitRequest {
-  expectedRevision?: number
+  expectedRevision: number
   writes: readonly SettingsWrite[]
   password: string
 }
@@ -1293,11 +1293,9 @@ export function apply(ctx: ClientContext): void {
   } else {
     const remote = new RemoteSettingsStore()
     scope = remote
-    commit = (revision, writes, _current, _target, password) => remote.commit({
-      ...(revision === undefined ? {} : { expectedRevision: revision }),
-      writes,
-      password,
-    })
+    commit = (revision, writes, _current, _target, password) => revision === undefined
+      ? Promise.reject(new Error('settings revision is unavailable'))
+      : remote.commit({ expectedRevision: revision, writes, password })
     ctx.effect(() => installRemoteLocalePersistence(ctx, remote), 'auth-tunnel: remote locale persistence')
     ctx.effect(() => () => { remote.dispose() }, 'auth-tunnel: remote settings')
   }
