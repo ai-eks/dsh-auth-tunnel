@@ -551,10 +551,12 @@ function writeJsonComplete(res: ServerResponse, status: number, value: unknown):
  */
 interface RemoteMutationFence {
   tail: Promise<void>
+  committedTail: Promise<void>
 }
 
 class PasswordGate {
   private auth: { passwordRef: string; ttlMs: number; allowRemoteSettings: boolean }
+  private remoteWritesEnabled: boolean
   private authGeneration = 0
   private readonly credentialGenerations = new Map<string, number>()
   private readonly proxyDrops = new Set<() => void>()
@@ -572,6 +574,7 @@ class PasswordGate {
       ttlMs: config.sessionTtlHours * 3600 * 1000,
       allowRemoteSettings: config.allowRemoteSettings,
     }
+    this.remoteWritesEnabled = config.allowRemoteSettings
     this.upstreamPort = upstreamPort
   }
 
@@ -583,6 +586,7 @@ class PasswordGate {
       ttlMs: config.sessionTtlHours * 3600 * 1000,
       allowRemoteSettings: config.allowRemoteSettings,
     }
+    this.remoteWritesEnabled = config.allowRemoteSettings
   }
 
   /** Drop connections authenticated with the previous credential value. */
@@ -600,12 +604,19 @@ class PasswordGate {
 
   /** Invalidate pending authentication before shutting down the gate server. */
   closeConnections(): void {
+    this.revokeRemoteSettings()
     this.revokeAuthenticatedConnections()
   }
 
   /** Revoke the settings surface immediately without disturbing ordinary sessions. */
   revokeRemoteSettings(): void {
     this.auth = { ...this.auth, allowRemoteSettings: false }
+    this.remoteWritesEnabled = false
+  }
+
+  /** Refuse remote writes that have not entered persistence yet. */
+  revokeRemoteMutations(): void {
+    this.remoteWritesEnabled = false
   }
 
   /** Fence every gate that currently authenticates with a rotated credential. */
@@ -620,10 +631,38 @@ class PasswordGate {
   }
 
   /** Keep authenticated remote writes ordered across concurrent browser tabs. */
-  private serializeRemoteMutation<T>(mutation: () => Promise<T>): Promise<T> {
-    const queued = this.remoteMutations.tail.then(mutation)
+  private serializeRemoteMutation<T>(mutation: (enterCommitPhase: () => void) => Promise<T>): Promise<T> {
+    let releaseCommitted: (() => void) | undefined
+    const enterCommitPhase = (): void => {
+      if (releaseCommitted !== undefined) return
+      let release = (): void => {}
+      const pending = new Promise<void>((resolve) => { release = resolve })
+      releaseCommitted = release
+      this.remoteMutations.committedTail = this.remoteMutations.committedTail.then(() => pending)
+    }
+    const queued = this.remoteMutations.tail.then(async () => {
+      try {
+        return await mutation(enterCommitPhase)
+      } finally {
+        releaseCommitted?.()
+      }
+    })
     this.remoteMutations.tail = queued.then(() => undefined, () => undefined)
     return queued
+  }
+
+  /** Check the live gate and Host descriptor before a remote write enters its commit phase. */
+  private remoteSettingsPolicyCurrent(passwordRef: string, requireEnabled = false): boolean {
+    if (!this.remoteWritesEnabled || !this.auth.allowRemoteSettings || this.auth.passwordRef !== passwordRef) return false
+    try {
+      const { descriptor } = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
+      const config = Config(objectRecord(descriptor.value) as unknown as InternalConfig)
+      return (!requireEnabled || config.enabled)
+        && config.allowRemoteSettings
+        && config.passwordRef === passwordRef
+    } catch {
+      return false
+    }
   }
 
   /** Revalidate the current credential generation and live permission. */
@@ -636,12 +675,7 @@ class PasswordGate {
       && this.auth.passwordRef === passwordRef
       && this.authGeneration === authGeneration
     if (!authenticated) return false
-    try {
-      const { descriptor } = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
-      return Config(objectRecord(descriptor.value) as unknown as InternalConfig).passwordRef === passwordRef
-    } catch {
-      return false
-    }
+    return this.remoteSettingsPolicyCurrent(passwordRef)
   }
 
   /** Revalidate authorization after reading a remote mutation body. */
@@ -816,7 +850,7 @@ class PasswordGate {
     if (body === undefined) return
     try {
       const request = parseRemoteSettingsWriteRequest(body)
-      await this.serializeRemoteMutation(async () => {
+      await this.serializeRemoteMutation(async (enterCommitPhase) => {
         try {
           const openedSettings = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
           if (!openedSettings.writable) throw new Error('settings provider is read-only')
@@ -846,6 +880,11 @@ class PasswordGate {
           }
           if (!current.allowRemoteSettings) throw new Error('remote settings disabled')
           await this.requireRemoteMutationAuthorization(req)
+          if (!this.remoteSettingsPolicyCurrent(current.passwordRef)
+            || this.credentialGeneration(current.passwordRef) !== authorizationCredentialGeneration
+            || this.credentialGeneration(target.passwordRef) !== credentialGeneration) {
+            throw new Error('remote settings authorization changed')
+          }
           let credentialRevision = request.expectedRevision
           let rollbackSettings: (() => Promise<void>) | undefined
           if (request.writes.length !== 0) {
@@ -858,6 +897,7 @@ class PasswordGate {
             const ops: SettingsPathOp[] = request.writes.map(write => write.op === 'set'
               ? { op: 'set', path: [write.field], value: write.value }
               : { op: 'unset', path: [write.field] })
+            enterCommitPhase()
             await settings.mutate(
               AUTH_TUNNEL_SETTINGS_NAMESPACE,
               ops,
@@ -894,6 +934,7 @@ class PasswordGate {
               throw new Error('access password credential changed')
             }
             if (password !== '') {
+              enterCommitPhase()
               await this.ctx.credentials.set(credentialRef(target.passwordRef), password)
             }
           } catch (error) {
@@ -924,11 +965,55 @@ class PasswordGate {
     try {
       const locale = objectRecord(body).locale
       if (locale !== 'zh' && locale !== 'en') throw new TypeError('unsupported locale')
-      await this.serializeRemoteMutation(async () => {
+      await this.serializeRemoteMutation(async (enterCommitPhase) => {
+        const authorizationPasswordRef = this.auth.passwordRef
+        const authorizationCredentialGeneration = this.credentialGeneration(authorizationPasswordRef)
         await this.requireRemoteMutationAuthorization(req)
+        if (!this.remoteSettingsPolicyCurrent(authorizationPasswordRef, true)
+          || this.credentialGeneration(authorizationPasswordRef) !== authorizationCredentialGeneration) {
+          throw new Error('remote settings authorization changed')
+        }
         const settings = this.ctx.get('settings')
         if (settings === undefined) throw new Error('settings service is unavailable')
-        await settings.update(LOCALE_SETTINGS_NAMESPACE, { preference: locale })
+        const openedSettings = descriptorFor(this.ctx, LOCALE_SETTINGS_NAMESPACE)
+        if (!openedSettings.writable) throw new Error('settings provider is read-only')
+        const opened = openedSettings.descriptor
+        const openedUser = opened.user === undefined ? {} : objectRecord(opened.user)
+        const rollbackOp: SettingsPathOp = Object.hasOwn(openedUser, 'preference')
+          ? { op: 'set', path: ['preference'], value: openedUser.preference }
+          : { op: 'unset', path: ['preference'] }
+        enterCommitPhase()
+        await settings.mutate(
+          LOCALE_SETTINGS_NAMESPACE,
+          [{ op: 'set', path: ['preference'], value: locale }],
+          opened.revision,
+        )
+        const committed = descriptorFor(this.ctx, LOCALE_SETTINGS_NAMESPACE).descriptor
+        try {
+          const committedUser = committed.user === undefined ? {} : objectRecord(committed.user)
+          if (!Object.hasOwn(committedUser, 'preference') || committedUser.preference !== locale) {
+            throw new Error('language write was not committed')
+          }
+          await this.requireRemoteMutationAuthorization(req)
+          if (!this.remoteSettingsPolicyCurrent(authorizationPasswordRef, true)
+            || this.credentialGeneration(authorizationPasswordRef) !== authorizationCredentialGeneration) {
+            throw new Error('remote settings authorization changed')
+          }
+        } catch (error) {
+          await settings.mutate(LOCALE_SETTINGS_NAMESPACE, [rollbackOp], committed.revision)
+          const restored = descriptorFor(this.ctx, LOCALE_SETTINGS_NAMESPACE).descriptor
+          const restoredUser = restored.user === undefined ? {} : objectRecord(restored.user)
+          const restoredPreference = Object.hasOwn(restoredUser, 'preference')
+            ? restoredUser.preference
+            : undefined
+          const expectedPreference = Object.hasOwn(openedUser, 'preference')
+            ? openedUser.preference
+            : undefined
+          if (!Object.is(restoredPreference, expectedPreference)) {
+            throw new Error('language rollback was not committed')
+          }
+          throw error
+        }
         await writeJsonComplete(res, 200, { locale })
       })
     } catch (error) {
@@ -1252,7 +1337,10 @@ class AuthTunnelRuntime {
   private readonly shutdown = new AbortController()
   private stagedStartup: AbortController | undefined
   private finishHandoff: (() => void) | undefined
-  private readonly remoteMutations: RemoteMutationFence = { tail: Promise.resolve() }
+  private readonly remoteMutations: RemoteMutationFence = {
+    tail: Promise.resolve(),
+    committedTail: Promise.resolve(),
+  }
   private readonly liveGates = new Set<PasswordGate>()
   private readonly handoffFallbacks = new Set<ActiveTunnel>()
   private readonly tokenCredentialGenerations = new Map<string, number>()
@@ -1349,12 +1437,13 @@ class AuthTunnelRuntime {
     }
     if (!config.enabled) {
       this.stagedStartup?.abort()
+      for (const gate of this.liveGates) gate.revokeRemoteMutations()
       const handoff = this.finishHandoff
       if (handoff !== undefined) {
         const finish = (): void => {
           if (this.finishHandoff === handoff) handoff()
         }
-        void this.remoteMutations.tail.then(finish, finish)
+        void this.remoteMutations.committedTail.then(finish, finish)
       }
     }
     if (!config.allowRemoteSettings) {
@@ -1455,7 +1544,7 @@ class AuthTunnelRuntime {
   private async reconcile(next: InternalConfig): Promise<void> {
     validateConfig(next)
     if (!next.enabled) {
-      await this.remoteMutations.tail
+      await this.remoteMutations.committedTail
       const previous = this.active
       this.active = undefined
       this.publish(undefined)
@@ -1510,7 +1599,7 @@ class AuthTunnelRuntime {
       if (previous !== undefined) {
         await this.waitForHandoffWithFallback(previous)
         previous.gate.revokeRemoteSettings()
-        await this.remoteMutations.tail
+        await this.remoteMutations.committedTail
         if (this.disposed) {
           await this.stop(previous)
           return

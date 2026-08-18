@@ -792,11 +792,19 @@ export async function commitCardChanges(
       }
     }
   }
-  const passwordBeforeEnable = password !== '' && !current.enabled && target.enabled
-  if (passwordBeforeEnable) {
-    const enableWrite = writes.find(write => write.field === 'enabled')
-    if (enableWrite === undefined) throw new Error('tunnel enable write is missing')
-    const setupWrites = writes.filter(write => write.field !== 'enabled')
+  const deferEnable = password !== '' && !current.enabled && target.enabled
+  const deferRemoteSettings = password !== '' && !current.allowRemoteSettings && target.allowRemoteSettings
+  if (deferEnable || deferRemoteSettings) {
+    const deferredWrites = writes.filter(write => (deferEnable && write.field === 'enabled')
+      || (deferRemoteSettings && write.field === 'allowRemoteSettings'))
+    if (deferEnable && !deferredWrites.some(write => write.field === 'enabled')) {
+      throw new Error('tunnel enable write is missing')
+    }
+    if (deferRemoteSettings && !deferredWrites.some(write => write.field === 'allowRemoteSettings')) {
+      throw new Error('remote settings enable write is missing')
+    }
+    const deferredFields = new Set(deferredWrites.map(write => write.field))
+    const setupWrites = writes.filter(write => !deferredFields.has(write.field))
     const prepared = await commitSettingsWrites(api, revision, setupWrites)
     if (setupWrites.some(write => !writeSatisfied(prepared, write))) {
       throw new Error('settings write was not committed')
@@ -820,10 +828,12 @@ export async function commitCardChanges(
       }
       throw error
     }
-    // A failed enable leaves the credential in place: the API has no compare-
+    // A failed deferred privilege write leaves the credential in place: the API has no compare-
     // and-unset operation, so deleting it could erase a concurrent replacement.
-    const enabled = await commitSettingsWrites(api, prepared.revision, [enableWrite])
-    if (!writeSatisfied(enabled, enableWrite)) throw new Error('settings write was not committed')
+    const granted = await commitSettingsWrites(api, prepared.revision, deferredWrites)
+    if (deferredWrites.some(write => !writeSatisfied(granted, write))) {
+      throw new Error('settings write was not committed')
+    }
     return
   }
   if (password !== '' && writes.length === 0) {

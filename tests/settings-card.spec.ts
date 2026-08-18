@@ -232,6 +232,33 @@ describe('auth-tunnel settings card contract', () => {
     })
   })
 
+  it('stores the password before granting remote settings access on an active tunnel', async () => {
+    const order: string[] = []
+    const { api, mutate } = successfulCardApi({ allowRemoteSettings: true }, order)
+
+    await commitCardChanges(
+      api,
+      7,
+      [{ field: 'allowRemoteSettings', op: 'set', value: true }],
+      quick,
+      { ...quick, allowRemoteSettings: true },
+      'replacement-password',
+      {},
+    )
+
+    expect(order).toEqual(['settings', 'credential', 'settings'])
+    expect(mutate).toHaveBeenNthCalledWith(1, {
+      ns: 'auth-tunnel',
+      expectedRevision: 7,
+      ops: [],
+    })
+    expect(mutate).toHaveBeenNthCalledWith(2, {
+      ns: 'auth-tunnel',
+      expectedRevision: 8,
+      ops: [{ op: 'set', path: ['allowRemoteSettings'], value: true }],
+    })
+  })
+
   it('preserves a newly created credential when enabling loses its revision fence', async () => {
     const mutate = vi.fn()
       .mockResolvedValueOnce({

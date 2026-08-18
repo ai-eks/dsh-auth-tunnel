@@ -35,7 +35,10 @@ class StubCredentials extends Service {
     if (this.resolveDelayMs > 0) {
       await new Promise<void>(resolve => { setTimeout(resolve, this.resolveDelayMs) })
     }
-    if (this.resolveBarrier !== undefined) await this.resolveBarrier
+    if (this.resolveBarrier !== undefined
+      && (this.resolveBarrierRef === undefined || this.resolveBarrierRef === request)) {
+      await this.resolveBarrier
+    }
     if (this.fault) return Promise.reject(new Error('credential store exploded'))
     const hit = this.values.get(request)
     this.afterResolve?.(request)
@@ -53,6 +56,9 @@ class StubCredentials extends Service {
 
   /** Test knob: release concurrent credential resolutions together. */
   resolveBarrier: Promise<void> | undefined
+
+  /** Test knob: limit the credential barrier to one reference. */
+  resolveBarrierRef: string | undefined
 
   /** Test knob: observe a credential lookup before a barrier holds it. */
   resolveStarted: ((ref: string) => void) | undefined
@@ -1183,6 +1189,75 @@ describe('password gate over the loopback webserver', () => {
     expect(response?.status).toBe(200)
     await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
     expect(composition.settings().get(settingsNamespace('locale'))).toEqual({ preference: 'en' })
+  })
+
+  it('rolls back a locale write when the authorizing credential changes during persistence', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    composition.settings().register(settingsNamespace('locale'), z.object({
+      preference: z.union(['zh', 'en']).required(false),
+    }))
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    let releasePersist = (): void => {}
+    composition.settings().persistBarrier = new Promise<void>((resolve) => { releasePersist = resolve })
+    let markPersistStarted = (): void => {}
+    const persistStarted = new Promise<void>((resolve) => { markPersistStarted = resolve })
+    composition.settings().persistStarted = markPersistStarted
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/locale`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ locale: 'en' }),
+    })
+    await persistStarted
+    composition.credentials().set('DSH_WEB_PASSWORD', 'local-admin-password')
+    composition.settings().persistStarted = undefined
+    composition.settings().persistBarrier = undefined
+    releasePersist()
+
+    expect((await responseTask).status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('locale'))).toEqual({})
+  })
+
+  it('does not let pre-commit credential resolution delay local tunnel shutdown', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true }, {
+      seeds: { NEXT_WEB_PASSWORD: 'next-password' },
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    let releaseResolve = (): void => {}
+    composition.credentials().resolveBarrier = new Promise<void>((resolve) => { releaseResolve = resolve })
+    composition.credentials().resolveBarrierRef = 'NEXT_WEB_PASSWORD'
+    let markResolveStarted = (): void => {}
+    const resolveStarted = new Promise<void>((resolve) => { markResolveStarted = resolve })
+    composition.credentials().resolveStarted = (ref) => {
+      if (ref !== 'NEXT_WEB_PASSWORD') return
+      composition.credentials().resolveStarted = undefined
+      markResolveStarted()
+    }
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' }],
+        password: '',
+      }),
+    }).catch(() => undefined)
+    await resolveStarted
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
+    await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
+    expect(await liveFixturePids()).toEqual([])
+
+    composition.credentials().resolveBarrier = undefined
+    composition.credentials().resolveBarrierRef = undefined
+    releaseResolve()
+    await responseTask
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
   })
 
   it('releases the remote mutation fence when the writer disconnects before the response', { timeout: 60_000 }, async () => {
