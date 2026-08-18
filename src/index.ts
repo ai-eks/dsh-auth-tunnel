@@ -1083,7 +1083,7 @@ async function spawnTunnel(
 
   if (cancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
   const child = spawn(config.executable, args, { env, stdio: ['ignore', 'pipe', 'pipe'] })
-  const cancel = (): void => { void killTree(child) }
+  const cancel = (): void => { void killTree(child).catch(() => undefined) }
   signal?.addEventListener('abort', cancel, { once: true })
   if (cancelled()) cancel()
   // A bounded rolling tail of cloudflared output for diagnostics; the
@@ -1299,7 +1299,9 @@ class AuthTunnelRuntime {
   /** Coalesce scalar settings writes, then reconcile only the latest snapshot. */
   request(config: InternalConfig): void {
     if (this.disposed) return
-    if (this.configured !== undefined && this.configured.passwordRef !== config.passwordRef) {
+    if (this.configured !== undefined
+      && (this.configured.passwordRef !== config.passwordRef
+        || this.configured.sessionTtlHours !== config.sessionTtlHours)) {
       for (const gate of this.liveGates) gate.updateAuth(config)
       if (this.active !== undefined) {
         this.active.config = {

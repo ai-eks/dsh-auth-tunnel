@@ -207,7 +207,7 @@ describe('auth-tunnel settings card contract', () => {
 
   it('stores the password before enabling a currently stopped tunnel', async () => {
     const order: string[] = []
-    const { api } = successfulCardApi({ enabled: true }, order)
+    const { api, mutate } = successfulCardApi({ enabled: true }, order)
 
     await commitCardChanges(
       api,
@@ -219,7 +219,131 @@ describe('auth-tunnel settings card contract', () => {
       {},
     )
 
-    expect(order).toEqual(['credential', 'settings'])
+    expect(order).toEqual(['settings', 'credential', 'settings'])
+    expect(mutate).toHaveBeenNthCalledWith(1, {
+      ns: 'auth-tunnel',
+      expectedRevision: 7,
+      ops: [],
+    })
+    expect(mutate).toHaveBeenNthCalledWith(2, {
+      ns: 'auth-tunnel',
+      expectedRevision: 8,
+      ops: [{ op: 'set', path: ['enabled'], value: true }],
+    })
+  })
+
+  it('removes a newly created credential when enabling loses its revision fence', async () => {
+    const mutate = vi.fn()
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: {
+          ok: true as const,
+          value: {
+            ns: 'auth-tunnel', schema: {}, value: { ...quick, enabled: false, passwordRef: 'NEXT_WEB_PASSWORD' },
+            user: { enabled: false, passwordRef: 'NEXT_WEB_PASSWORD' },
+            applies: 'live' as const, secrets: [], revision: 8,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: { ok: false as const, error: { code: 'conflict', message: 'settings revision changed' } },
+      })
+    const describe = vi.fn(() => Promise.resolve({
+      rpcId: 'test',
+      result: {
+        ok: true as const,
+        value: { credentials: { NEXT_WEB_PASSWORD: { configured: false, writable: true } } },
+      },
+    }))
+    const set = vi.fn(() => Promise.resolve({
+      rpcId: 'test', result: { ok: true as const, value: {} },
+    }))
+    const unset = vi.fn(() => Promise.resolve({
+      rpcId: 'test', result: { ok: true as const, value: {} },
+    }))
+
+    await expect(commitCardChanges(
+      { settings: { mutate }, credentials: { describe, set, unset } } as never,
+      7,
+      [
+        { field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' },
+        { field: 'enabled', op: 'set', value: true },
+      ],
+      { ...quick, enabled: false },
+      { ...quick, passwordRef: 'NEXT_WEB_PASSWORD' },
+      'first-password',
+      { enabled: false },
+    )).rejects.toThrow('settings revision changed')
+
+    expect(mutate).toHaveBeenNthCalledWith(1, {
+      ns: 'auth-tunnel',
+      expectedRevision: 7,
+      ops: [{ op: 'set', path: ['passwordRef'], value: 'NEXT_WEB_PASSWORD' }],
+    })
+    expect(set).toHaveBeenCalledWith({ ref: 'NEXT_WEB_PASSWORD', value: 'first-password' })
+    expect(unset).toHaveBeenCalledWith({ ref: 'NEXT_WEB_PASSWORD' })
+    expect(mutate).toHaveBeenNthCalledWith(2, {
+      ns: 'auth-tunnel',
+      expectedRevision: 8,
+      ops: [{ op: 'set', path: ['enabled'], value: true }],
+    })
+  })
+
+  it('restores stopped settings when the pre-enablement credential write fails', async () => {
+    const mutate = vi.fn()
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: {
+          ok: true as const,
+          value: {
+            ns: 'auth-tunnel', schema: {}, value: { ...quick, enabled: false, passwordRef: 'NEXT_WEB_PASSWORD' },
+            user: { enabled: false, passwordRef: 'NEXT_WEB_PASSWORD' },
+            applies: 'live' as const, secrets: [], revision: 8,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: {
+          ok: true as const,
+          value: {
+            ns: 'auth-tunnel', schema: {}, value: { ...quick, enabled: false },
+            user: { enabled: false }, applies: 'live' as const, secrets: [], revision: 9,
+          },
+        },
+      })
+    const describe = vi.fn(() => Promise.resolve({
+      rpcId: 'test',
+      result: {
+        ok: true as const,
+        value: { credentials: { NEXT_WEB_PASSWORD: { configured: false, writable: true } } },
+      },
+    }))
+    const set = vi.fn(() => Promise.resolve({
+      rpcId: 'test',
+      result: { ok: false as const, error: { code: 'credential-rejected', message: 'read only' } },
+    }))
+
+    await expect(commitCardChanges(
+      { settings: { mutate }, credentials: { describe, set } } as never,
+      7,
+      [
+        { field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' },
+        { field: 'enabled', op: 'set', value: true },
+      ],
+      { ...quick, enabled: false },
+      { ...quick, passwordRef: 'NEXT_WEB_PASSWORD' },
+      'first-password',
+      { enabled: false },
+    )).rejects.toThrow('read only')
+
+    expect(mutate).toHaveBeenCalledTimes(2)
+    expect(mutate).toHaveBeenNthCalledWith(2, {
+      ns: 'auth-tunnel',
+      expectedRevision: 8,
+      ops: [{ op: 'unset', path: ['passwordRef'] }],
+    })
   })
 
   it('rejects a passwordless local passwordRef change targeting the tunnel token', async () => {

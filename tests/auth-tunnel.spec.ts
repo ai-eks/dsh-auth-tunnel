@@ -2360,6 +2360,30 @@ describe('rc7 plugin settings', () => {
     await login(`http://127.0.0.1:${String(nextPort)}`, undefined, 'alternate-password')
   })
 
+  it('applies a reduced session lifetime to every live gate during a port handoff', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick()
+    const previousGate = await composition.gateBase()
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const nextPort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const before = await composition.runtimeStatus()
+
+    await composition.settings().update(namespace, { gatePort: nextPort })
+    await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'running',
+    )
+    expect(await liveFixturePids()).toHaveLength(2)
+
+    await composition.settings().update(namespace, { sessionTtlHours: 1 })
+
+    expect((await login(previousGate)).get('set-cookie')).toContain('Max-Age=3600')
+    expect((await login(`http://127.0.0.1:${String(nextPort)}`)).get('set-cookie')).toContain('Max-Age=3600')
+  })
+
   it('serializes password rotations across both gates during a port handoff', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     const previousGate = await composition.gateBase()

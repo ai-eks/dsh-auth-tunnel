@@ -792,17 +792,58 @@ export async function commitCardChanges(
       }
     }
   }
+  const passwordBeforeEnable = password !== '' && !current.enabled && target.enabled
+  if (passwordBeforeEnable) {
+    const enableWrite = writes.find(write => write.field === 'enabled')
+    if (enableWrite === undefined) throw new Error('tunnel enable write is missing')
+    const setupWrites = writes.filter(write => write.field !== 'enabled')
+    const prepared = await commitSettingsWrites(api, revision, setupWrites)
+    if (setupWrites.some(write => !writeSatisfied(prepared, write))) {
+      throw new Error('settings write was not committed')
+    }
+    try {
+      await commitCredentialWrite(api, target.passwordRef, password)
+    } catch (error) {
+      if (setupWrites.length !== 0) {
+        const openedUser = record(currentUser)
+        const rollbackWrites = setupWrites.map((write): SettingsWrite => Object.hasOwn(openedUser, write.field)
+          ? {
+              field: write.field,
+              op: 'set',
+              value: openedUser[write.field] as Exclude<AuthTunnelSettings[FieldKey], undefined>,
+            }
+          : { field: write.field, op: 'unset' })
+        const restored = await commitSettingsWrites(api, prepared.revision, rollbackWrites)
+        if (rollbackWrites.some(write => !writeSatisfied(restored, write))) {
+          throw new Error('settings rollback was not committed')
+        }
+      }
+      throw error
+    }
+    try {
+      const enabled = await commitSettingsWrites(api, prepared.revision, [enableWrite])
+      if (!writeSatisfied(enabled, enableWrite)) throw new Error('settings write was not committed')
+    } catch (error) {
+      // A newly selected reference was known to be absent before this save, so
+      // remove the value we just created if the enable fence loses a race. An
+      // existing reference stays a valid password update on the prepared,
+      // disabled configuration and can be enabled on the next save.
+      if (target.passwordRef !== current.passwordRef) {
+        const removed = await api.credentials.unset({ ref: target.passwordRef })
+        if (!removed.result.ok) throw new Error(removed.result.error.message)
+      }
+      throw error
+    }
+    return
+  }
   if (password !== '' && writes.length === 0) {
     const committed = await commitSettingsWrites(api, revision, [])
     if (record(committed.value).passwordRef !== target.passwordRef) {
       throw new Error('settings password reference changed')
     }
   }
-  // A stopped tunnel receives its replacement credential before settings can
-  // publish it. Other saves keep the active request path alive by committing
+  // Active saves keep the current public request path alive by committing
   // settings first and restoring their exact user-layer values on failure.
-  const passwordBeforeEnable = password !== '' && !current.enabled && target.enabled
-  if (passwordBeforeEnable) await commitCredentialWrite(api, target.passwordRef, password)
   let committed: SettingsNamespaceView | undefined
   let rollbackWrites: SettingsWrite[] | undefined
   if (writes.length !== 0) {
@@ -820,7 +861,7 @@ export async function commitCardChanges(
     }
     committed = result
   }
-  if (password !== '' && !passwordBeforeEnable) {
+  if (password !== '') {
     try {
       await commitCredentialWrite(api, target.passwordRef, password)
     } catch (error) {
