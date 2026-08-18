@@ -1338,6 +1338,8 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+const PASSWORD_RESOLUTION_CANCELLED = new Error('auth-tunnel: password resolution cancelled')
+
 /** Own the one live gate/tunnel pair and reconcile settings changes serially. */
 class AuthTunnelRuntime {
   private active: ActiveTunnel | undefined
@@ -1346,6 +1348,7 @@ class AuthTunnelRuntime {
   private drainTask: Promise<void> | undefined
   private disposed = false
   private readonly shutdown = new AbortController()
+  private passwordChecks = new AbortController()
   private stagedStartup: AbortController | undefined
   private finishHandoff: (() => void) | undefined
   private readonly remoteMutations: RemoteMutationFence = {
@@ -1442,6 +1445,8 @@ class AuthTunnelRuntime {
   /** Coalesce scalar settings writes, then reconcile only the latest snapshot. */
   request(config: InternalConfig): void {
     if (this.disposed) return
+    if (!config.enabled) this.passwordChecks.abort()
+    else if (this.passwordChecks.signal.aborted) this.passwordChecks = new AbortController()
     const passwordRefChanged = this.configured !== undefined
       && this.configured.passwordRef !== config.passwordRef
     if (!config.enabled || !config.allowRemoteSettings || passwordRefChanged) {
@@ -1513,6 +1518,7 @@ class AuthTunnelRuntime {
     this.active = undefined
     this.publish(undefined)
     this.shutdown.abort()
+    this.passwordChecks.abort()
     this.stagedStartup?.abort()
     await Promise.all([
       this.drainTask,
@@ -1557,6 +1563,7 @@ class AuthTunnelRuntime {
         await this.reconcile(next)
       } catch (error) {
         if (this.disposed) return
+        if (error === PASSWORD_RESOLUTION_CANCELLED) continue
         const message = errorMessage(error)
         const running = this.active?.alive === true
         this.setStatus('error', running, running ? this.active?.publicUrl : undefined, message)
@@ -1715,8 +1722,19 @@ class AuthTunnelRuntime {
   }
 
   private async requirePassword(ref: string): Promise<void> {
-    if (await sessionKey(this.ctx, ref) === undefined) {
-      throw new Error(`auth-tunnel: credential reference "${ref}" is not configured`)
+    const signal = this.passwordChecks.signal
+    let abort = (): void => {}
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      abort = (): void => { reject(PASSWORD_RESOLUTION_CANCELLED) }
+      if (signal.aborted) abort()
+      else signal.addEventListener('abort', abort, { once: true })
+    })
+    try {
+      if (await Promise.race([sessionKey(this.ctx, ref), cancelled]) === undefined) {
+        throw new Error(`auth-tunnel: credential reference "${ref}" is not configured`)
+      }
+    } finally {
+      signal.removeEventListener('abort', abort)
     }
   }
 
@@ -1765,6 +1783,8 @@ class AuthTunnelRuntime {
       await this.stopChild(candidate)
       return current
     }
+    this.detachPreCommitRemoteMutations(false)
+    await this.remoteMutations.committedTail
     await this.stopChild(current)
     this.appliedTokenCredentialGeneration = tokenGeneration
     return candidate

@@ -2759,6 +2759,89 @@ describe('rc7 plugin settings', () => {
     expect(retainedToken).toBe('fixture-token-3')
   })
 
+  it('keeps a refreshed fallback child alive until a committed response finishes', { timeout: 60_000 }, async () => {
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const gatePort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const composition = await loadComposition({
+      mode: 'token',
+      tokenRef: 'TOKEN_A',
+      publicHostname: 'gui.example.com',
+      gatePort,
+      allowRemoteSettings: true,
+      executable: await fixtureExecutable('fake-cloudflared-token-rotated-crash.sh'),
+      startupTimeoutMs: 15_000,
+    }, { seeds: { TOKEN_A: 'fixture-token-1', TOKEN_B: 'fixture-token-2' } })
+    composition.settings().register(settingsNamespace('locale'), z.object({
+      preference: z.union(['zh', 'en']).required(false),
+    }))
+    const originalPid = (await liveFixturePids())[0]!
+    const base = `http://127.0.0.1:${String(gatePort)}`
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const originalEnd = ServerResponse.prototype.end
+    let releaseResponse = (): void => {}
+    let markResponseHeld = (): void => {}
+    const responseHeld = new Promise<void>((resolve) => { markResponseHeld = resolve })
+    let held = false
+    vi.spyOn(ServerResponse.prototype, 'end').mockImplementation((function (
+      this: ServerResponse,
+      ...args: unknown[]
+    ): ServerResponse {
+      if (!held && this.req.url === '/dsh-auth-tunnel/locale') {
+        held = true
+        releaseResponse = () => { Reflect.apply(originalEnd, this, args) }
+        markResponseHeld()
+        return this
+      }
+      return Reflect.apply(originalEnd, this, args) as ServerResponse
+    }) as typeof ServerResponse.prototype.end)
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/locale`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ locale: 'en' }),
+    }).catch(() => undefined)
+    await responseHeld
+    let released = false
+    try {
+      const before = await composition.runtimeStatus()
+      await composition.settings().update(namespace, { tokenRef: 'TOKEN_B' })
+      await waitForStatus(
+        composition,
+        status => status.revision > before.revision && status.phase === 'running',
+        5000,
+      )
+      composition.credentials().set('TOKEN_A', 'fixture-token-3')
+
+      const refreshDeadline = Date.now() + 7000
+      let refreshedPid: string | undefined
+      while (refreshedPid === undefined) {
+        for (const pid of await liveFixturePids()) {
+          const token = await readFile(join(tmpdir(), `${FAKE_PREFIX}${pid}.token`), 'utf8').catch(() => '')
+          if (pid !== originalPid && token === 'fixture-token-3') refreshedPid = pid
+        }
+        if (Date.now() >= refreshDeadline) throw new Error('rotated fallback child did not start')
+        if (refreshedPid === undefined) await sleep(25)
+      }
+
+      await sleep(3700)
+      expect(await liveFixturePids()).toContain(originalPid)
+      releaseResponse()
+      released = true
+      expect((await responseTask)?.status).toBe(200)
+      const retiredDeadline = Date.now() + 5000
+      while ((await liveFixturePids()).includes(originalPid)) {
+        if (Date.now() >= retiredDeadline) throw new Error('refreshed fallback child did not retire its predecessor')
+        await sleep(25)
+      }
+    } finally {
+      if (!released) releaseResponse()
+    }
+  })
+
   it('starts and stops the gate and cloudflared from the live enabled switch', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ enabled: false })
     expect(await composition.runtimeStatus()).toMatchObject({ phase: 'stopped', running: false })
@@ -2783,6 +2866,39 @@ describe('rc7 plugin settings', () => {
     await waitForStatus(composition, status => status.phase === 'running')
     expect((await liveFixturePids()).length).toBe(1)
     expect((await fetch(`${await composition.gateBase()}/dsh-auth-tunnel/login`)).status).toBe(200)
+  })
+
+  it('disables the active tunnel while password validation is stalled', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick(undefined, {
+      seeds: { ALT_WEB_PASSWORD: 'alternate-password' },
+    })
+    const base = await composition.gateBase()
+    let releaseResolve = (): void => {}
+    composition.credentials().resolveBarrier = new Promise<void>((resolve) => { releaseResolve = resolve })
+    composition.credentials().resolveBarrierRef = 'ALT_WEB_PASSWORD'
+    let markResolveStarted = (): void => {}
+    const resolveStarted = new Promise<void>((resolve) => { markResolveStarted = resolve })
+    composition.credentials().resolveStarted = (ref) => {
+      if (ref !== 'ALT_WEB_PASSWORD') return
+      composition.credentials().resolveStarted = undefined
+      markResolveStarted()
+    }
+
+    await composition.settings().update(namespace, { passwordRef: 'ALT_WEB_PASSWORD' })
+    await resolveStarted
+    try {
+      const startedAt = Date.now()
+      await composition.settings().update(namespace, { enabled: false })
+      await waitForStatus(composition, status => status.phase === 'stopped' && !status.running, 3000)
+
+      expect(Date.now() - startedAt).toBeLessThan(3000)
+      expect(await liveFixturePids()).toEqual([])
+      await expect(fetch(`${base}/dsh-auth-tunnel/login`)).rejects.toThrow()
+    } finally {
+      composition.credentials().resolveBarrier = undefined
+      composition.credentials().resolveBarrierRef = undefined
+      releaseResolve()
+    }
   })
 
   it('keeps the previous public path alive for the runtime-status handoff', { timeout: 60_000 }, async () => {
