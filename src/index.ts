@@ -618,8 +618,12 @@ class PasswordGate {
   /** Refuse remote writes that have not entered persistence yet. */
   revokeRemoteMutations(): void {
     this.remoteWritesEnabled = false
+    this.invalidateRemoteMutations()
+  }
+
+  /** Make every pre-commit operation from the previous queue epoch stale. */
+  invalidateRemoteMutations(): void {
     this.remoteMutationGeneration += 1
-    this.remoteMutations.tail = this.remoteMutations.committedTail
   }
 
   /** Fence every gate that currently authenticates with a rotated credential. */
@@ -1426,13 +1430,22 @@ class AuthTunnelRuntime {
     }
   }
 
+  /** Rotate the shared queue after invalidating every gate that could own its pre-commit work. */
+  private detachPreCommitRemoteMutations(revokeWrites: boolean): void {
+    for (const gate of this.liveGates) {
+      if (revokeWrites) gate.revokeRemoteMutations()
+      else gate.invalidateRemoteMutations()
+    }
+    this.remoteMutations.tail = this.remoteMutations.committedTail
+  }
+
   /** Coalesce scalar settings writes, then reconcile only the latest snapshot. */
   request(config: InternalConfig): void {
     if (this.disposed) return
     const passwordRefChanged = this.configured !== undefined
       && this.configured.passwordRef !== config.passwordRef
     if (!config.enabled || !config.allowRemoteSettings || passwordRefChanged) {
-      for (const gate of this.liveGates) gate.revokeRemoteMutations()
+      this.detachPreCommitRemoteMutations(true)
     }
     if (this.configured !== undefined
       && (passwordRefChanged
@@ -1609,6 +1622,7 @@ class AuthTunnelRuntime {
       // new runtime URL before the browser's current tunnel is retired.
       if (previous !== undefined) {
         await this.waitForHandoffWithFallback(previous)
+        this.detachPreCommitRemoteMutations(false)
         previous.gate.revokeRemoteSettings()
         await this.remoteMutations.committedTail
         if (this.disposed) {
@@ -1681,6 +1695,8 @@ class AuthTunnelRuntime {
           this.restorePreviousAfterFailedHandoff(candidate, previous)
           return
         }
+        this.detachPreCommitRemoteMutations(false)
+        await this.remoteMutations.committedTail
         await this.stopChild(previous)
       }
       this.appliedTokenCredentialGeneration = tokenGeneration
@@ -1754,20 +1770,43 @@ class AuthTunnelRuntime {
     return candidate
   }
 
+  /** Keep route construction on its requested snapshot while latching the latest access policy. */
+  private withCurrentAuth(config: InternalConfig): InternalConfig {
+    const current = this.configured
+    if (current === undefined) return config
+    return {
+      ...config,
+      passwordRef: current.passwordRef,
+      sessionTtlHours: current.sessionTtlHours,
+      allowRemoteSettings: current.allowRemoteSettings,
+    }
+  }
+
   private async startFull(config: InternalConfig): Promise<ActiveTunnel> {
     if (this.startupCancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
-    await this.requirePassword(config.passwordRef)
-    if (this.startupCancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
-    const gate = new PasswordGate(this.ctx, config, this.ctx.webServer.port, this.remoteMutations)
-    const { server, port } = await gate.start(config.gatePort)
+    let gateConfig = this.withCurrentAuth(config)
+    while (true) {
+      await this.requirePassword(gateConfig.passwordRef)
+      if (this.startupCancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
+      const latest = this.withCurrentAuth(config)
+      if (latest.passwordRef === gateConfig.passwordRef) {
+        gateConfig = latest
+        break
+      }
+      gateConfig = latest
+    }
+    const gate = new PasswordGate(this.ctx, gateConfig, this.ctx.webServer.port, this.remoteMutations)
     this.liveGates.add(gate)
+    let server: Server | undefined
     try {
-      const spawned = await this.spawnStaged(config, `http://127.0.0.1:${String(port)}`)
+      const started = await gate.start(config.gatePort)
+      server = started.server
+      const spawned = await this.spawnStaged(config, `http://127.0.0.1:${String(started.port)}`)
       return {
         config,
         gate,
-        server,
-        port,
+        server: started.server,
+        port: started.port,
         child: spawned.child,
         publicUrl: spawned.publicUrl,
         alive: true,
@@ -1775,7 +1814,7 @@ class AuthTunnelRuntime {
     } catch (error) {
       gate.closeConnections()
       this.liveGates.delete(gate)
-      await closeGate(server)
+      if (server !== undefined) await closeGate(server)
       throw error
     }
   }

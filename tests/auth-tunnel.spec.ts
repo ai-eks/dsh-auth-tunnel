@@ -1148,6 +1148,61 @@ describe('password gate over the loopback webserver', () => {
     expect((await responseTask)?.status).toBe(200)
   })
 
+  it('keeps the previous tunnel child alive until a process-changing save response finishes', { timeout: 60_000 }, async () => {
+    const quickExecutable = await fixtureExecutable('fake-cloudflared-quick.sh')
+    const delayedExecutable = await fixtureExecutable('fake-cloudflared-delayed.sh')
+    const composition = await bootQuick({ allowRemoteSettings: true, executable: quickExecutable })
+    const originalPid = (await liveFixturePids())[0]!
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    const before = await composition.runtimeStatus()
+    const originalEnd = ServerResponse.prototype.end
+    let releaseResponse = (): void => {}
+    let markResponseHeld = (): void => {}
+    const responseHeld = new Promise<void>((resolve) => { markResponseHeld = resolve })
+    let held = false
+    vi.spyOn(ServerResponse.prototype, 'end').mockImplementation((function (
+      this: ServerResponse,
+      ...args: unknown[]
+    ): ServerResponse {
+      if (!held && this.req.url === '/dsh-auth-tunnel/settings') {
+        held = true
+        releaseResponse = () => { Reflect.apply(originalEnd, this, args) }
+        markResponseHeld()
+        return this
+      }
+      return Reflect.apply(originalEnd, this, args) as ServerResponse
+    }) as typeof ServerResponse.prototype.end)
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'executable', op: 'set', value: delayedExecutable }],
+        password: '',
+      }),
+    })
+    await responseHeld
+    await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'running',
+    )
+    await sleep(3700)
+    expect(await liveFixturePids()).toContain(originalPid)
+
+    releaseResponse()
+    expect((await responseTask).status).toBe(200)
+    const retiredDeadline = Date.now() + 5000
+    while ((await liveFixturePids()).includes(originalPid)) {
+      if (Date.now() >= retiredDeadline) throw new Error('previous tunnel child was not retired')
+      await sleep(25)
+    }
+  })
+
   it('returns the complete locale response before a local disable stops the tunnel', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     composition.settings().register(settingsNamespace('locale'), z.object({
@@ -2077,6 +2132,42 @@ describe('tunnel lifecycle', () => {
     expect(await composition.runtimeStatus()).toMatchObject({ phase: 'running', running: true })
   })
 
+  it('latches a password reference changed while the initial gate is being created', { timeout: 60_000 }, async () => {
+    const composition = await loadComposition({
+      mode: 'quick',
+      executable: await fixtureExecutable('fake-cloudflared-delayed.sh'),
+      startupTimeoutMs: 15_000,
+    }, {
+      wait: false,
+      credentialResolveDelayMs: 700,
+      seeds: { ALT_WEB_PASSWORD: 'alternate-password' },
+    })
+    const namespace = settingsNamespace('auth-tunnel')
+    const settingsDeadline = Date.now() + 3000
+    while (composition.settings().get(namespace) === undefined) {
+      if (Date.now() >= settingsDeadline) throw new Error('auth-tunnel settings were not registered')
+      await sleep(10)
+    }
+    await composition.settings().update(namespace, { passwordRef: 'ALT_WEB_PASSWORD' })
+    const gateDeadline = Date.now() + 5000
+    while ((await liveFixturePids()).length === 0) {
+      if (Date.now() >= gateDeadline) throw new Error('initial cloudflared did not start')
+      await sleep(10)
+    }
+    composition.credentials().resolveDelayMs = 0
+    const base = await composition.gateBase()
+
+    const staleLogin = await fetch(`${base}/dsh-auth-tunnel/login`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'password=s3kret-passw0rd',
+    })
+    expect(staleLogin.headers.get('set-cookie')).toBeNull()
+    await login(base, undefined, 'alternate-password')
+    await composition.loaded.loader.await()
+  })
+
   it('teardown kills the cloudflared child and closes the gate', { timeout: 60_000 }, async () => {
     const { gateBase } = await bootQuick()
     const base = await gateBase()
@@ -2848,6 +2939,82 @@ describe('rc7 plugin settings', () => {
 
     expect(responses.filter(response => response.includes(' 200 '))).toHaveLength(1)
     expect(responses.filter(response => response.includes(' 409 '))).toHaveLength(1)
+  })
+
+  it('detaches a previous gate pre-commit save when a port handoff retires it', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true }, {
+      seeds: { NEXT_WEB_PASSWORD: 'next-password' },
+    })
+    const previousGate = await composition.gateBase()
+    const cookie = (await login(previousGate)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${previousGate}/dsh-auth-tunnel/settings`, {
+      headers: { cookie },
+    })).json() as { settings: { revision: number } }
+    let releaseResolve = (): void => {}
+    composition.credentials().resolveBarrier = new Promise<void>((resolve) => { releaseResolve = resolve })
+    composition.credentials().resolveBarrierRef = 'NEXT_WEB_PASSWORD'
+    let markResolveStarted = (): void => {}
+    const resolveStarted = new Promise<void>((resolve) => { markResolveStarted = resolve })
+    composition.credentials().resolveStarted = (ref) => {
+      if (ref !== 'NEXT_WEB_PASSWORD') return
+      composition.credentials().resolveStarted = undefined
+      markResolveStarted()
+    }
+    const staleTask = fetch(`${previousGate}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' }],
+        password: '',
+      }),
+    }).catch(() => undefined)
+    await resolveStarted
+
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const nextPort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const before = await composition.runtimeStatus()
+    await composition.settings().update(namespace, { gatePort: nextPort })
+    await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'running',
+    )
+    await sleep(3700)
+
+    const nextGate = `http://127.0.0.1:${String(nextPort)}`
+    const nextCookie = (await login(nextGate)).get('set-cookie')!.split(';', 1)[0]!
+    const nextOpened = await (await fetch(`${nextGate}/dsh-auth-tunnel/settings`, {
+      headers: { cookie: nextCookie },
+    })).json() as { settings: { revision: number } }
+    const freshSave = fetch(`${nextGate}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie: nextCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: nextOpened.settings.revision,
+        writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+        password: '',
+      }),
+    })
+    try {
+      const outcome = await Promise.race([
+        freshSave,
+        sleep(3000).then(() => undefined),
+      ])
+      expect(outcome?.status).toBe(200)
+    } finally {
+      composition.credentials().resolveBarrier = undefined
+      composition.credentials().resolveBarrierRef = undefined
+      releaseResolve()
+    }
+    await staleTask
+    expect(composition.settings().get(namespace)).toMatchObject({
+      passwordRef: 'DSH_WEB_PASSWORD',
+      sessionTtlHours: 24,
+    })
   })
 
   it('interrupts an adopted port handoff when the tunnel is disabled', { timeout: 60_000 }, async () => {
