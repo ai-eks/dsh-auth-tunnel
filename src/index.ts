@@ -557,6 +557,7 @@ interface RemoteMutationFence {
 class PasswordGate {
   private auth: { passwordRef: string; ttlMs: number; allowRemoteSettings: boolean }
   private remoteWritesEnabled: boolean
+  private remoteMutationGeneration = 0
   private authGeneration = 0
   private readonly credentialGenerations = new Map<string, number>()
   private readonly proxyDrops = new Set<() => void>()
@@ -617,6 +618,8 @@ class PasswordGate {
   /** Refuse remote writes that have not entered persistence yet. */
   revokeRemoteMutations(): void {
     this.remoteWritesEnabled = false
+    this.remoteMutationGeneration += 1
+    this.remoteMutations.tail = this.remoteMutations.committedTail
   }
 
   /** Fence every gate that currently authenticates with a rotated credential. */
@@ -632,9 +635,13 @@ class PasswordGate {
 
   /** Keep authenticated remote writes ordered across concurrent browser tabs. */
   private serializeRemoteMutation<T>(mutation: (enterCommitPhase: () => void) => Promise<T>): Promise<T> {
+    const mutationGeneration = this.remoteMutationGeneration
     let releaseCommitted: (() => void) | undefined
     const enterCommitPhase = (): void => {
       if (releaseCommitted !== undefined) return
+      if (!this.remoteWritesEnabled || mutationGeneration !== this.remoteMutationGeneration) {
+        throw new Error('remote settings authorization changed')
+      }
       let release = (): void => {}
       const pending = new Promise<void>((resolve) => { release = resolve })
       releaseCommitted = release
@@ -1422,8 +1429,13 @@ class AuthTunnelRuntime {
   /** Coalesce scalar settings writes, then reconcile only the latest snapshot. */
   request(config: InternalConfig): void {
     if (this.disposed) return
+    const passwordRefChanged = this.configured !== undefined
+      && this.configured.passwordRef !== config.passwordRef
+    if (!config.enabled || !config.allowRemoteSettings || passwordRefChanged) {
+      for (const gate of this.liveGates) gate.revokeRemoteMutations()
+    }
     if (this.configured !== undefined
-      && (this.configured.passwordRef !== config.passwordRef
+      && (passwordRefChanged
         || this.configured.sessionTtlHours !== config.sessionTtlHours)) {
       for (const gate of this.liveGates) gate.updateAuth(config)
       if (this.active !== undefined) {
@@ -1437,7 +1449,6 @@ class AuthTunnelRuntime {
     }
     if (!config.enabled) {
       this.stagedStartup?.abort()
-      for (const gate of this.liveGates) gate.revokeRemoteMutations()
       const handoff = this.finishHandoff
       if (handoff !== undefined) {
         const finish = (): void => {

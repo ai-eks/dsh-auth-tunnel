@@ -1253,6 +1253,25 @@ describe('password gate over the loopback webserver', () => {
     await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
     expect(await liveFixturePids()).toEqual([])
 
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: true })
+    await waitForStatus(composition, status => status.phase === 'running' && status.running)
+    const resumedBase = await composition.gateBase()
+    const resumedCookie = (await login(resumedBase)).get('set-cookie')!.split(';', 1)[0]!
+    const resumed = await (await fetch(`${resumedBase}/dsh-auth-tunnel/settings`, {
+      headers: { cookie: resumedCookie },
+    })).json() as { settings: { revision: number } }
+    const resumedSave = await fetch(`${resumedBase}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie: resumedCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: resumed.settings.revision,
+        writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+        password: '',
+      }),
+    })
+    expect(resumedSave.status).toBe(200)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).sessionTtlHours).toBe(24)
+
     composition.credentials().resolveBarrier = undefined
     composition.credentials().resolveBarrierRef = undefined
     releaseResolve()
