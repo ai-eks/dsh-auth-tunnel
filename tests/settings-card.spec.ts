@@ -161,6 +161,24 @@ describe('auth-tunnel settings card contract', () => {
     expect(set).toHaveBeenCalledWith({ ref: 'DSH_WEB_PASSWORD', value: '  rotated-password  ' })
   })
 
+  it('rejects an active route change combined with an access password rotation', async () => {
+    const order: string[] = []
+    const { api, mutate, set } = successfulCardApi({ gatePort: 32_345 }, order)
+
+    await expect(commitCardChanges(
+      api,
+      7,
+      [{ field: 'gatePort', op: 'set', value: 32_345 }],
+      quick,
+      { ...quick, gatePort: 32_345 },
+      'replacement-password',
+      {},
+    )).rejects.toThrow('separately from tunnel route changes')
+
+    expect(mutate).not.toHaveBeenCalled()
+    expect(set).not.toHaveBeenCalled()
+  })
+
   it('commits a newly selected password reference before writing its credential', async () => {
     const order: string[] = []
     const { api } = successfulCardApi({ passwordRef: 'NEXT_WEB_PASSWORD' }, order)

@@ -726,6 +726,14 @@ function writeSatisfied(source: { user?: unknown }, write: SettingsWrite): boole
   return Object.hasOwn(user, write.field) && Object.is(user[write.field], write.value)
 }
 
+function tunnelRouteChanged(current: AuthTunnelSettings, target: AuthTunnelSettings): boolean {
+  return current.mode !== target.mode
+    || current.gatePort !== target.gatePort
+    || current.executable !== target.executable
+    || current.tokenRef !== target.tokenRef
+    || current.publicHostname !== target.publicHostname
+}
+
 type CardApi = Pick<IApiClient, 'settings' | 'credentials'>
 type CardCommit = (
   revision: number | undefined,
@@ -776,6 +784,9 @@ export async function commitCardChanges(
 ): Promise<void> {
   if (password !== '' && !fitsLoginForm(password)) {
     throw new RangeError('access password is too long for the login endpoint')
+  }
+  if (password !== '' && current.enabled && tunnelRouteChanged(current, target)) {
+    throw new Error('rotate the access password separately from tunnel route changes')
   }
   if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
     throw new Error('access password credential conflicts with the tunnel token credential')
