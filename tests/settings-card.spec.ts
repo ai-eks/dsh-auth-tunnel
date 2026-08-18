@@ -306,6 +306,35 @@ describe('auth-tunnel settings card contract', () => {
     expect(set).not.toHaveBeenCalled()
   })
 
+  it('rejects a local password that cannot fit through the login endpoint', async () => {
+    const mutate = vi.fn(() => Promise.resolve({
+      rpcId: 'test',
+      result: {
+        ok: true as const,
+        value: {
+          ns: 'auth-tunnel', schema: {}, value: quick, user: {},
+          applies: 'live' as const, secrets: [], revision: 8,
+        },
+      },
+    }))
+    const set = vi.fn(() => Promise.resolve({
+      rpcId: 'test', result: { ok: true as const, value: {} },
+    }))
+
+    await expect(commitCardChanges(
+      { settings: { mutate }, credentials: { describe: vi.fn(), set } } as never,
+      7,
+      [],
+      quick,
+      quick,
+      'x'.repeat(20_000),
+      {},
+    )).rejects.toThrow('too long')
+
+    expect(mutate).not.toHaveBeenCalled()
+    expect(set).not.toHaveBeenCalled()
+  })
+
   it('rolls back local settings when the credential write fails', async () => {
     const mutate = vi.fn()
       .mockResolvedValueOnce({
@@ -514,6 +543,26 @@ describe('auth-tunnel settings card contract', () => {
       await vi.advanceTimersByTimeAsync(1000)
       expect(read).toHaveBeenCalledTimes(2)
       expect(store.getSnapshot()).toMatchObject({ status: 'ready', revision: 3 })
+
+      unsubscribe()
+      store.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not retry an initial forbidden remote settings read', async () => {
+    vi.useFakeTimers()
+    try {
+      const forbidden = Object.assign(new Error('forbidden'), { status: 403 })
+      const read = vi.fn(() => Promise.reject(forbidden))
+      const store = new RemoteSettingsStore({ read, commit: vi.fn() })
+      const unsubscribe = store.subscribe(() => {})
+
+      await store.refresh()
+      expect(store.getSnapshot()).toMatchObject({ status: 'unavailable', writable: false })
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(read).toHaveBeenCalledTimes(1)
 
       unsubscribe()
       store.dispose()

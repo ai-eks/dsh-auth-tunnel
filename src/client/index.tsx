@@ -260,6 +260,7 @@ const RUNTIME_STATUS_PATH = '/dsh-auth-tunnel/status'
 const REMOTE_SETTINGS_PATH = '/dsh-auth-tunnel/settings'
 const REMOTE_LOCALE_PATH = '/dsh-auth-tunnel/locale'
 const REMOTE_SETTINGS_RETRY_MS = 1000
+const MAX_LOGIN_BODY_BYTES = 16 * 1024
 const INITIAL_RUNTIME_STATUS: RuntimeStatusSnapshot = {
   phase: 'unavailable',
   running: false,
@@ -282,6 +283,13 @@ function parseRuntimeStatus(value: unknown): RuntimeStatusSnapshot {
     ...(typeof candidate.publicUrl === 'string' ? { publicUrl: candidate.publicUrl } : {}),
     ...(typeof candidate.message === 'string' ? { message: candidate.message } : {}),
   }
+}
+
+/** Whether a password round-trips through a login form within its body limit. */
+function fitsLoginForm(password: string): boolean {
+  const body = new URLSearchParams({ password }).toString()
+  return new TextEncoder().encode(body).byteLength <= MAX_LOGIN_BODY_BYTES
+    && new URLSearchParams(body).get('password') === password
 }
 
 async function readRuntimeStatus(): Promise<RuntimeStatusSnapshot> {
@@ -588,6 +596,7 @@ export class RemoteSettingsStore {
   private readonly listeners = new Set<() => void>()
   private task: Promise<RemoteSettingsDocument | undefined> | undefined
   private retryTimer: ReturnType<typeof setTimeout> | undefined
+  private retryUnavailableReads = true
   private disposed = false
 
   constructor(private readonly transport: RemoteSettingsTransport = {
@@ -620,6 +629,7 @@ export class RemoteSettingsStore {
     }
     this.task = this.transport.read().then((document) => {
       if (!this.disposed) {
+        this.retryUnavailableReads = true
         this.document = document
         this.publish(document.snapshot)
       }
@@ -627,12 +637,20 @@ export class RemoteSettingsStore {
     }, (error: unknown) => {
       if (!this.disposed) {
         const status = record(error).status
-        if ((status === 401 || status === 403) && this.snapshot.status === 'ready') {
-          const snapshot = { ...this.snapshot, writable: false }
-          if (this.document !== undefined) this.document = { ...this.document, snapshot }
-          this.publish(snapshot)
-        } else if (this.snapshot.status === 'loading') {
-          this.publish({ ...INITIAL_REMOTE_SETTINGS_SNAPSHOT, status: 'unavailable' })
+        if (status === 401 || status === 403) {
+          this.retryUnavailableReads = false
+          if (this.snapshot.status === 'ready') {
+            const snapshot = { ...this.snapshot, writable: false }
+            if (this.document !== undefined) this.document = { ...this.document, snapshot }
+            this.publish(snapshot)
+          } else if (this.snapshot.status === 'loading') {
+            this.publish({ ...INITIAL_REMOTE_SETTINGS_SNAPSHOT, status: 'unavailable' })
+          }
+        } else {
+          this.retryUnavailableReads = true
+          if (this.snapshot.status === 'loading') {
+            this.publish({ ...INITIAL_REMOTE_SETTINGS_SNAPSHOT, status: 'unavailable' })
+          }
         }
       }
       return undefined
@@ -668,7 +686,8 @@ export class RemoteSettingsStore {
   }
 
   private scheduleRetry(): void {
-    if (this.disposed || this.listeners.size === 0 || this.snapshot.status !== 'unavailable') return
+    if (this.disposed || !this.retryUnavailableReads
+      || this.listeners.size === 0 || this.snapshot.status !== 'unavailable') return
     this.retryTimer = setTimeout(() => {
       this.retryTimer = undefined
       void this.refresh()
@@ -755,6 +774,9 @@ export async function commitCardChanges(
   password: string,
   currentUser: unknown,
 ): Promise<void> {
+  if (password !== '' && !fitsLoginForm(password)) {
+    throw new RangeError('access password is too long for the login endpoint')
+  }
   if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
     throw new Error('access password credential conflicts with the tunnel token credential')
   }

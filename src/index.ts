@@ -433,11 +433,21 @@ function parseRemoteSettingsWriteRequest(value: unknown): RemoteSettingsWriteReq
   if (request.password !== undefined && typeof request.password !== 'string') {
     throw new TypeError('password must be a string')
   }
+  if (typeof request.password === 'string' && request.password !== '' && !fitsLoginForm(request.password)) {
+    throw new RangeError('password exceeds the login form limit')
+  }
   return {
     expectedRevision,
     writes,
     password: typeof request.password === 'string' ? request.password : '',
   }
+}
+
+/** Whether a password round-trips through a login form within its body limit. */
+function fitsLoginForm(password: string): boolean {
+  const body = new URLSearchParams({ password }).toString()
+  return Buffer.byteLength(body) <= MAX_LOGIN_BODY_BYTES
+    && new URLSearchParams(body).get('password') === password
 }
 
 function descriptorFor(ctx: Context, namespace: string): { descriptor: SettingsDescriptor; writable: boolean } {
@@ -691,7 +701,8 @@ class PasswordGate {
       this.proxy(req, res)
       return
     }
-    if (!await this.authenticated(req)) {
+    const authGeneration = this.authGeneration
+    if (!await this.authenticated(req) || authGeneration !== this.authGeneration) {
       await this.challenge(req, res)
       return
     }

@@ -758,6 +758,29 @@ describe('password gate over the loopback webserver', () => {
     expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
   })
 
+  it('rejects a remote password that cannot fit through the login endpoint', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [],
+        password: 'x'.repeat(20_000),
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(await composition.credentials().resolve('DSH_WEB_PASSWORD'))
+      .toMatchObject({ value: 's3kret-passw0rd' })
+  })
+
   it('rejects duplicate remote writes without committing their final value', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     const base = await composition.gateBase()
@@ -1103,6 +1126,30 @@ describe('password gate over the loopback webserver', () => {
     expect((await fetch(`${base}/`, { redirect: 'manual', headers: { cookie } })).status).toBe(401)
     const fresh = (await login(base, undefined, 'rotated-passw0rd')).get('set-cookie')!.split(';', 1)[0]!
     expect((await fetch(`${base}/`, { redirect: 'manual', headers: { cookie: fresh } })).status).not.toBe(302)
+  })
+
+  it('rejects an HTTP request when the access credential rotates during authentication', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick()
+    let proxied = 0
+    composition.loaded.webServer.register({
+      kind: 'exact', path: '/api/auth-race', handler: (_req, res) => {
+        proxied += 1
+        res.writeHead(200)
+        res.end()
+      },
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    composition.credentials().afterResolve = (ref) => {
+      if (ref !== 'DSH_WEB_PASSWORD') return
+      composition.credentials().afterResolve = undefined
+      composition.credentials().set(ref, 'rotated-password')
+    }
+
+    const response = await fetch(`${base}/api/auth-race`, { headers: { cookie } })
+
+    expect(response.status).toBe(401)
+    expect(proxied).toBe(0)
   })
 
   it('regenerates hop-by-hop headers on both HTTP proxy legs', { timeout: 60_000 }, async () => {
