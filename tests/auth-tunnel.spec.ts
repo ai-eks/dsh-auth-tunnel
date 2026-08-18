@@ -36,6 +36,7 @@ class StubCredentials extends Service {
     if (this.resolveBarrier !== undefined) await this.resolveBarrier
     if (this.fault) return Promise.reject(new Error('credential store exploded'))
     const hit = this.values.get(request)
+    this.afterResolve?.(request)
     return hit === undefined ? undefined : { value: hit, source: 'test' }
   }
 
@@ -47,6 +48,9 @@ class StubCredentials extends Service {
 
   /** Test knob: release concurrent credential resolutions together. */
   resolveBarrier: Promise<void> | undefined
+
+  /** Test knob: mutate credential state after reading a value but before returning it. */
+  afterResolve: ((ref: string) => void) | undefined
 
   /** Test knob: set or delete one credential. */
   set(ref: string, value: string | undefined): void {
@@ -492,6 +496,28 @@ describe('password gate over the loopback webserver', () => {
     await waitForStatus(composition, status => status.revision > beforeDisable.revision && status.phase === 'running')
     expect((await fetch(`${base}/api/settings.describe`, rpc('settings.describe'))).status).toBe(403)
     expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
+  })
+
+  it('rejects a pending settings descriptor after remote settings are revoked', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const port = Number(new URL(base).port)
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const before = await composition.runtimeStatus()
+    const finish = await beginJsonPost(port, '/api/settings.describe', cookie, {
+      type: 'client-request',
+      rpcId: 'pending-settings-describe',
+      method: 'settings.describe',
+      payload: {},
+    })
+    await sleep(50)
+
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { allowRemoteSettings: false })
+    await waitForStatus(composition, status => status.revision > before.revision)
+
+    const response = await finish()
+    expect(response).toContain(' 403 ')
+    expect(response).not.toContain('auth-tunnel')
   })
 
   it('rotates the long-lived access password verbatim through the plugin endpoint without echoing it', { timeout: 60_000 }, async () => {
@@ -1112,6 +1138,43 @@ describe('upgrade pass-through', () => {
 
     await closed
     expect(socket.destroyed).toBe(true)
+  })
+
+  it('rejects an upgrade when the access credential rotates during authentication', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick()
+    composition.loaded.webServer.registerUpgrade({
+      path: '/events',
+      handler: (_req, socket) => {
+        socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: dsh-echo\r\nConnection: Upgrade\r\n\r\n')
+      },
+    })
+    const base = await composition.gateBase()
+    const port = Number(new URL(base).port)
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    composition.credentials().afterResolve = (ref) => {
+      if (ref !== 'DSH_WEB_PASSWORD') return
+      composition.credentials().afterResolve = undefined
+      composition.credentials().set(ref, 'rotated-password')
+    }
+    const socket = connect(port, '127.0.0.1')
+    socket.on('error', () => {})
+    await once(socket, 'connect')
+    const outcome = new Promise<string>((resolve) => {
+      socket.once('data', (data: Buffer) => { resolve(String(data)) })
+      socket.once('close', () => { resolve('closed') })
+    })
+    socket.write([
+      'GET /events HTTP/1.1',
+      `Host: 127.0.0.1:${String(port)}`,
+      'Connection: Upgrade',
+      'Upgrade: dsh-echo',
+      `Cookie: ${cookie}`,
+      '',
+      '',
+    ].join('\r\n'))
+
+    expect(await outcome).toBe('closed')
+    socket.destroy()
   })
 
   it('closes upgrades on the retained gate after a passwordRef update fails', { timeout: 60_000 }, async () => {
@@ -1969,6 +2032,70 @@ describe('rc7 plugin settings', () => {
     expect(await liveFixturePids()).toEqual([])
     await expect(fetch(`${previousGate}/dsh-auth-tunnel/login`)).rejects.toThrow()
     await expect(fetch(`http://127.0.0.1:${String(nextPort)}/dsh-auth-tunnel/login`)).rejects.toThrow()
+  })
+
+  it('returns a remote disable response before interrupting a port handoff', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const previousGate = await composition.gateBase()
+    const cookie = (await login(previousGate)).get('set-cookie')!.split(';', 1)[0]!
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const nextPort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const before = await composition.runtimeStatus()
+
+    await composition.settings().update(namespace, { gatePort: nextPort })
+    await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'running',
+    )
+    const opened = await (await fetch(`${previousGate}/dsh-auth-tunnel/settings`, {
+      headers: { cookie },
+    })).json() as { settings: { revision: number } }
+
+    const response = await fetch(`${previousGate}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'enabled', op: 'set', value: false }],
+        password: '',
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ settings: { value: { enabled: false } } })
+    await waitForStatus(composition, status => status.phase === 'stopped' && !status.running, 3000)
+    expect(await liveFixturePids()).toEqual([])
+  })
+
+  it('revokes remote settings on every gate retained during a port handoff', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const previousGate = await composition.gateBase()
+    const cookie = (await login(previousGate)).get('set-cookie')!.split(';', 1)[0]!
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const nextPort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const before = await composition.runtimeStatus()
+
+    await composition.settings().update(namespace, { gatePort: nextPort })
+    await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'running',
+    )
+    expect(await liveFixturePids()).toHaveLength(2)
+
+    await composition.settings().update(namespace, { allowRemoteSettings: false })
+
+    expect((await fetch(`${previousGate}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
+    expect((await fetch(`http://127.0.0.1:${String(nextPort)}/dsh-auth-tunnel/settings`, {
+      headers: { cookie },
+    })).status).toBe(403)
   })
 
   it('keeps the old tunnel when a live process rebuild fails', { timeout: 60_000 }, async () => {
