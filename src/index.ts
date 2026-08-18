@@ -33,6 +33,8 @@ export type TunnelMode = 'quick' | 'token'
 export interface Config {
   /** Keep the settings surface loaded while deciding whether the public tunnel itself runs. */
   enabled: boolean
+  /** Allow authenticated public pages to read and update Host settings. */
+  allowRemoteSettings: boolean
   /**
    * Credential reference resolving to the shared access password, resolved
    * through the composition's credentials service. Configuration carries the
@@ -64,6 +66,7 @@ export interface Config {
 
 interface InternalConfig {
   enabled: boolean
+  allowRemoteSettings: boolean
   passwordRef: string
   sessionTtlHours: number
   mode: TunnelMode
@@ -87,6 +90,7 @@ const PUBLIC_HOSTNAME_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z
 
 export const Config: z<InternalConfig> = z.object({
   enabled: z.boolean().default(true),
+  allowRemoteSettings: z.boolean().default(false),
   passwordRef: z.string().min(1).role('credential-ref').default('DSH_WEB_PASSWORD'),
   sessionTtlHours: z.number().min(0.01).default(720),
   mode: z.union(['quick', 'token']).default('quick'),
@@ -147,6 +151,7 @@ const LOGOUT_PATH = `${AUTH_PREFIX}/logout`
 export const AUTH_TUNNEL_STATUS_PATH = `${AUTH_PREFIX}/status`
 const PUBLIC_MANIFEST_PATH = '/manifest.webmanifest'
 const AUTH_COOKIE = 'dsh_auth_tunnel'
+const SETTINGS_ACCESS_META = '<meta name="dsh-settings-access" content="host">'
 const MAX_LOGIN_BODY_BYTES = 16 * 1024
 const OUTPUT_TAIL_CHARS = 8192
 const KILL_GRACE_MS = 2000
@@ -163,6 +168,32 @@ const HOP_BY_HOP_HEADERS = new Set([
   'transfer-encoding',
   'upgrade',
 ])
+const REMOTE_SETTINGS_METHODS = new Set([
+  'settings.describe',
+  'settings.openDocument',
+  'settings.update',
+  'settings.replace',
+  'settings.mutate',
+  'credentials.describe',
+  'credentials.set',
+  'credentials.unset',
+  'llm.discoverModels',
+])
+
+/** Whether this API request belongs to the Host configuration plane. */
+function isRemoteSettingsRequest(url: URL): boolean {
+  if (!url.pathname.startsWith('/api/')) return false
+  return REMOTE_SETTINGS_METHODS.has(url.pathname.slice('/api/'.length))
+}
+
+/** Mark an index response whose authenticated intermediary serves Host settings. */
+export function injectSettingsAccessMeta(html: string): string {
+  if (html.includes(SETTINGS_ACCESS_META)) return html
+  const head = html.indexOf('<head>')
+  return head === -1
+    ? `${SETTINGS_ACCESS_META}${html}`
+    : `${html.slice(0, head + '<head>'.length)}${SETTINGS_ACCESS_META}${html.slice(head + '<head>'.length)}`
+}
 
 /** The model-facing prompt section text for one live public URL.
  * @param publicUrl - the discovered quick-tunnel URL or the configured hostname URL.
@@ -351,26 +382,28 @@ async function readForm(req: IncomingMessage, res: ServerResponse): Promise<URLS
  * cloudflared, never a browser.
  */
 class PasswordGate {
-  private auth: { passwordRef: string; ttlMs: number }
+  private auth: { passwordRef: string; ttlMs: number; allowRemoteSettings: boolean }
   private readonly upstreamPort: number
 
   constructor(
     private readonly ctx: Context,
-    config: { passwordRef: string; sessionTtlHours: number },
+    config: { passwordRef: string; sessionTtlHours: number; allowRemoteSettings: boolean },
     upstreamPort: number,
   ) {
     this.auth = {
       passwordRef: config.passwordRef,
       ttlMs: config.sessionTtlHours * 3600 * 1000,
+      allowRemoteSettings: config.allowRemoteSettings,
     }
     this.upstreamPort = upstreamPort
   }
 
   /** Atomically replace the authentication policy used by subsequent requests. */
-  updateAuth(config: { passwordRef: string; sessionTtlHours: number }): void {
+  updateAuth(config: { passwordRef: string; sessionTtlHours: number; allowRemoteSettings: boolean }): void {
     this.auth = {
       passwordRef: config.passwordRef,
       ttlMs: config.sessionTtlHours * 3600 * 1000,
+      allowRemoteSettings: config.allowRemoteSettings,
     }
   }
 
@@ -440,6 +473,11 @@ class PasswordGate {
     }
     if (!await this.authenticated(req)) {
       await this.challenge(req, res)
+      return
+    }
+    if (isRemoteSettingsRequest(url) && !this.auth.allowRemoteSettings) {
+      res.writeHead(403, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+      res.end('{"error":"remote settings disabled"}')
       return
     }
     this.proxy(req, res)
@@ -725,6 +763,11 @@ class AuthTunnelRuntime {
 
   getStatus(): AuthTunnelRuntimeStatus {
     return this.status
+  }
+
+  /** Whether the currently served public page may use Host settings. */
+  allowsRemoteSettings(): boolean {
+    return this.active?.alive === true && this.active.config.allowRemoteSettings
   }
 
   /** Attach an optional shell registry while it is present in the composition. */
@@ -1023,6 +1066,10 @@ class AuthTunnelRuntime {
 export async function apply(ctx: Context, config: Config): Promise<void> {
   const runtime = new AuthTunnelRuntime(ctx)
   ctx.effect(() => async () => { await runtime.dispose() }, 'auth-tunnel: runtime')
+  ctx.effect(
+    () => ctx.webServer.tapIndex(html => runtime.allowsRemoteSettings() ? injectSettingsAccessMeta(html) : html),
+    'auth-tunnel: authenticated settings marker',
+  )
   ctx.webServer.register({
     kind: 'exact',
     path: AUTH_TUNNEL_STATUS_PATH,

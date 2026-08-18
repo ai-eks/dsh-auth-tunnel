@@ -20,6 +20,7 @@ const LOCALE_NAMESPACE = 'settings.auth-tunnel'
 type LocaleKey =
   | 'title' | 'description' | 'unsaved' | 'readOnly' | 'live'
   | 'enabled' | 'enabledHint' | 'enabledOn' | 'enabledOff'
+  | 'allowRemoteSettings' | 'allowRemoteSettingsHint'
   | 'status' | 'statusRunning' | 'statusStopped' | 'statusApplying'
   | 'statusErrorRunning' | 'statusErrorStopped' | 'statusUnavailable' | 'publicUrl'
   | 'accessSection' | 'accessSectionHint' | 'tunnelSection' | 'advancedSection' | 'advancedSectionHint'
@@ -53,6 +54,8 @@ const zh: Record<LocaleKey, string> = {
   enabledHint: '保存后立即启动或停止密码门和 cloudflared，设置卡片会继续保留。',
   enabledOn: '开启',
   enabledOff: '关闭',
+  allowRemoteSettings: '允许远程页面修改设置',
+  allowRemoteSettingsHint: '仅对通过访问密码登录的公网页面生效。开启后刷新公网页面，即可读取并保存插件配置、语言和其他 Host 设置；默认关闭。',
   status: '运行状态',
   statusRunning: '运行中',
   statusStopped: '已停止',
@@ -116,6 +119,8 @@ const en: Record<LocaleKey, string> = {
   enabledHint: 'Saving starts or stops the password gate and cloudflared immediately while keeping this card available.',
   enabledOn: 'On',
   enabledOff: 'Off',
+  allowRemoteSettings: 'Allow remote pages to change settings',
+  allowRemoteSettingsHint: 'Applies only to public pages signed in with the access password. After enabling it, refresh the public page to read and save plugin configuration, language, and other Host settings. Disabled by default.',
   status: 'Runtime status',
   statusRunning: 'Running',
   statusStopped: 'Stopped',
@@ -174,6 +179,7 @@ export type TunnelMode = 'quick' | 'token'
 /** Settings values mirrored from the Host schema. Secrets remain credential references. */
 export interface AuthTunnelSettings {
   enabled: boolean
+  allowRemoteSettings: boolean
   passwordRef: string
   sessionTtlHours: number
   mode: TunnelMode
@@ -212,12 +218,13 @@ export type SettingsWrite =
   | { field: FieldKey; op: 'unset' }
 
 const FIELD_KEYS: readonly FieldKey[] = [
-  'enabled', 'passwordRef', 'sessionTtlHours', 'mode', 'tokenRef', 'publicHostname',
+  'enabled', 'allowRemoteSettings', 'passwordRef', 'sessionTtlHours', 'mode', 'tokenRef', 'publicHostname',
   'gatePort', 'executable', 'startupTimeoutMs',
 ]
 
 const DEFAULT_VALUES: Record<FieldKey, string | number | boolean | undefined> = {
   enabled: true,
+  allowRemoteSettings: false,
   passwordRef: 'DSH_WEB_PASSWORD',
   sessionTtlHours: 720,
   mode: 'quick',
@@ -415,6 +422,7 @@ function parseDraft(draft: Draft): AuthTunnelSettings {
   const publicHostname = draft.values.publicHostname.trim()
   return {
     enabled: draft.values.enabled === 'true',
+    allowRemoteSettings: draft.values.allowRemoteSettings === 'true',
     passwordRef: draft.values.passwordRef.trim(),
     sessionTtlHours: numberDraft(draft.values.sessionTtlHours),
     mode: draft.values.mode as TunnelMode,
@@ -754,6 +762,28 @@ function SettingsForm(props: FormProps) {
         <div style={styles.sectionHead}>
           <h3 id="auth-tunnel-access-section" style={styles.sectionTitle}>{props.t('accessSection')}</h3>
           <p style={styles.sectionHint}>{props.t('accessSectionHint')}</p>
+        </div>
+        <div style={styles.field}>
+          <div style={styles.fieldHead}>
+            <label style={styles.label} htmlFor="auth-tunnel-allow-remote-settings">{props.t('allowRemoteSettings')}</label>
+            {overridden('allowRemoteSettings') ? <span style={styles.badge}>{props.t('overridden')}</span> : null}
+            {overridden('allowRemoteSettings')
+              ? <button type="button" style={styles.reset} disabled={disabled} onClick={() => { reset('allowRemoteSettings') }}>{props.t('reset')}</button>
+              : null}
+          </div>
+          <label style={styles.toggle}>
+            <input
+              id="auth-tunnel-allow-remote-settings"
+              type="checkbox"
+              role="switch"
+              style={styles.checkbox}
+              checked={target.allowRemoteSettings}
+              disabled={disabled}
+              onChange={(event) => { edit('allowRemoteSettings', String(event.target.checked)) }}
+            />
+            <span>{props.t(target.allowRemoteSettings ? 'enabledOn' : 'enabledOff')}</span>
+          </label>
+          <p style={styles.hint}>{props.t('allowRemoteSettingsHint')}</p>
         </div>
         {field('passwordRef', 'passwordRef', 'passwordRefHint')}
         <div style={styles.field}>

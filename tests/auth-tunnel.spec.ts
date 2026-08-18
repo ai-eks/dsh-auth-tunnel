@@ -352,6 +352,46 @@ async function waitForStatus(
 }
 
 describe('password gate over the loopback webserver', () => {
+  it('keeps Host settings local until the live remote-settings switch is enabled', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick()
+    let settingsRequests = 0
+    composition.loaded.webServer.register({
+      kind: 'exact', path: '/api/settings.describe', handler: (_req, res) => {
+        settingsRequests += 1
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end('{"ok":true}')
+      },
+    })
+    composition.loaded.webServer.registerFallback((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      res.end(composition.loaded.webServer.applyIndexTaps('<html><head></head><body>Harness</body></html>'))
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+
+    const denied = await fetch(`${base}/api/settings.describe`, { method: 'POST', headers: { cookie } })
+    expect(denied.status).toBe(403)
+    expect(await denied.json()).toEqual({ error: 'remote settings disabled' })
+    expect(settingsRequests).toBe(0)
+    expect(await (await fetch(`${base}/`, { headers: { cookie } })).text())
+      .not.toContain('<meta name="dsh-settings-access" content="host">')
+
+    const beforeEnable = await composition.runtimeStatus()
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { allowRemoteSettings: true })
+    await waitForStatus(composition, status => status.revision > beforeEnable.revision && status.phase === 'running')
+
+    const allowed = await fetch(`${base}/api/settings.describe`, { method: 'POST', headers: { cookie } })
+    expect(allowed.status).toBe(200)
+    expect(settingsRequests).toBe(1)
+    expect(await (await fetch(`${base}/`, { headers: { cookie } })).text())
+      .toContain('<meta name="dsh-settings-access" content="host">')
+
+    const beforeDisable = await composition.runtimeStatus()
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { allowRemoteSettings: false })
+    await waitForStatus(composition, status => status.revision > beforeDisable.revision && status.phase === 'running')
+    expect((await fetch(`${base}/api/settings.describe`, { method: 'POST', headers: { cookie } })).status).toBe(403)
+  })
+
   it('serves the public Web App Manifest without opening other unauthenticated paths', { timeout: 60_000 }, async () => {
     const { loaded, gateBase } = await bootQuick()
     loaded.webServer.register({
@@ -1057,7 +1097,7 @@ describe('rc7 plugin settings', () => {
     expect(descriptor).toMatchObject({
       ns: namespace,
       applies: 'live',
-      value: { enabled: false, mode: 'token' },
+      value: { enabled: false, allowRemoteSettings: false, mode: 'token' },
     })
     expect(await composition.runtimeStatus()).toMatchObject({ phase: 'stopped', running: false })
     expect(consoleSpy).not.toHaveBeenCalled()
