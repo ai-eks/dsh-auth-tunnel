@@ -154,6 +154,7 @@ describe('auth-tunnel settings card contract', () => {
       quick,
       { ...quick, sessionTtlHours: 24 },
       '  rotated-password  ',
+      {},
     )
 
     expect(order).toEqual(['settings', 'credential'])
@@ -171,6 +172,7 @@ describe('auth-tunnel settings card contract', () => {
       quick,
       { ...quick, passwordRef: 'NEXT_WEB_PASSWORD' },
       'next-password',
+      {},
     )
 
     expect(order).toEqual(['credential-check', 'settings', 'credential'])
@@ -197,6 +199,7 @@ describe('auth-tunnel settings card contract', () => {
       quick,
       { ...quick, passwordRef: 'NEXT_WEB_PASSWORD' },
       'next-password',
+      {},
     )).rejects.toThrow('settings revision changed')
 
     expect(set).not.toHaveBeenCalled()
@@ -213,6 +216,7 @@ describe('auth-tunnel settings card contract', () => {
       { ...quick, enabled: false },
       quick,
       'first-password',
+      {},
     )
 
     expect(order).toEqual(['settings', 'credential'])
@@ -230,9 +234,30 @@ describe('auth-tunnel settings card contract', () => {
       current,
       { ...current, passwordRef: 'DSH_TUNNEL_TOKEN' },
       '',
+      {},
     )).rejects.toThrow('conflicts')
 
     expect(describe).not.toHaveBeenCalled()
+    expect(set).not.toHaveBeenCalled()
+    expect(mutate).not.toHaveBeenCalled()
+  })
+
+  it('rejects a passwordless local passwordRef change targeting an unconfigured credential', async () => {
+    const order: string[] = []
+    const { api, describe, mutate, set } = successfulCardApi({ passwordRef: 'MISSING_PASSWORD' }, order)
+
+    await expect(commitCardChanges(
+      api,
+      7,
+      [{ field: 'passwordRef', op: 'set', value: 'MISSING_PASSWORD' }],
+      quick,
+      { ...quick, passwordRef: 'MISSING_PASSWORD' },
+      '',
+      {},
+    )).rejects.toThrow('not configured')
+
+    expect(order).toEqual(['credential-check'])
+    expect(describe).toHaveBeenCalledWith({ refs: ['MISSING_PASSWORD'] })
     expect(set).not.toHaveBeenCalled()
     expect(mutate).not.toHaveBeenCalled()
   })
@@ -248,6 +273,7 @@ describe('auth-tunnel settings card contract', () => {
       quick,
       { ...quick, passwordRef: 'OTHER_HOST_SECRET' },
       'replacement',
+      {},
     )).rejects.toThrow('already exists')
 
     expect(order).toEqual(['credential-check'])
@@ -269,6 +295,7 @@ describe('auth-tunnel settings card contract', () => {
       quick,
       quick,
       'replacement',
+      {},
     )).rejects.toThrow('settings revision changed')
 
     expect(mutate).toHaveBeenCalledWith({
@@ -277,6 +304,51 @@ describe('auth-tunnel settings card contract', () => {
       ops: [],
     })
     expect(set).not.toHaveBeenCalled()
+  })
+
+  it('rolls back local settings when the credential write fails', async () => {
+    const mutate = vi.fn()
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: {
+          ok: true as const,
+          value: {
+            ns: 'auth-tunnel', schema: {}, value: { ...quick, sessionTtlHours: 24 },
+            user: { sessionTtlHours: 24 }, applies: 'live' as const, secrets: [], revision: 8,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: {
+          ok: true as const,
+          value: {
+            ns: 'auth-tunnel', schema: {}, value: { ...quick, sessionTtlHours: 48 },
+            user: { sessionTtlHours: 48 }, applies: 'live' as const, secrets: [], revision: 9,
+          },
+        },
+      })
+    const set = vi.fn(() => Promise.resolve({
+      rpcId: 'test',
+      result: { ok: false as const, error: { code: 'credential-rejected', message: 'read only' } },
+    }))
+
+    await expect(commitCardChanges(
+      { settings: { mutate }, credentials: { describe: vi.fn(), set } } as never,
+      7,
+      [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+      { ...quick, sessionTtlHours: 48 },
+      { ...quick, sessionTtlHours: 24 },
+      'replacement',
+      { sessionTtlHours: 48 },
+    )).rejects.toThrow('read only')
+
+    expect(mutate).toHaveBeenCalledTimes(2)
+    expect(mutate).toHaveBeenNthCalledWith(2, {
+      ns: 'auth-tunnel',
+      expectedRevision: 8,
+      ops: [{ op: 'set', path: ['sessionTtlHours'], value: 48 }],
+    })
   })
 
   it('registers its browser card under the Host settings namespace', () => {

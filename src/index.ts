@@ -891,8 +891,8 @@ class PasswordGate {
         const settings = this.ctx.get('settings')
         if (settings === undefined) throw new Error('settings service is unavailable')
         await settings.update(LOCALE_SETTINGS_NAMESPACE, { preference: locale })
+        await writeJsonComplete(res, 200, { locale })
       })
-      writeJson(res, 200, { locale })
     } catch (error) {
       this.ctx.logger.warn(`auth-tunnel: remote locale write rejected: ${error instanceof Error ? error.message : String(error)}`)
       writeJson(res, 409, { error: 'language was not saved' })

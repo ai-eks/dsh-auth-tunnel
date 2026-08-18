@@ -10,6 +10,7 @@
 
 import { chmod, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises'
 import { once } from 'node:events'
+import { ServerResponse } from 'node:http'
 import { connect, connect as netConnect, createServer as createNetServer, type AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -863,6 +864,49 @@ describe('password gate over the loopback webserver', () => {
     expect(await response.json()).toMatchObject({ settings: { value: { enabled: false } } })
     await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
     expect(await liveFixturePids()).toEqual([])
+  })
+
+  it('returns the complete locale response before a local disable stops the tunnel', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    composition.settings().register(settingsNamespace('locale'), z.object({
+      preference: z.union(['zh', 'en']).required(false),
+    }))
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const originalEnd = ServerResponse.prototype.end
+    let releaseResponse = (): void => {}
+    let markResponseHeld = (): void => {}
+    const responseHeld = new Promise<void>((resolve) => { markResponseHeld = resolve })
+    let held = false
+    vi.spyOn(ServerResponse.prototype, 'end').mockImplementation((function (
+      this: ServerResponse,
+      ...args: unknown[]
+    ): ServerResponse {
+      if (!held && this.req.url === '/dsh-auth-tunnel/locale') {
+        held = true
+        releaseResponse = () => { Reflect.apply(originalEnd, this, args) }
+        markResponseHeld()
+        return this
+      }
+      return Reflect.apply(originalEnd, this, args) as ServerResponse
+    }) as typeof ServerResponse.prototype.end)
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/locale`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ locale: 'en' }),
+    }).catch(() => undefined)
+    await responseHeld
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
+    await sleep(250)
+    const beforeRelease = await composition.runtimeStatus()
+    releaseResponse()
+    const response = await responseTask
+
+    expect(beforeRelease).toMatchObject({ phase: 'applying', running: true })
+    expect(response?.status).toBe(200)
+    await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
+    expect(composition.settings().get(settingsNamespace('locale'))).toEqual({ preference: 'en' })
   })
 
   it('releases the remote mutation fence when the writer disconnects before the response', { timeout: 60_000 }, async () => {

@@ -714,6 +714,7 @@ type CardCommit = (
   current: AuthTunnelSettings,
   target: AuthTunnelSettings,
   password: string,
+  currentUser: unknown,
 ) => Promise<void>
 
 /** Write a secret in the credential plane; it never enters settings YAML or a response payload. */
@@ -752,15 +753,19 @@ export async function commitCardChanges(
   current: AuthTunnelSettings,
   target: AuthTunnelSettings,
   password: string,
+  currentUser: unknown,
 ): Promise<void> {
   if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
     throw new Error('access password credential conflicts with the tunnel token credential')
   }
-  if (password !== '') {
-    if (target.passwordRef !== current.passwordRef) {
-      const response = await api.credentials.describe({ refs: [target.passwordRef] })
-      if (!response.result.ok) throw new Error(response.result.error.message)
-      if (response.result.value.credentials[target.passwordRef]?.configured !== false) {
+  if (target.passwordRef !== current.passwordRef) {
+    const response = await api.credentials.describe({ refs: [target.passwordRef] })
+    if (!response.result.ok) throw new Error(response.result.error.message)
+    const configured = response.result.value.credentials[target.passwordRef]?.configured
+    if (password === '') {
+      if (configured !== true) throw new Error('access password credential is not configured')
+    } else {
+      if (configured !== false) {
         throw new Error('access password credential already exists')
       }
     }
@@ -771,16 +776,39 @@ export async function commitCardChanges(
       throw new Error('settings password reference changed')
     }
   }
-  // Commit the revision-fenced settings first. If the new credential is not
-  // ready when live reconciliation observes them, credentials/updated retries
-  // the retained configuration after the following write succeeds.
+  // Commit the revision-fenced settings first so live reconciliation can see
+  // the selected reference. A failed credential write restores the exact
+  // user-layer values that this save replaced.
+  let committed: SettingsNamespaceView | undefined
+  let rollbackWrites: SettingsWrite[] | undefined
   if (writes.length !== 0) {
-    const committed = await commitSettingsWrites(api, revision, writes)
-    if (writes.some(write => !writeSatisfied(committed, write))) {
+    const openedUser = record(currentUser)
+    rollbackWrites = writes.map((write): SettingsWrite => Object.hasOwn(openedUser, write.field)
+      ? {
+          field: write.field,
+          op: 'set',
+          value: openedUser[write.field] as Exclude<AuthTunnelSettings[FieldKey], undefined>,
+        }
+      : { field: write.field, op: 'unset' })
+    const result = await commitSettingsWrites(api, revision, writes)
+    if (writes.some(write => !writeSatisfied(result, write))) {
       throw new Error('settings write was not committed')
     }
+    committed = result
   }
-  if (password !== '') await commitCredentialWrite(api, target.passwordRef, password)
+  if (password !== '') {
+    try {
+      await commitCredentialWrite(api, target.passwordRef, password)
+    } catch (error) {
+      if (committed !== undefined && rollbackWrites !== undefined) {
+        const restored = await commitSettingsWrites(api, committed.revision, rollbackWrites)
+        if (rollbackWrites.some(write => !writeSatisfied(restored, write))) {
+          throw new Error('settings rollback was not committed')
+        }
+      }
+      throw error
+    }
+  }
 }
 
 const styles: Record<string, CSSProperties> = {
@@ -1168,6 +1196,7 @@ function AuthTunnelCard(props: CardProps & {
         current,
         target,
         password,
+        snapshot.user,
       )
       succeeded = true
     } catch {
@@ -1306,7 +1335,7 @@ export function apply(ctx: ClientContext): void {
   } else {
     const remote = new RemoteSettingsStore()
     scope = remote
-    commit = (revision, writes, _current, _target, password) => revision === undefined
+    commit = (revision, writes, _current, _target, password, _currentUser) => revision === undefined
       ? Promise.reject(new Error('settings revision is unavailable'))
       : remote.commit({ expectedRevision: revision, writes, password })
     ctx.effect(() => installRemoteLocalePersistence(ctx, remote), 'auth-tunnel: remote locale persistence')
