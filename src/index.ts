@@ -556,6 +556,8 @@ interface RemoteMutationFence {
 class PasswordGate {
   private auth: { passwordRef: string; ttlMs: number; allowRemoteSettings: boolean }
   private authGeneration = 0
+  private readonly credentialGenerations = new Map<string, number>()
+  private readonly proxyDrops = new Set<() => void>()
   private readonly upgradeDrops = new Set<() => void>()
   private readonly upgradeSockets = new Set<Duplex>()
 
@@ -575,7 +577,7 @@ class PasswordGate {
 
   /** Atomically replace the authentication policy used by subsequent requests. */
   updateAuth(config: { passwordRef: string; sessionTtlHours: number; allowRemoteSettings: boolean }): void {
-    if (config.passwordRef !== this.auth.passwordRef) this.revokeAuthenticatedUpgrades()
+    if (config.passwordRef !== this.auth.passwordRef) this.revokeAuthenticatedConnections()
     this.auth = {
       passwordRef: config.passwordRef,
       ttlMs: config.sessionTtlHours * 3600 * 1000,
@@ -583,9 +585,10 @@ class PasswordGate {
     }
   }
 
-  /** Drop upgraded connections authenticated with the previous credential value. */
-  revokeAuthenticatedUpgrades(): void {
+  /** Drop connections authenticated with the previous credential value. */
+  private revokeAuthenticatedConnections(): void {
     this.authGeneration += 1
+    for (const drop of [...this.proxyDrops]) drop()
     this.closeUpgradedConnections()
   }
 
@@ -602,7 +605,13 @@ class PasswordGate {
 
   /** Fence every gate that currently authenticates with a rotated credential. */
   credentialUpdated(ref: string): void {
-    if (this.auth.passwordRef === ref) this.revokeAuthenticatedUpgrades()
+    this.credentialGenerations.set(ref, (this.credentialGenerations.get(ref) ?? 0) + 1)
+    if (this.auth.passwordRef === ref) this.revokeAuthenticatedConnections()
+  }
+
+  /** Snapshot one credential's update generation for an optimistic write fence. */
+  private credentialGeneration(ref: string): number {
+    return this.credentialGenerations.get(ref) ?? 0
   }
 
   /** Keep authenticated remote writes ordered across concurrent browser tabs. */
@@ -698,7 +707,7 @@ class PasswordGate {
       return
     }
     if (isPublicManifestRequest(url, req)) {
-      this.proxy(req, res)
+      this.proxy(req, res, false)
       return
     }
     const authGeneration = this.authGeneration
@@ -728,7 +737,7 @@ class PasswordGate {
       writeJson(res, 403, { error: 'remote configuration method unavailable' })
       return
     }
-    this.proxy(req, res)
+    this.proxy(req, res, true)
   }
 
   /** Serve the core plugin-directory read with only this plugin's namespace. */
@@ -819,9 +828,10 @@ class PasswordGate {
           if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
             throw new Error('access password credential conflicts with the tunnel token credential')
           }
+          const credentialGeneration = this.credentialGeneration(target.passwordRef)
           if (target.passwordRef !== current.passwordRef) {
             const targetCredential = await this.ctx.credentials.resolve(credentialRef(target.passwordRef))
-            if (password === '' && targetCredential === undefined) {
+            if (password === '' && (targetCredential === undefined || targetCredential.value === '')) {
               throw new Error('access password credential is not configured')
             }
             if (password !== '' && targetCredential !== undefined) {
@@ -872,6 +882,9 @@ class PasswordGate {
               const latest = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
               if (!latest.writable) throw new Error('settings provider is read-only')
               if (latest.descriptor.revision !== credentialRevision) throw new Error('settings revision changed')
+              if (this.credentialGeneration(target.passwordRef) !== credentialGeneration) {
+                throw new Error('access password credential changed')
+              }
               await this.ctx.credentials.set(credentialRef(target.passwordRef), password)
             } catch (error) {
               await rollbackSettings?.()
@@ -968,7 +981,7 @@ class PasswordGate {
   }
 
   /** Forward one accepted HTTP request to the loopback webserver with the Host rewritten. */
-  private proxy(req: IncomingMessage, res: ServerResponse): void {
+  private proxy(req: IncomingMessage, res: ServerResponse, authenticated: boolean): void {
     const headers = withoutHopByHopHeaders(upstreamHeaders(req, this.upstreamPort))
     /* v8 ignore next -- node:http always sets url on server requests */
     const outgoing = httpRequest({
@@ -985,7 +998,15 @@ class PasswordGate {
     const cancelUpstream = (): void => {
       if (!res.writableFinished) outgoing.destroy()
     }
+    const revoke = (): void => {
+      req.unpipe(outgoing)
+      outgoing.destroy()
+      if (!res.destroyed) res.destroy()
+      if (!req.destroyed) req.destroy()
+    }
+    if (authenticated) this.proxyDrops.add(revoke)
     res.once('close', cancelUpstream)
+    res.once('close', () => { this.proxyDrops.delete(revoke) })
     outgoing.once('close', () => { res.off('close', cancelUpstream) })
     outgoing.on('error', (error: Error) => {
       if (res.destroyed) return

@@ -726,6 +726,40 @@ describe('password gate over the loopback webserver', () => {
       .toMatchObject({ value: 's3kret-passw0rd' })
   })
 
+  it('rolls back remote settings when the access credential changes during persistence', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    let releasePersist = (): void => {}
+    composition.settings().persistBarrier = new Promise<void>((resolve) => { releasePersist = resolve })
+    let markPersistStarted = (): void => {}
+    const persistStarted = new Promise<void>((resolve) => { markPersistStarted = resolve })
+    composition.settings().persistStarted = markPersistStarted
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+        password: 'stale-remote-password',
+      }),
+    })
+    await persistStarted
+    composition.credentials().set('DSH_WEB_PASSWORD', 'local-admin-password')
+    composition.settings().persistStarted = undefined
+    composition.settings().persistBarrier = undefined
+    releasePersist()
+
+    expect((await responseTask).status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).sessionTtlHours).toBe(720)
+    expect(await composition.credentials().resolve('DSH_WEB_PASSWORD'))
+      .toMatchObject({ value: 'local-admin-password' })
+  })
+
   it('rejects a remote save that rotates the active password and tunnel route together', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     const base = await composition.gateBase()
@@ -789,6 +823,30 @@ describe('password gate over the loopback webserver', () => {
       body: JSON.stringify({
         expectedRevision: opened.settings.revision,
         writes: [{ field: 'passwordRef', op: 'set', value: 'MISSING_PASSWORD' }],
+        password: '',
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
+  })
+
+  it('rejects a passwordless switch to an empty resolved access credential', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true }, {
+      seeds: { EMPTY_PASSWORD: '' },
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'passwordRef', op: 'set', value: 'EMPTY_PASSWORD' }],
         password: '',
       }),
     })
@@ -1266,6 +1324,51 @@ describe('password gate over the loopback webserver', () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     vi.setSystemTime(Date.now() + 31 * 24 * 3600 * 1000)
     expect((await fetch(`${base}/`, { redirect: 'manual', headers: { cookie } })).status).toBe(401)
+  })
+
+  it('cancels an authenticated proxied HTTP request when the access credential rotates', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick()
+    let markStarted = (): void => {}
+    const started = new Promise<void>((resolve) => { markStarted = resolve })
+    let markCancelled = (): void => {}
+    const cancelled = new Promise<void>((resolve) => { markCancelled = resolve })
+    let executed = false
+    composition.loaded.webServer.register({
+      kind: 'exact', path: '/slow-action', handler: (req, res) => {
+        markStarted()
+        req.once('aborted', markCancelled)
+        req.once('end', () => {
+          executed = true
+          res.end('completed')
+        })
+      },
+    })
+    const base = await composition.gateBase()
+    const port = Number(new URL(base).port)
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const body = 'execute-after-revocation'
+    const socket = connect(port, '127.0.0.1')
+    socket.on('error', () => {})
+    await once(socket, 'connect')
+    const closed = once(socket, 'close').then(() => 'closed')
+    socket.write([
+      'POST /slow-action HTTP/1.1',
+      `Host: 127.0.0.1:${String(port)}`,
+      `Content-Length: ${String(Buffer.byteLength(body))}`,
+      `Cookie: ${cookie}`,
+      '',
+      body.slice(0, 1),
+    ].join('\r\n'))
+    await started
+
+    composition.credentials().set('DSH_WEB_PASSWORD', 'rotated-password')
+
+    expect(await Promise.race([closed, sleep(3000).then(() => 'timeout')])).toBe('closed')
+    await Promise.race([
+      cancelled,
+      sleep(3000).then(() => { throw new Error('upstream request survived the credential rotation') }),
+    ])
+    expect(executed).toBe(false)
   })
 
   it('answers wrong content types, oversized bodies, and deleted credentials inside the login handshake', { timeout: 60_000 }, async () => {
