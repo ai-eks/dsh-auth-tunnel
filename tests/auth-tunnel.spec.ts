@@ -33,6 +33,7 @@ class StubCredentials extends Service {
     if (this.resolveDelayMs > 0) {
       await new Promise<void>(resolve => { setTimeout(resolve, this.resolveDelayMs) })
     }
+    if (this.resolveBarrier !== undefined) await this.resolveBarrier
     if (this.fault) return Promise.reject(new Error('credential store exploded'))
     const hit = this.values.get(request)
     return hit === undefined ? undefined : { value: hit, source: 'test' }
@@ -43,6 +44,9 @@ class StubCredentials extends Service {
 
   /** Test knob: hold credential resolution before startup creates a controller. */
   resolveDelayMs = 0
+
+  /** Test knob: release concurrent credential resolutions together. */
+  resolveBarrier: Promise<void> | undefined
 
   /** Test knob: set or delete one credential. */
   set(ref: string, value: string | undefined): void {
@@ -1806,6 +1810,108 @@ describe('rc7 plugin settings', () => {
     expect((await fetch(`${previousGate}/dsh-auth-tunnel/status`, { headers: { cookie } })).status).toBe(200)
     await sleep(700)
     await expect(fetch(`${previousGate}/dsh-auth-tunnel/status`, { headers: { cookie } })).rejects.toThrow()
+  })
+
+  it('revokes the old credential on the previous gate during a port handoff', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true }, {
+      seeds: { ALT_WEB_PASSWORD: 'alternate-password' },
+    })
+    const previousGate = await composition.gateBase()
+    const cookie = (await login(previousGate)).get('set-cookie')!.split(';', 1)[0]!
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const nextPort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const before = await composition.runtimeStatus()
+
+    await composition.settings().update(namespace, {
+      gatePort: nextPort,
+      passwordRef: 'ALT_WEB_PASSWORD',
+    })
+    await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'running',
+    )
+
+    const response = await fetch(`${previousGate}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ writes: [], password: 'overwritten-password' }),
+    })
+    expect(response.status).toBe(401)
+    expect(await composition.credentials().resolve('ALT_WEB_PASSWORD'))
+      .toMatchObject({ value: 'alternate-password' })
+  })
+
+  it('serializes password rotations across both gates during a port handoff', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const previousGate = await composition.gateBase()
+    const previousPort = Number(new URL(previousGate).port)
+    const cookie = (await login(previousGate)).get('set-cookie')!.split(';', 1)[0]!
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const nextPort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const before = await composition.runtimeStatus()
+
+    await composition.settings().update(namespace, { gatePort: nextPort })
+    await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'running',
+    )
+    const opened = await (await fetch(`http://127.0.0.1:${String(nextPort)}/dsh-auth-tunnel/settings`, {
+      headers: { cookie },
+    })).json() as { settings: { revision: number } }
+    const request = (password: string) => ({
+      expectedRevision: opened.settings.revision,
+      writes: [],
+      password,
+    })
+    const finishPrevious = await beginJsonPost(previousPort, '/dsh-auth-tunnel/settings', cookie, request('first-password'))
+    const finishCandidate = await beginJsonPost(nextPort, '/dsh-auth-tunnel/settings', cookie, request('second-password'))
+    await sleep(50)
+    let releaseResolves = (): void => {}
+    composition.credentials().resolveBarrier = new Promise<void>((resolve) => { releaseResolves = resolve })
+
+    const responsesTask = Promise.all([finishPrevious(), finishCandidate()])
+    await sleep(50)
+    releaseResolves()
+    const responses = await responsesTask
+
+    expect(responses.filter(response => response.includes(' 200 '))).toHaveLength(1)
+    expect(responses.filter(response => response.includes(' 409 '))).toHaveLength(1)
+  })
+
+  it('interrupts an adopted port handoff when the tunnel is disabled', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick()
+    const previousGate = await composition.gateBase()
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const nextPort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const before = await composition.runtimeStatus()
+
+    await composition.settings().update(namespace, { gatePort: nextPort })
+    await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'running',
+    )
+    expect(await liveFixturePids()).toHaveLength(2)
+
+    const startedAt = Date.now()
+    await composition.settings().update(namespace, { enabled: false })
+    await waitForStatus(composition, status => status.phase === 'stopped', 3000)
+
+    expect(Date.now() - startedAt).toBeLessThan(3000)
+    expect(await liveFixturePids()).toEqual([])
+    await expect(fetch(`${previousGate}/dsh-auth-tunnel/login`)).rejects.toThrow()
+    await expect(fetch(`http://127.0.0.1:${String(nextPort)}/dsh-auth-tunnel/login`)).rejects.toThrow()
   })
 
   it('keeps the old tunnel when a live process rebuild fails', { timeout: 60_000 }, async () => {

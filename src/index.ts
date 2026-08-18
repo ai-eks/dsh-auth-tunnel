@@ -520,16 +520,19 @@ function writeJson(res: ServerResponse, status: number, value: unknown): void {
  * server speaks plain HTTP on loopback only — the public client is always
  * cloudflared, never a browser.
  */
+interface RemoteMutationFence {
+  tail: Promise<void>
+}
+
 class PasswordGate {
   private auth: { passwordRef: string; ttlMs: number; allowRemoteSettings: boolean }
-  private remoteMutationTail: Promise<void> = Promise.resolve()
   private readonly upgradeDrops = new Set<() => void>()
-  private readonly upstreamPort: number
 
   constructor(
     private readonly ctx: Context,
     config: { passwordRef: string; sessionTtlHours: number; allowRemoteSettings: boolean },
-    upstreamPort: number,
+    private readonly upstreamPort: number,
+    private readonly remoteMutations: RemoteMutationFence,
   ) {
     this.auth = {
       passwordRef: config.passwordRef,
@@ -556,8 +559,8 @@ class PasswordGate {
 
   /** Keep authenticated remote writes ordered across concurrent browser tabs. */
   private serializeRemoteMutation<T>(mutation: () => Promise<T>): Promise<T> {
-    const queued = this.remoteMutationTail.then(mutation)
-    this.remoteMutationTail = queued.then(() => undefined, () => undefined)
+    const queued = this.remoteMutations.tail.then(mutation)
+    this.remoteMutations.tail = queued.then(() => undefined, () => undefined)
     return queued
   }
 
@@ -1098,6 +1101,8 @@ class AuthTunnelRuntime {
   private disposed = false
   private readonly shutdown = new AbortController()
   private stagedStartup: AbortController | undefined
+  private finishHandoff: (() => void) | undefined
+  private readonly remoteMutations: RemoteMutationFence = { tail: Promise.resolve() }
   private tokenCredentialGeneration = 0
   private appliedTokenCredentialGeneration = 0
   private configured: InternalConfig | undefined
@@ -1177,7 +1182,10 @@ class AuthTunnelRuntime {
   /** Coalesce scalar settings writes, then reconcile only the latest snapshot. */
   request(config: InternalConfig): void {
     if (this.disposed) return
-    if (!config.enabled) this.stagedStartup?.abort()
+    if (!config.enabled) {
+      this.stagedStartup?.abort()
+      this.finishHandoff?.()
+    }
     if (!config.allowRemoteSettings && this.active?.config.allowRemoteSettings === true) {
       const revoked = { ...this.active.config, allowRemoteSettings: false }
       this.active.config = revoked
@@ -1308,6 +1316,7 @@ class AuthTunnelRuntime {
         await this.stop(candidate)
         throw this.exitedBeforeAdoption(candidate)
       }
+      if (previous !== undefined) previous.gate.updateAuth(next)
       this.setStatus('running', true, candidate.publicUrl)
       // Keep the old public path alive long enough for its page to observe the
       // new runtime URL before the browser's current tunnel is retired.
@@ -1315,6 +1324,12 @@ class AuthTunnelRuntime {
         await this.waitForHandoff()
         if (this.disposed) {
           await this.stop(previous)
+          return
+        }
+        if (this.desired?.enabled === false) {
+          this.active = undefined
+          this.publish(undefined)
+          await Promise.all([this.stop(candidate), this.stop(previous)])
           return
         }
         if (!candidate.alive) {
@@ -1367,6 +1382,12 @@ class AuthTunnelRuntime {
           await this.stopChild(previous)
           return
         }
+        if (this.desired?.enabled === false) {
+          this.active = undefined
+          this.publish(undefined)
+          await Promise.all([this.stop(candidate), this.stopChild(previous)])
+          return
+        }
         if (!candidate.alive) {
           this.restorePreviousAfterFailedHandoff(candidate, previous)
           return
@@ -1398,7 +1419,7 @@ class AuthTunnelRuntime {
     if (this.startupCancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
     await this.requirePassword(config.passwordRef)
     if (this.startupCancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
-    const gate = new PasswordGate(this.ctx, config, this.ctx.webServer.port)
+    const gate = new PasswordGate(this.ctx, config, this.ctx.webServer.port, this.remoteMutations)
     const { server, port } = await gate.start(config.gatePort)
     try {
       const spawned = await this.spawnStaged(config, `http://127.0.0.1:${String(port)}`)
@@ -1474,8 +1495,10 @@ class AuthTunnelRuntime {
         settled = true
         clearTimeout(timeout)
         signal.removeEventListener('abort', finish)
+        if (this.finishHandoff === finish) this.finishHandoff = undefined
         resolve()
       }
+      this.finishHandoff = finish
       const timeout = setTimeout(finish, TUNNEL_HANDOFF_MS)
       signal.addEventListener('abort', finish, { once: true })
       if (signal.aborted) finish()
