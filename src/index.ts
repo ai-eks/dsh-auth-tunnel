@@ -830,6 +830,7 @@ class PasswordGate {
           }
           if (!current.allowRemoteSettings) throw new Error('remote settings disabled')
           await this.requireRemoteMutationAuthorization(req)
+          let credentialRevision = request.expectedRevision
           let rollbackSettings: (() => Promise<void>) | undefined
           if (request.writes.length !== 0) {
             const settings = this.ctx.get('settings')
@@ -850,6 +851,7 @@ class PasswordGate {
             if (request.writes.some(write => !settingsWriteSatisfied(committed, write))) {
               throw new Error('settings write was not committed')
             }
+            credentialRevision = committed.revision
             rollbackSettings = async () => {
               const rollbackOps: SettingsPathOp[] = rollbackWrites.map(write => write.op === 'set'
                 ? { op: 'set', path: [write.field], value: write.value }
@@ -867,6 +869,9 @@ class PasswordGate {
           }
           if (password !== '') {
             try {
+              const latest = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
+              if (!latest.writable) throw new Error('settings provider is read-only')
+              if (latest.descriptor.revision !== credentialRevision) throw new Error('settings revision changed')
               await this.ctx.credentials.set(credentialRef(target.passwordRef), password)
             } catch (error) {
               await rollbackSettings?.()

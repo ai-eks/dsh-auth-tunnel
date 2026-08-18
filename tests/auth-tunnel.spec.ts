@@ -31,6 +31,7 @@ class StubCredentials extends Service {
   }
 
   async resolve(request: string): Promise<{ value: string; source: string } | undefined> {
+    this.resolveStarted?.(request)
     if (this.resolveDelayMs > 0) {
       await new Promise<void>(resolve => { setTimeout(resolve, this.resolveDelayMs) })
     }
@@ -52,6 +53,9 @@ class StubCredentials extends Service {
 
   /** Test knob: release concurrent credential resolutions together. */
   resolveBarrier: Promise<void> | undefined
+
+  /** Test knob: observe a credential lookup before a barrier holds it. */
+  resolveStarted: ((ref: string) => void) | undefined
 
   /** Test knob: mutate credential state after reading a value but before returning it. */
   afterResolve: ((ref: string) => void) | undefined
@@ -637,6 +641,41 @@ describe('password gate over the loopback webserver', () => {
     expect(response.status).toBe(401)
     expect(await composition.credentials().resolve('ALT_WEB_PASSWORD'))
       .toMatchObject({ value: 'alternate-password' })
+  })
+
+  it('rechecks the settings revision after password-only authorization waits', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    let releaseResolve = (): void => {}
+    composition.credentials().resolveBarrier = new Promise<void>((resolve) => { releaseResolve = resolve })
+    let signalResolveStarted = (): void => {}
+    const resolveStarted = new Promise<void>((resolve) => { signalResolveStarted = resolve })
+    composition.credentials().resolveStarted = (ref) => {
+      if (ref !== 'DSH_WEB_PASSWORD') return
+      composition.credentials().resolveStarted = undefined
+      signalResolveStarted()
+    }
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [],
+        password: 'stale-page-password',
+      }),
+    })
+    await resolveStarted
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
+    releaseResolve()
+
+    expect((await responseTask).status).toBe(409)
+    expect(await composition.credentials().resolve('DSH_WEB_PASSWORD'))
+      .toMatchObject({ value: 's3kret-passw0rd' })
   })
 
   it('does not leave a new remote credential when settings persistence fails', { timeout: 60_000 }, async () => {
