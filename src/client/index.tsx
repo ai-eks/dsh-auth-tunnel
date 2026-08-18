@@ -257,6 +257,7 @@ function record(value: unknown): Record<string, unknown> {
 const RUNTIME_STATUS_PATH = '/dsh-auth-tunnel/status'
 const REMOTE_SETTINGS_PATH = '/dsh-auth-tunnel/settings'
 const REMOTE_LOCALE_PATH = '/dsh-auth-tunnel/locale'
+const REMOTE_SETTINGS_RETRY_MS = 1000
 const INITIAL_RUNTIME_STATUS: RuntimeStatusSnapshot = {
   phase: 'unavailable',
   running: false,
@@ -574,6 +575,7 @@ export class RemoteSettingsStore {
   private snapshot = INITIAL_REMOTE_SETTINGS_SNAPSHOT
   private readonly listeners = new Set<() => void>()
   private task: Promise<RemoteSettingsDocument | undefined> | undefined
+  private retryTimer: ReturnType<typeof setTimeout> | undefined
   private disposed = false
 
   constructor(private readonly transport: RemoteSettingsTransport = {
@@ -586,12 +588,22 @@ export class RemoteSettingsStore {
   readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
     if (this.listeners.size === 1) void this.refresh()
-    return () => { this.listeners.delete(listener) }
+    return () => {
+      this.listeners.delete(listener)
+      if (this.listeners.size === 0 && this.retryTimer !== undefined) {
+        clearTimeout(this.retryTimer)
+        this.retryTimer = undefined
+      }
+    }
   }
 
   readonly refresh = (): Promise<RemoteSettingsDocument | undefined> => {
     if (this.disposed) return Promise.resolve(undefined)
     if (this.task !== undefined) return this.task
+    if (this.retryTimer !== undefined) {
+      clearTimeout(this.retryTimer)
+      this.retryTimer = undefined
+    }
     this.task = this.transport.read().then((document) => {
       if (!this.disposed) this.publish(document.snapshot)
       return document
@@ -600,7 +612,10 @@ export class RemoteSettingsStore {
         this.publish({ ...INITIAL_REMOTE_SETTINGS_SNAPSHOT, status: 'unavailable' })
       }
       return undefined
-    }).finally(() => { this.task = undefined })
+    }).finally(() => {
+      this.task = undefined
+      this.scheduleRetry()
+    })
     return this.task
   }
 
@@ -613,6 +628,16 @@ export class RemoteSettingsStore {
   dispose(): void {
     this.disposed = true
     this.listeners.clear()
+    if (this.retryTimer !== undefined) clearTimeout(this.retryTimer)
+    this.retryTimer = undefined
+  }
+
+  private scheduleRetry(): void {
+    if (this.disposed || this.listeners.size === 0 || this.snapshot.status !== 'unavailable') return
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined
+      void this.refresh()
+    }, REMOTE_SETTINGS_RETRY_MS)
   }
 
   private publish(snapshot: SettingsScopeSnapshot<AuthTunnelSettings>): void {
@@ -651,9 +676,8 @@ type CardApi = Pick<IApiClient, 'settings' | 'credentials'>
 type CardCommit = (
   revision: number | undefined,
   writes: readonly SettingsWrite[],
-  currentEnabled: boolean,
-  currentPasswordRef: string,
-  targetPasswordRef: string,
+  current: AuthTunnelSettings,
+  target: AuthTunnelSettings,
   password: string,
 ) => Promise<void>
 
@@ -690,19 +714,30 @@ export async function commitCardChanges(
   api: CardApi,
   revision: number | undefined,
   writes: readonly SettingsWrite[],
-  currentEnabled: boolean,
-  currentPasswordRef: string,
-  targetPasswordRef: string,
+  current: AuthTunnelSettings,
+  target: AuthTunnelSettings,
   password: string,
 ): Promise<void> {
+  if (password !== '') {
+    if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
+      throw new Error('access password credential conflicts with the tunnel token credential')
+    }
+    if (target.passwordRef !== current.passwordRef) {
+      const response = await api.credentials.describe({ refs: [target.passwordRef] })
+      if (!response.result.ok) throw new Error(response.result.error.message)
+      if (response.result.value.credentials[target.passwordRef]?.configured !== false) {
+        throw new Error('access password credential already exists')
+      }
+    }
+  }
   const changesActivePassword = password !== ''
-    && currentEnabled
-    && currentPasswordRef === targetPasswordRef
+    && current.enabled
+    && current.passwordRef === target.passwordRef
   // Rotating the active credential invalidates the public page's cookie, so
   // ordinary settings must cross the gate first. A newly selected reference
   // is populated first so Host reconciliation never sees it unconfigured.
   if (password !== '' && !changesActivePassword) {
-    await commitCredentialWrite(api, targetPasswordRef, password)
+    await commitCredentialWrite(api, target.passwordRef, password)
   }
   if (writes.length !== 0) {
     const committed = await commitSettingsWrites(api, revision, writes)
@@ -710,7 +745,7 @@ export async function commitCardChanges(
       throw new Error('settings write was not committed')
     }
   }
-  if (changesActivePassword) await commitCredentialWrite(api, targetPasswordRef, password)
+  if (changesActivePassword) await commitCredentialWrite(api, target.passwordRef, password)
 }
 
 const styles: Record<string, CSSProperties> = {
@@ -1079,15 +1114,13 @@ function AuthTunnelCard(props: CardProps & {
   }
 
   if (snapshot.status !== 'ready' || snapshot.value === undefined) return null
+  const snapshotValue = snapshot.value
 
   const save = async (draft: Draft): Promise<void> => {
     const target = parseDraft(draft)
     const writes = savePlan(draft, target)
     const password = draft.password
-    const current = record(snapshot.value)
-    const currentPasswordRef = typeof current.passwordRef === 'string'
-      ? current.passwordRef
-      : target.passwordRef
+    const current = snapshotValue
     const runtimeChanged = writes.some(write => !Object.is(current[write.field], target[write.field]))
     const startingRevision = snapshot.revision
     setShell(current => ({ ...current, saving: true, failed: false }))
@@ -1096,9 +1129,8 @@ function AuthTunnelCard(props: CardProps & {
       await props.commit(
         startingRevision,
         writes,
-        current.enabled === true,
-        currentPasswordRef,
-        target.passwordRef,
+        current,
+        target,
         password,
       )
       succeeded = true
@@ -1230,7 +1262,7 @@ export function apply(ctx: ClientContext): void {
   } else {
     const remote = new RemoteSettingsStore()
     scope = remote
-    commit = (revision, writes, _currentEnabled, _currentPasswordRef, _targetPasswordRef, password) => remote.commit({
+    commit = (revision, writes, _current, _target, password) => remote.commit({
       ...(revision === undefined ? {} : { expectedRevision: revision }),
       writes,
       password,

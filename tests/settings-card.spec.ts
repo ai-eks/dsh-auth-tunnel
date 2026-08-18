@@ -16,7 +16,7 @@ const quick: AuthTunnelSettings = {
   startupTimeoutMs: 15_000,
 }
 
-function successfulCardApi(user: Record<string, unknown>, order: string[]) {
+function successfulCardApi(user: Record<string, unknown>, order: string[], configuredRefs: readonly string[] = []) {
   const mutate = vi.fn(() => {
     order.push('settings')
     return Promise.resolve({
@@ -34,7 +34,22 @@ function successfulCardApi(user: Record<string, unknown>, order: string[]) {
     order.push('credential')
     return Promise.resolve({ rpcId: 'test', result: { ok: true as const, value: {} } })
   })
-  return { api: { settings: { mutate }, credentials: { set } } as never, mutate, set }
+  const describe = vi.fn(({ refs }: { refs: string[] }) => {
+    order.push('credential-check')
+    return Promise.resolve({
+      rpcId: 'test',
+      result: {
+        ok: true as const,
+        value: {
+          credentials: Object.fromEntries(refs.map(ref => [ref, {
+            configured: configuredRefs.includes(ref),
+            writable: true,
+          }])),
+        },
+      },
+    })
+  })
+  return { api: { settings: { mutate }, credentials: { describe, set } } as never, describe, mutate, set }
 }
 
 describe('auth-tunnel settings card contract', () => {
@@ -129,9 +144,8 @@ describe('auth-tunnel settings card contract', () => {
       api,
       7,
       [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
-      true,
-      'DSH_WEB_PASSWORD',
-      'DSH_WEB_PASSWORD',
+      quick,
+      { ...quick, sessionTtlHours: 24 },
       '  rotated-password  ',
     )
 
@@ -147,13 +161,12 @@ describe('auth-tunnel settings card contract', () => {
       api,
       7,
       [{ field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' }],
-      true,
-      'DSH_WEB_PASSWORD',
-      'NEXT_WEB_PASSWORD',
+      quick,
+      { ...quick, passwordRef: 'NEXT_WEB_PASSWORD' },
       'next-password',
     )
 
-    expect(order).toEqual(['credential', 'settings'])
+    expect(order).toEqual(['credential-check', 'credential', 'settings'])
   })
 
   it('stores the password before enabling a currently stopped tunnel', async () => {
@@ -164,13 +177,49 @@ describe('auth-tunnel settings card contract', () => {
       api,
       7,
       [{ field: 'enabled', op: 'set', value: true }],
-      false,
-      'DSH_WEB_PASSWORD',
-      'DSH_WEB_PASSWORD',
+      { ...quick, enabled: false },
+      quick,
       'first-password',
     )
 
     expect(order).toEqual(['credential', 'settings'])
+  })
+
+  it('rejects a local password write targeting the tunnel token', async () => {
+    const order: string[] = []
+    const { api, describe, mutate, set } = successfulCardApi({}, order)
+    const current = { ...quick, tokenRef: 'DSH_TUNNEL_TOKEN' }
+
+    await expect(commitCardChanges(
+      api,
+      7,
+      [{ field: 'passwordRef', op: 'set', value: 'DSH_TUNNEL_TOKEN' }],
+      current,
+      { ...current, passwordRef: 'DSH_TUNNEL_TOKEN' },
+      'replacement',
+    )).rejects.toThrow('conflicts')
+
+    expect(describe).not.toHaveBeenCalled()
+    expect(set).not.toHaveBeenCalled()
+    expect(mutate).not.toHaveBeenCalled()
+  })
+
+  it('rejects a local password write targeting another configured credential', async () => {
+    const order: string[] = []
+    const { api, mutate, set } = successfulCardApi({}, order, ['OTHER_HOST_SECRET'])
+
+    await expect(commitCardChanges(
+      api,
+      7,
+      [{ field: 'passwordRef', op: 'set', value: 'OTHER_HOST_SECRET' }],
+      quick,
+      { ...quick, passwordRef: 'OTHER_HOST_SECRET' },
+      'replacement',
+    )).rejects.toThrow('already exists')
+
+    expect(order).toEqual(['credential-check'])
+    expect(set).not.toHaveBeenCalled()
+    expect(mutate).not.toHaveBeenCalled()
   })
 
   it('registers its browser card under the Host settings namespace', () => {
@@ -254,6 +303,37 @@ describe('auth-tunnel settings card contract', () => {
     expect(notifications).toBe(2)
     dispose()
     store.dispose()
+  })
+
+  it('retries an unavailable initial remote settings read while subscribed', async () => {
+    vi.useFakeTimers()
+    try {
+      const document = parseRemoteSettingsDocument({
+        settings: {
+          value: { ...quick, allowRemoteSettings: true },
+          base: quick,
+          user: { allowRemoteSettings: true },
+          revision: 3,
+          writable: true,
+        },
+      })
+      const read = vi.fn()
+        .mockRejectedValueOnce(new Error('handoff'))
+        .mockResolvedValue(document)
+      const store = new RemoteSettingsStore({ read, commit: vi.fn() })
+      const unsubscribe = store.subscribe(() => {})
+
+      await store.refresh()
+      expect(store.getSnapshot().status).toBe('unavailable')
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(read).toHaveBeenCalledTimes(2)
+      expect(store.getSnapshot()).toMatchObject({ status: 'ready', revision: 3 })
+
+      unsubscribe()
+      store.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('keeps a stable external runtime snapshot and maps every visible state', async () => {

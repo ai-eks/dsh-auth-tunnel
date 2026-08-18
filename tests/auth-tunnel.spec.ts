@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Context, Service } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
+import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { SettingsProvider, settingsNamespace, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
 
@@ -43,6 +44,7 @@ class StubCredentials extends Service {
     } else {
       this.values.set(ref, value)
     }
+    this.ctx.emit('credentials/updated', credentialRef(ref))
   }
 
   private readonly values = new Map<string, string>()
@@ -183,6 +185,8 @@ interface CompositionOptions {
   withShell?: boolean
   /** Register no settings provider row. */
   withSettings?: boolean
+  /** Make the settings row activate after the tunnel row. */
+  settingsAfterTunnel?: boolean
   /** Initial raw settings document. */
   settingsDocument?: Record<string, unknown>
   /** Seed no DSH_WEB_PASSWORD. */
@@ -219,13 +223,14 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
     '  config:',
     "    host: '127.0.0.1'",
     '    port: 0',
-    ...settingsRows,
+    ...(options?.settingsAfterTunnel === true ? [] : settingsRows),
     ...(options?.credentialsAfterWebServer === true ? [] : credentialRows),
     ...(options?.withShell === false ? [] : [
       "- name: '@deepseek-ai/dsh-shell-env'",
       "- name: '@deepseek-ai/dsh-system-prompt'",
     ]),
     ...tunnelRows,
+    ...(options?.settingsAfterTunnel === true ? settingsRows : []),
     ...(options?.credentialsAfterWebServer === true ? credentialRows : []),
     '',
   ]
@@ -992,6 +997,26 @@ describe('tunnel lifecycle', () => {
 
   })
 
+  it('serializes a live settings update behind initial tunnel startup', { timeout: 60_000 }, async () => {
+    const composition = await loadComposition({
+      mode: 'quick',
+      executable: await fixtureExecutable('fake-cloudflared-delayed.sh'),
+      startupTimeoutMs: 15_000,
+    }, { wait: false })
+    const deadline = Date.now() + 5000
+    while ((await liveFixturePids()).length === 0) {
+      if (Date.now() >= deadline) throw new Error('initial cloudflared did not start')
+      await sleep(25)
+    }
+
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { sessionTtlHours: 24 })
+    await composition.loaded.loader.await()
+    await sleep(800)
+
+    expect(await liveFixturePids()).toHaveLength(1)
+    expect(await composition.runtimeStatus()).toMatchObject({ phase: 'running', running: true })
+  })
+
   it('teardown kills the cloudflared child and closes the gate', { timeout: 60_000 }, async () => {
     const { gateBase } = await bootQuick()
     const base = await gateBase()
@@ -1260,6 +1285,7 @@ describe('rc7 plugin settings', () => {
 
   it('hot-switches the password reference and preserves the live gate when the new credential is missing', { timeout: 60_000 }, async () => {
     const composition = await loadComposition({
+      allowRemoteSettings: true,
       mode: 'quick',
       executable: await fixtureExecutable('fake-cloudflared-quick.sh'),
       startupTimeoutMs: 15_000,
@@ -1292,7 +1318,7 @@ describe('rc7 plugin settings', () => {
       body: 'password=settings-password',
     })
     expect(oldPassword.headers.get('location')).toBe('/dsh-auth-tunnel/login?error=1')
-    await login(base, undefined, 'next-settings-password')
+    const cookie = (await login(base, undefined, 'next-settings-password')).get('set-cookie')!.split(';', 1)[0]!
 
     const beforeFailure = await composition.runtimeStatus()
     await composition.settings().update(namespace, { passwordRef: 'MISSING_PASSWORD' })
@@ -1303,6 +1329,25 @@ describe('rc7 plugin settings', () => {
     expect(failed).toMatchObject({ running: true, publicUrl: QUICK_URL })
     expect(failed.message).toContain('MISSING_PASSWORD')
     await login(base, undefined, 'next-settings-password')
+
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    const repairedResponse = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [],
+        password: 'repaired-password',
+      }),
+    })
+    expect(repairedResponse.status).toBe(200)
+    await waitForStatus(
+      composition,
+      status => status.revision > failed.revision && status.phase === 'running',
+    )
+    await login(base, undefined, 'repaired-password')
     expect((await liveFixturePids()).length).toBe(1)
   })
 
@@ -1403,10 +1448,26 @@ describe('rc7 plugin settings', () => {
     expect(composition.shellEnv().contributors[0]?.resolve().DSH_PUBLIC_URL).toBe(QUICK_URL)
   })
 
-  it('keeps the original composition working when no settings provider is mounted', { timeout: 60_000 }, async () => {
+  it('waits safely when no settings provider is mounted', { timeout: 60_000 }, async () => {
     const composition = await bootQuick(undefined, { withSettings: false })
     expect(composition.loaded.get('settings')).toBeUndefined()
-    expect((await fetch(`${await composition.gateBase()}/dsh-auth-tunnel/login`)).status).toBe(200)
+    const tunnel = [...composition.loaded.loader.entries()]
+      .find(entry => entry.options.name === 'dsh-auth-tunnel')
+    expect(tunnel?.fiber?.state).toBe(0)
+    expect(await liveFixturePids()).toEqual([])
+  })
+
+  it('loads delayed persisted settings before opening public access', { timeout: 60_000 }, async () => {
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+    const composition = await bootQuick(undefined, {
+      settingsAfterTunnel: true,
+      settingsDocument: { 'auth-tunnel': { enabled: false } },
+    })
+
+    expect(composition.settings().get(namespace)).toMatchObject({ enabled: false })
+    expect(await composition.runtimeStatus()).toMatchObject({ phase: 'stopped', running: false })
+    expect(await liveFixturePids()).toEqual([])
+    expect(consoleSpy).not.toHaveBeenCalledWith(expect.stringContaining('cloudflare tunnel:'))
   })
 })
 

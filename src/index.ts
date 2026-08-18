@@ -84,9 +84,9 @@ export const name = 'dsh-auth-tunnel'
 /** Host/browser pairing key for the plugin settings card. */
 export const AUTH_TUNNEL_SETTINGS_NAMESPACE = settingsNamespace('auth-tunnel')
 
-// The gate proxies onto the loopback webserver and resolves credential
-// references, so activation waits for both services.
-export const inject = ['webServer', 'credentials']
+// Public access cannot open until the persisted settings snapshot and both
+// runtime dependencies are available.
+export const inject = ['webServer', 'credentials', 'settings']
 
 const PUBLIC_HOSTNAME_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i
 
@@ -118,27 +118,13 @@ export function validateConfig(config: Config): void {
   }
 }
 
-/** Register the optional rc7 settings section and forward every live value. */
+/** Register the rc7 settings section and forward every live value. */
 function settingsConfig(
   ctx: Context,
   entry: Config,
   onChange: (next: InternalConfig) => void,
 ): InternalConfig {
-  const settings = ctx.get('settings')
-  if (settings === undefined) {
-    ctx.inject(['settings'], (settingsCtx) => {
-      const scope = settingsCtx.settings.register(AUTH_TUNNEL_SETTINGS_NAMESPACE, Config, {
-        base: entry,
-        applies: 'live',
-        validate: validateConfig,
-      })
-      settingsCtx.effect(() => scope.watch(next => { onChange(next) }), 'auth-tunnel: settings watcher')
-      onChange(scope.get())
-    })
-    validateConfig(entry)
-    return entry
-  }
-  const scope = settings.register(AUTH_TUNNEL_SETTINGS_NAMESPACE, Config, {
+  const scope = ctx.settings.register(AUTH_TUNNEL_SETTINGS_NAMESPACE, Config, {
     base: entry,
     applies: 'live',
     validate: validateConfig,
@@ -1053,6 +1039,7 @@ class AuthTunnelRuntime {
   private drainTask: Promise<void> | undefined
   private disposed = false
   private readonly shutdown = new AbortController()
+  private configured: InternalConfig | undefined
   private revision = 0
   private status: AuthTunnelRuntimeStatus = { phase: 'stopped', running: false, revision: 0 }
   private readonly intentionalExits = new WeakSet<ChildProcess>()
@@ -1094,6 +1081,12 @@ class AuthTunnelRuntime {
 
   /** Apply the boot snapshot synchronously so startup still reports hard failures. */
   async start(config: InternalConfig): Promise<void> {
+    this.configured = config
+    this.drainTask = this.startInitial(config).finally(() => { this.finishDrain() })
+    await this.drainTask
+  }
+
+  private async startInitial(config: InternalConfig): Promise<void> {
     if (!config.enabled) {
       this.setStatus('stopped', false)
       return
@@ -1108,6 +1101,7 @@ class AuthTunnelRuntime {
       this.adopt(candidate)
       this.setStatus('running', true, candidate.publicUrl)
     } catch (error) {
+      if (this.disposed) return
       this.setStatus('error', false, undefined, errorMessage(error))
       throw error
     }
@@ -1116,11 +1110,17 @@ class AuthTunnelRuntime {
   /** Coalesce scalar settings writes, then reconcile only the latest snapshot. */
   request(config: InternalConfig): void {
     if (this.disposed) return
+    this.configured = config
     this.desired = config
     const running = this.active?.alive === true
     this.setStatus('applying', running, running ? this.active?.publicUrl : undefined)
     if (this.debounce !== undefined) clearTimeout(this.debounce)
     this.debounce = setTimeout(() => { this.beginDrain() }, 120)
+  }
+
+  /** Retry the latest desired settings after its access credential is repaired. */
+  credentialUpdated(ref: string): void {
+    if (this.configured?.passwordRef === ref) this.request(this.configured)
   }
 
   /** Stop queued work and tear down the currently adopted runtime. */
@@ -1161,12 +1161,14 @@ class AuthTunnelRuntime {
   private beginDrain(): void {
     this.debounce = undefined
     if (this.disposed || this.drainTask !== undefined) return
-    this.drainTask = this.drain().finally(() => {
-      this.drainTask = undefined
-      if (this.desired !== undefined && !this.disposed) {
-        this.debounce = setTimeout(() => { this.beginDrain() }, 0)
-      }
-    })
+    this.drainTask = this.drain().finally(() => { this.finishDrain() })
+  }
+
+  private finishDrain(): void {
+    this.drainTask = undefined
+    if (this.desired === undefined || this.disposed) return
+    if (this.debounce !== undefined) clearTimeout(this.debounce)
+    this.debounce = setTimeout(() => { this.beginDrain() }, 0)
   }
 
   private async drain(): Promise<void> {
@@ -1444,6 +1446,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   ctx.inject(['systemPrompt'], (injected) => {
     injected.effect(() => runtime.attachSystemPrompt(injected.systemPrompt), 'auth-tunnel: prompt publication')
   })
+  ctx.on('credentials/updated', ref => { runtime.credentialUpdated(ref) })
   const active = settingsConfig(ctx, config, next => { runtime.request(next) })
   await runtime.start(active)
 }
