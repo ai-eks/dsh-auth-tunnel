@@ -1203,6 +1203,77 @@ describe('password gate over the loopback webserver', () => {
     }
   })
 
+  it('restores the previous tunnel when its replacement exits during the response fence', { timeout: 60_000 }, async () => {
+    const quickExecutable = await fixtureExecutable('fake-cloudflared-quick.sh')
+    const crashingExecutable = await fixtureExecutable('fake-cloudflared-late-crash.sh')
+    const composition = await bootQuick({ allowRemoteSettings: true, executable: quickExecutable })
+    const originalPid = (await liveFixturePids())[0]!
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    const before = await composition.runtimeStatus()
+    const originalEnd = ServerResponse.prototype.end
+    let releaseResponse = (): void => {}
+    let markResponseHeld = (): void => {}
+    const responseHeld = new Promise<void>((resolve) => { markResponseHeld = resolve })
+    let held = false
+    vi.spyOn(ServerResponse.prototype, 'end').mockImplementation((function (
+      this: ServerResponse,
+      ...args: unknown[]
+    ): ServerResponse {
+      if (!held && this.req.url === '/dsh-auth-tunnel/settings') {
+        held = true
+        releaseResponse = () => { Reflect.apply(originalEnd, this, args) }
+        markResponseHeld()
+        return this
+      }
+      return Reflect.apply(originalEnd, this, args) as ServerResponse
+    }) as typeof ServerResponse.prototype.end)
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'executable', op: 'set', value: crashingExecutable }],
+        password: '',
+      }),
+    }).catch(() => undefined)
+    await responseHeld
+    let released = false
+    try {
+      await waitForStatus(
+        composition,
+        status => status.revision > before.revision
+          && status.phase === 'running'
+          && status.publicUrl?.includes('late-crash') === true,
+      )
+      const failed = await waitForStatus(
+        composition,
+        status => status.phase === 'error' && !status.running,
+        7000,
+      )
+      expect(await liveFixturePids()).toContain(originalPid)
+
+      releaseResponse()
+      released = true
+      expect((await responseTask)?.status).toBe(200)
+      const restored = await waitForStatus(
+        composition,
+        status => status.revision > failed.revision
+          && status.phase === 'error'
+          && status.running
+          && status.publicUrl === QUICK_URL,
+      )
+      expect(restored.message).toContain('kept the previous public URL')
+      expect(await liveFixturePids()).toEqual([originalPid])
+    } finally {
+      if (!released) releaseResponse()
+    }
+  })
+
   it('returns the complete locale response before a local disable stops the tunnel', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     composition.settings().register(settingsNamespace('locale'), z.object({
@@ -2885,6 +2956,51 @@ describe('rc7 plugin settings', () => {
     }
 
     await composition.settings().update(namespace, { passwordRef: 'ALT_WEB_PASSWORD' })
+    await resolveStarted
+    try {
+      const startedAt = Date.now()
+      await composition.settings().update(namespace, { enabled: false })
+      await waitForStatus(composition, status => status.phase === 'stopped' && !status.running, 3000)
+
+      expect(Date.now() - startedAt).toBeLessThan(3000)
+      expect(await liveFixturePids()).toEqual([])
+      await expect(fetch(`${base}/dsh-auth-tunnel/login`)).rejects.toThrow()
+    } finally {
+      composition.credentials().resolveBarrier = undefined
+      composition.credentials().resolveBarrierRef = undefined
+      releaseResolve()
+    }
+  })
+
+  it('disables the active tunnel while tunnel-token resolution is stalled', { timeout: 60_000 }, async () => {
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const gatePort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const tokenExecutable = await fixtureExecutable('fake-cloudflared-token.sh')
+    const composition = await bootQuick({ gatePort }, {
+      seeds: { DSH_TUNNEL_TOKEN: 'fixture-token' },
+    })
+    const base = await composition.gateBase()
+    let releaseResolve = (): void => {}
+    composition.credentials().resolveBarrier = new Promise<void>((resolve) => { releaseResolve = resolve })
+    composition.credentials().resolveBarrierRef = 'DSH_TUNNEL_TOKEN'
+    let markResolveStarted = (): void => {}
+    const resolveStarted = new Promise<void>((resolve) => { markResolveStarted = resolve })
+    composition.credentials().resolveStarted = (ref) => {
+      if (ref !== 'DSH_TUNNEL_TOKEN') return
+      composition.credentials().resolveStarted = undefined
+      markResolveStarted()
+    }
+
+    await composition.settings().update(namespace, {
+      mode: 'token',
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
+      executable: tokenExecutable,
+    })
     await resolveStarted
     try {
       const startedAt = Date.now()

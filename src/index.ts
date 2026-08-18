@@ -1171,6 +1171,30 @@ class PasswordGate {
   }
 }
 
+const TUNNEL_STARTUP_CANCELLED = new Error('auth-tunnel: tunnel startup cancelled')
+const PASSWORD_RESOLUTION_CANCELLED = new Error('auth-tunnel: password resolution cancelled')
+
+/** Await one asynchronous lookup until its owning runtime transition is cancelled. */
+async function untilAbort<T>(
+  task: () => Promise<T>,
+  signal: AbortSignal | undefined,
+  reason: Error,
+): Promise<T> {
+  if (signal === undefined) return task()
+  if (signal.aborted) throw reason
+  let abort = (): void => {}
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    abort = (): void => { reject(reason) }
+    signal.addEventListener('abort', abort, { once: true })
+    if (signal.aborted) abort()
+  })
+  try {
+    return await Promise.race([task(), cancelled])
+  } finally {
+    signal.removeEventListener('abort', abort)
+  }
+}
+
 /** Spawn one cloudflared and resolve once the tunnel is up; any failure kills the child. */
 async function spawnTunnel(
   ctx: Context,
@@ -1179,7 +1203,7 @@ async function spawnTunnel(
   signal?: AbortSignal,
 ): Promise<{ child: ChildProcess; publicUrl: string }> {
   const cancelled = (): boolean => signal?.aborted === true
-  if (cancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
+  if (cancelled()) throw TUNNEL_STARTUP_CANCELLED
   let args: string[]
   let publicUrlHint: string | undefined
   let tokenValue: string | undefined
@@ -1201,7 +1225,11 @@ async function spawnTunnel(
     if (config.gatePort === 0) {
       throw new Error('auth-tunnel: token mode requires gatePort: the named tunnel\'s dashboard ingress points at this loopback port, so it must be fixed')
     }
-    const hit = await ctx.credentials.resolve(credentialRef(tokenRef))
+    const hit = await untilAbort(
+      () => ctx.credentials.resolve(credentialRef(tokenRef)),
+      signal,
+      TUNNEL_STARTUP_CANCELLED,
+    )
     if (hit === undefined || hit.value === '') {
       throw new Error(`auth-tunnel: credential reference "${tokenRef}" is not configured`)
     }
@@ -1212,7 +1240,7 @@ async function spawnTunnel(
     args = ['tunnel', '--no-autoupdate', 'run']
   }
 
-  if (cancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
+  if (cancelled()) throw TUNNEL_STARTUP_CANCELLED
   const child = spawn(config.executable, args, { env, stdio: ['ignore', 'pipe', 'pipe'] })
   const cancel = (): void => { void killTree(child).catch(() => undefined) }
   signal?.addEventListener('abort', cancel, { once: true })
@@ -1268,7 +1296,7 @@ async function spawnTunnel(
     // Let an immediate post-readiness process exit reach ChildProcess before
     // the runtime adopts and publishes the candidate.
     await new Promise<void>(resolve => { setTimeout(resolve, TUNNEL_ADOPTION_CHECK_MS) })
-    if (cancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
+    if (cancelled()) throw TUNNEL_STARTUP_CANCELLED
     if (child.exitCode !== null || child.signalCode !== null) {
       throw new Error(
         `auth-tunnel: cloudflared exited before adoption (code ${String(child.exitCode)}, signal ${String(child.signalCode)})`,
@@ -1337,8 +1365,6 @@ function errorMessage(error: unknown): string {
   /* v8 ignore next -- service and process failures are Errors; String guards exotic rejections */
   return error instanceof Error ? error.message : String(error)
 }
-
-const PASSWORD_RESOLUTION_CANCELLED = new Error('auth-tunnel: password resolution cancelled')
 
 /** Own the one live gate/tunnel pair and reconcile settings changes serially. */
 class AuthTunnelRuntime {
@@ -1563,7 +1589,7 @@ class AuthTunnelRuntime {
         await this.reconcile(next)
       } catch (error) {
         if (this.disposed) return
-        if (error === PASSWORD_RESOLUTION_CANCELLED) continue
+        if (error === PASSWORD_RESOLUTION_CANCELLED || error === TUNNEL_STARTUP_CANCELLED) continue
         const message = errorMessage(error)
         const running = this.active?.alive === true
         this.setStatus('error', running, running ? this.active?.publicUrl : undefined, message)
@@ -1704,6 +1730,14 @@ class AuthTunnelRuntime {
         }
         this.detachPreCommitRemoteMutations(false)
         await this.remoteMutations.committedTail
+        if (!candidate.alive) {
+          if (!this.restorePreviousAfterFailedHandoff(candidate, previous)) {
+            this.active = undefined
+            this.publish(undefined)
+            await this.stopChild(previous)
+          }
+          return
+        }
         await this.stopChild(previous)
       }
       this.appliedTokenCredentialGeneration = tokenGeneration
@@ -1722,19 +1756,12 @@ class AuthTunnelRuntime {
   }
 
   private async requirePassword(ref: string): Promise<void> {
-    const signal = this.passwordChecks.signal
-    let abort = (): void => {}
-    const cancelled = new Promise<never>((_resolve, reject) => {
-      abort = (): void => { reject(PASSWORD_RESOLUTION_CANCELLED) }
-      if (signal.aborted) abort()
-      else signal.addEventListener('abort', abort, { once: true })
-    })
-    try {
-      if (await Promise.race([sessionKey(this.ctx, ref), cancelled]) === undefined) {
-        throw new Error(`auth-tunnel: credential reference "${ref}" is not configured`)
-      }
-    } finally {
-      signal.removeEventListener('abort', abort)
+    if (await untilAbort(
+      () => sessionKey(this.ctx, ref),
+      this.passwordChecks.signal,
+      PASSWORD_RESOLUTION_CANCELLED,
+    ) === undefined) {
+      throw new Error(`auth-tunnel: credential reference "${ref}" is not configured`)
     }
   }
 
@@ -1785,6 +1812,17 @@ class AuthTunnelRuntime {
     }
     this.detachPreCommitRemoteMutations(false)
     await this.remoteMutations.committedTail
+    if (!candidate.alive) {
+      const restored = this.restorePreviousAfterFailedHandoff(candidate, current)
+      await this.stopChild(candidate)
+      if (!restored) {
+        this.active = undefined
+        this.publish(undefined)
+        await this.stopChild(current)
+        return undefined
+      }
+      return current
+    }
     await this.stopChild(current)
     this.appliedTokenCredentialGeneration = tokenGeneration
     return candidate
@@ -1803,11 +1841,11 @@ class AuthTunnelRuntime {
   }
 
   private async startFull(config: InternalConfig): Promise<ActiveTunnel> {
-    if (this.startupCancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
+    if (this.startupCancelled()) throw TUNNEL_STARTUP_CANCELLED
     let gateConfig = this.withCurrentAuth(config)
     while (true) {
       await this.requirePassword(gateConfig.passwordRef)
-      if (this.startupCancelled()) throw new Error('auth-tunnel: tunnel startup cancelled')
+      if (this.startupCancelled()) throw TUNNEL_STARTUP_CANCELLED
       const latest = this.withCurrentAuth(config)
       if (latest.passwordRef === gateConfig.passwordRef) {
         gateConfig = latest
