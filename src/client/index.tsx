@@ -22,12 +22,14 @@ type LocaleKey =
   | 'enabled' | 'enabledHint' | 'enabledOn' | 'enabledOff'
   | 'status' | 'statusRunning' | 'statusStopped' | 'statusApplying'
   | 'statusErrorRunning' | 'statusErrorStopped' | 'statusUnavailable' | 'publicUrl'
-  | 'mode' | 'modeHint' | 'quick' | 'token'
+  | 'accessSection' | 'accessSectionHint' | 'tunnelSection' | 'advancedSection' | 'advancedSectionHint'
+  | 'mode' | 'modeHint' | 'quick' | 'token' | 'quickRequirements' | 'tokenRequirements'
   | 'passwordRef' | 'passwordRefHint'
+  | 'password' | 'passwordHint' | 'passwordPlaceholder'
   | 'sessionTtlHours' | 'sessionTtlHoursHint'
   | 'tokenRef' | 'tokenRefHint'
   | 'publicHostname' | 'publicHostnameHint'
-  | 'gatePort' | 'gatePortHint'
+  | 'quickGatePort' | 'quickGatePortHint' | 'tokenGatePort' | 'tokenGatePortHint'
   | 'executable' | 'executableHint'
   | 'startupTimeoutMs' | 'startupTimeoutMsHint'
   | 'overridden' | 'reset' | 'discard' | 'save' | 'saving' | 'saveFailed'
@@ -59,20 +61,32 @@ const zh: Record<LocaleKey, string> = {
   statusErrorStopped: '应用失败（隧道未运行）',
   statusUnavailable: '暂时无法读取',
   publicUrl: '公网地址',
+  accessSection: '访问保护（Quick / Token 共用）',
+  accessSectionHint: '两种隧道模式都先经过同一个密码登录页。',
+  tunnelSection: 'Cloudflare 隧道',
+  advancedSection: '高级设置',
+  advancedSectionHint: '通常无需修改；仅在 cloudflared 路径或启动环境特殊时调整。',
   mode: '隧道模式',
-  modeHint: 'Quick 使用临时 trycloudflare.com 地址；Token 使用 Cloudflare 控制台中已配置的命名隧道。',
+  modeHint: '切换模式后，下方只显示该模式会使用的配置。',
   quick: 'Quick（临时隧道）',
   token: 'Token（命名隧道）',
+  quickRequirements: 'Quick 只需要上方的访问密码；无需 Cloudflare Token 或自有域名，Gate 端口保持 0 即可自动分配。',
+  tokenRequirements: 'Token 启用前必须准备 Tunnel Token、已绑定的公网域名和固定 Gate 端口；Cloudflare ingress 必须指向该端口。',
   passwordRef: '密码凭据引用',
-  passwordRefHint: '共享访问密码在凭据服务中的引用名，不是密码明文。',
+  passwordRefHint: '保存下方密码时写入的凭据名；一般保持 DSH_WEB_PASSWORD。',
+  password: '设置或替换访问密码',
+  passwordHint: '仅在本次保存时写入凭据服务，保存后清空且永不回显。该密码可重复登录，直到再次替换；不是登录一次即失效的 OTP。替换后现有公网会话会失效，请使用新密码重新登录。',
+  passwordPlaceholder: '留空表示不修改当前密码',
   sessionTtlHours: '会话时长（小时）',
   sessionTtlHoursHint: '登录 Cookie 的绝对有效期。',
-  tokenRef: 'Tunnel Token 凭据引用',
-  tokenRefHint: 'Cloudflare Tunnel Token 在凭据服务中的引用名。',
-  publicHostname: '公网主机名',
+  tokenRef: 'Tunnel Token 凭据引用（必填）',
+  tokenRefHint: '填写已存入凭据服务的名称，例如 DSH_TUNNEL_TOKEN；不是 Token 明文。',
+  publicHostname: '公网主机名（必填）',
   publicHostnameHint: 'Cloudflare 控制台中绑定到命名隧道的域名。',
-  gatePort: 'Gate 端口',
-  gatePortHint: 'Quick 可填 0 自动分配；Token 模式必须与控制台 ingress 中的固定端口一致。',
+  quickGatePort: 'Gate 端口（自动）',
+  quickGatePortHint: '建议保持 0，由插件自动选择可用端口。',
+  tokenGatePort: 'Gate 端口（必填）',
+  tokenGatePortHint: '必须使用 1–65535 的固定端口，并与 Cloudflare ingress 的 loopback 端口一致。',
   executable: 'cloudflared 可执行文件',
   executableHint: 'PATH 中的命令名或绝对路径。',
   startupTimeoutMs: '启动超时（毫秒）',
@@ -110,20 +124,32 @@ const en: Record<LocaleKey, string> = {
   statusErrorStopped: 'Apply failed (tunnel stopped)',
   statusUnavailable: 'Temporarily unavailable',
   publicUrl: 'Public URL',
+  accessSection: 'Access protection (shared by Quick and Token)',
+  accessSectionHint: 'Both tunnel modes use the same password login gate.',
+  tunnelSection: 'Cloudflare tunnel',
+  advancedSection: 'Advanced settings',
+  advancedSectionHint: 'Usually unchanged; adjust only for a custom cloudflared path or startup environment.',
   mode: 'Tunnel mode',
-  modeHint: 'Quick uses a temporary trycloudflare.com URL; Token uses a named tunnel configured in Cloudflare.',
+  modeHint: 'After switching modes, only settings used by that mode are shown below.',
   quick: 'Quick (temporary tunnel)',
   token: 'Token (named tunnel)',
+  quickRequirements: 'Quick only needs the access password above. It needs no Cloudflare Token or custom domain, and gate port 0 selects a port automatically.',
+  tokenRequirements: 'Before enabling Token mode, provide a Tunnel Token, bound public hostname, and fixed gate port. Cloudflare ingress must target that port.',
   passwordRef: 'Password credential reference',
-  passwordRefHint: 'Credential-service reference for the shared access password, not the password itself.',
+  passwordRefHint: 'Credential name written when saving the password below; normally keep DSH_WEB_PASSWORD.',
+  password: 'Set or replace access password',
+  passwordHint: 'Written to the credential service only on this save, then cleared and never revealed. It remains reusable until replaced; it is not a single-use OTP. Replacing it invalidates existing public sessions, which must sign in again.',
+  passwordPlaceholder: 'Leave blank to keep the current password',
   sessionTtlHours: 'Session lifetime (hours)',
   sessionTtlHoursHint: 'Absolute lifetime of the login cookie.',
-  tokenRef: 'Tunnel Token credential reference',
-  tokenRefHint: 'Credential-service reference for the Cloudflare Tunnel Token.',
-  publicHostname: 'Public hostname',
+  tokenRef: 'Tunnel Token credential reference (required)',
+  tokenRefHint: 'Name already stored in the credential service, such as DSH_TUNNEL_TOKEN; not the Token literal.',
+  publicHostname: 'Public hostname (required)',
   publicHostnameHint: 'Hostname bound to the named tunnel in Cloudflare.',
-  gatePort: 'Gate port',
-  gatePortHint: 'Quick may use 0 for automatic allocation; Token must match the fixed ingress port configured in Cloudflare.',
+  quickGatePort: 'Gate port (automatic)',
+  quickGatePortHint: 'Keep 0 to let the plugin select an available port.',
+  tokenGatePort: 'Gate port (required)',
+  tokenGatePortHint: 'Use a fixed port from 1–65535 matching the loopback port in Cloudflare ingress.',
   executable: 'cloudflared executable',
   executableHint: 'A command on PATH or an absolute path.',
   startupTimeoutMs: 'Startup timeout (ms)',
@@ -178,6 +204,7 @@ type DraftAction = 'set' | 'unset'
 interface Draft {
   values: Record<FieldKey, string>
   edits: Partial<Record<FieldKey, DraftAction>>
+  password: string
 }
 
 export type SettingsWrite =
@@ -372,7 +399,11 @@ function initialDraft(snapshot: SettingsScopeSnapshot<AuthTunnelSettings>): Draf
   for (const field of FIELD_KEYS) {
     values[field] = display(Object.hasOwn(resolved, field) ? resolved[field] : DEFAULT_VALUES[field])
   }
-  return { values, edits: {} }
+  return { values, edits: {}, password: '' }
+}
+
+function draftDirty(draft: Draft): boolean {
+  return Object.keys(draft.edits).length !== 0 || draft.password.trim() !== ''
 }
 
 function numberDraft(text: string): number {
@@ -446,11 +477,21 @@ function writeSatisfied(source: { user?: unknown }, write: SettingsWrite): boole
   return Object.hasOwn(user, write.field) && Object.is(user[write.field], write.value)
 }
 
-type SettingsApi = Pick<IApiClient, 'settings'>
+type CardApi = Pick<IApiClient, 'settings' | 'credentials'>
+
+/** Write a secret in the credential plane; it never enters settings YAML or a response payload. */
+export async function commitCredentialWrite(
+  api: Pick<IApiClient, 'credentials'>,
+  ref: string,
+  value: string,
+): Promise<void> {
+  const response = await api.credentials.set({ ref, value })
+  if (!response.result.ok) throw new Error(response.result.error.message)
+}
 
 /** Commit the whole edited form in one revision-fenced Host mutation. */
 export async function commitSettingsWrites(
-  api: SettingsApi,
+  api: Pick<IApiClient, 'settings'>,
   revision: number | undefined,
   writes: readonly SettingsWrite[],
 ): Promise<SettingsNamespaceView> {
@@ -464,6 +505,34 @@ export async function commitSettingsWrites(
   })
   if (!response.result.ok) throw new Error(response.result.error.message)
   return response.result.value
+}
+
+/** Commit card settings and an optional password without breaking the current public request path. */
+export async function commitCardChanges(
+  api: CardApi,
+  revision: number | undefined,
+  writes: readonly SettingsWrite[],
+  currentEnabled: boolean,
+  currentPasswordRef: string,
+  targetPasswordRef: string,
+  password: string,
+): Promise<void> {
+  const changesActivePassword = password !== ''
+    && currentEnabled
+    && currentPasswordRef === targetPasswordRef
+  // Rotating the active credential invalidates the public page's cookie, so
+  // ordinary settings must cross the gate first. A newly selected reference
+  // is populated first so Host reconciliation never sees it unconfigured.
+  if (password !== '' && !changesActivePassword) {
+    await commitCredentialWrite(api, targetPasswordRef, password)
+  }
+  if (writes.length !== 0) {
+    const committed = await commitSettingsWrites(api, revision, writes)
+    if (writes.some(write => !writeSatisfied(committed, write))) {
+      throw new Error('settings write was not committed')
+    }
+  }
+  if (changesActivePassword) await commitCredentialWrite(api, targetPasswordRef, password)
 }
 
 const styles: Record<string, CSSProperties> = {
@@ -492,6 +561,18 @@ const styles: Record<string, CSSProperties> = {
   runtimeValue: { color: 'var(--dsw-alias-label-primary)', fontWeight: 600, textAlign: 'right' },
   runtimeLink: { color: 'var(--dsw-alias-label-secondary)', overflowWrap: 'anywhere', textAlign: 'right' },
   runtimeError: { margin: 0, color: 'var(--dsw-alias-label-error)', overflowWrap: 'anywhere' },
+  section: {
+    margin: '14px 0 0', padding: '0 12px', border: '1px solid var(--dsw-alias-border-l2)',
+    borderRadius: 10, background: 'var(--dsw-alias-bg-module-platform)',
+  },
+  sectionHead: { padding: '12px 0 2px' },
+  sectionTitle: { margin: 0, fontSize: 13, fontWeight: 600, lineHeight: 1.5 },
+  sectionHint: { margin: '3px 0 0', fontSize: 12, lineHeight: 1.5, color: 'var(--dsw-alias-label-tertiary)' },
+  requirements: {
+    margin: '4px 0 0', padding: '9px 10px', borderRadius: 8,
+    background: 'var(--dsw-alias-bg-layer-3)', fontSize: 12, lineHeight: 1.5,
+    color: 'var(--dsw-alias-label-secondary)',
+  },
   field: { display: 'flex', flexDirection: 'column', gap: 6, padding: '12px 0' },
   fieldHead: { display: 'flex', alignItems: 'center', gap: 8 },
   label: { flex: 1, minWidth: 0, fontSize: 13, fontWeight: 500, lineHeight: 1.5 },
@@ -592,9 +673,15 @@ function SettingsForm(props: FormProps) {
     const edits = { ...draft.edits }
     if (text === initial.values[field]) delete edits[field]
     else edits[field] = 'set'
-    const next = { values: { ...draft.values, [field]: text }, edits }
+    const next = { ...draft, values: { ...draft.values, [field]: text }, edits }
     setDraft(next)
-    props.onDirty(Object.keys(edits).length !== 0)
+    props.onDirty(draftDirty(next))
+  }
+
+  const editPassword = (password: string): void => {
+    const next = { ...draft, password }
+    setDraft(next)
+    props.onDirty(draftDirty(next))
   }
 
   const reset = (field: FieldKey): void => {
@@ -602,11 +689,12 @@ function SettingsForm(props: FormProps) {
     if (owns(props.snapshot.user, field)) edits[field] = 'unset'
     else delete edits[field]
     const next = {
+      ...draft,
       values: { ...draft.values, [field]: display(inherited(props.snapshot, field)) },
       edits,
     }
     setDraft(next)
-    props.onDirty(Object.keys(edits).length !== 0)
+    props.onDirty(draftDirty(next))
   }
 
   const overridden = (field: FieldKey): boolean => {
@@ -662,33 +750,74 @@ function SettingsForm(props: FormProps) {
         </label>
         <p style={styles.hint}>{props.t('enabledHint')}</p>
       </div>
-      <div style={styles.field}>
-        <div style={styles.fieldHead}>
-          <label style={styles.label} htmlFor="auth-tunnel-mode">{props.t('mode')}</label>
-          {overridden('mode') ? <span style={styles.badge}>{props.t('overridden')}</span> : null}
-          {overridden('mode')
-            ? <button type="button" style={styles.reset} disabled={disabled} onClick={() => { reset('mode') }}>{props.t('reset')}</button>
-            : null}
+      <section style={styles.section} aria-labelledby="auth-tunnel-access-section">
+        <div style={styles.sectionHead}>
+          <h3 id="auth-tunnel-access-section" style={styles.sectionTitle}>{props.t('accessSection')}</h3>
+          <p style={styles.sectionHint}>{props.t('accessSectionHint')}</p>
         </div>
-        <select
-          id="auth-tunnel-mode"
-          style={styles.input}
-          value={draft.values.mode}
-          disabled={disabled}
-          onChange={(event) => { edit('mode', event.target.value) }}
-        >
-          <option value="quick">{props.t('quick')}</option>
-          <option value="token">{props.t('token')}</option>
-        </select>
-        <p style={styles.hint}>{props.t('modeHint')}</p>
-      </div>
-      {field('passwordRef', 'passwordRef', 'passwordRefHint')}
-      {field('sessionTtlHours', 'sessionTtlHours', 'sessionTtlHoursHint', 'decimal')}
-      {target.mode === 'token' ? field('tokenRef', 'tokenRef', 'tokenRefHint') : null}
-      {target.mode === 'token' ? field('publicHostname', 'publicHostname', 'publicHostnameHint') : null}
-      {field('gatePort', 'gatePort', 'gatePortHint', 'numeric')}
-      {field('executable', 'executable', 'executableHint')}
-      {field('startupTimeoutMs', 'startupTimeoutMs', 'startupTimeoutMsHint', 'numeric')}
+        {field('passwordRef', 'passwordRef', 'passwordRefHint')}
+        <div style={styles.field}>
+          <div style={styles.fieldHead}>
+            <label style={styles.label} htmlFor="auth-tunnel-password">{props.t('password')}</label>
+          </div>
+          <input
+            id="auth-tunnel-password"
+            type="password"
+            autoComplete="new-password"
+            style={styles.input}
+            value={draft.password}
+            placeholder={props.t('passwordPlaceholder')}
+            disabled={disabled}
+            onChange={(event) => { editPassword(event.target.value) }}
+          />
+          <p style={styles.hint}>{props.t('passwordHint')}</p>
+        </div>
+        {field('sessionTtlHours', 'sessionTtlHours', 'sessionTtlHoursHint', 'decimal')}
+      </section>
+      <section style={styles.section} aria-labelledby="auth-tunnel-tunnel-section">
+        <div style={styles.sectionHead}>
+          <h3 id="auth-tunnel-tunnel-section" style={styles.sectionTitle}>{props.t('tunnelSection')}</h3>
+        </div>
+        <div style={styles.field}>
+          <div style={styles.fieldHead}>
+            <label style={styles.label} htmlFor="auth-tunnel-mode">{props.t('mode')}</label>
+            {overridden('mode') ? <span style={styles.badge}>{props.t('overridden')}</span> : null}
+            {overridden('mode')
+              ? <button type="button" style={styles.reset} disabled={disabled} onClick={() => { reset('mode') }}>{props.t('reset')}</button>
+              : null}
+          </div>
+          <select
+            id="auth-tunnel-mode"
+            style={styles.input}
+            value={draft.values.mode}
+            disabled={disabled}
+            onChange={(event) => { edit('mode', event.target.value) }}
+          >
+            <option value="quick">{props.t('quick')}</option>
+            <option value="token">{props.t('token')}</option>
+          </select>
+          <p style={styles.hint}>{props.t('modeHint')}</p>
+          <p role="note" style={styles.requirements}>
+            {props.t(target.mode === 'token' ? 'tokenRequirements' : 'quickRequirements')}
+          </p>
+        </div>
+        {target.mode === 'token' ? field('tokenRef', 'tokenRef', 'tokenRefHint') : null}
+        {target.mode === 'token' ? field('publicHostname', 'publicHostname', 'publicHostnameHint') : null}
+        {field(
+          'gatePort',
+          target.mode === 'token' ? 'tokenGatePort' : 'quickGatePort',
+          target.mode === 'token' ? 'tokenGatePortHint' : 'quickGatePortHint',
+          'numeric',
+        )}
+      </section>
+      <section style={styles.section} aria-labelledby="auth-tunnel-advanced-section">
+        <div style={styles.sectionHead}>
+          <h3 id="auth-tunnel-advanced-section" style={styles.sectionTitle}>{props.t('advancedSection')}</h3>
+          <p style={styles.sectionHint}>{props.t('advancedSectionHint')}</p>
+        </div>
+        {field('executable', 'executable', 'executableHint')}
+        {field('startupTimeoutMs', 'startupTimeoutMs', 'startupTimeoutMsHint', 'numeric')}
+      </section>
       <div style={styles.footer}>
         {props.failed ? <p role="status" style={styles.failed}>{props.t('saveFailed')}</p> : null}
         <button
@@ -718,6 +847,7 @@ function SettingsForm(props: FormProps) {
 
 interface ShellState {
   revision: number | undefined
+  formVersion: number
   dirty: boolean
   saving: boolean
   failed: boolean
@@ -725,7 +855,7 @@ interface ShellState {
 
 function AuthTunnelCard(props: CardProps & {
   scope: Pick<SettingsScope<AuthTunnelSettings>, 'getSnapshot' | 'subscribe'>
-  api: SettingsApi
+  api: CardApi
   runtime: RuntimeStatusStore
 }) {
   const snapshot = useSyncExternalStore(props.scope.subscribe, props.scope.getSnapshot)
@@ -736,6 +866,7 @@ function AuthTunnelCard(props: CardProps & {
   )
   const [shell, setShell] = useState<ShellState>({
     revision: snapshot.revision,
+    formVersion: 0,
     dirty: false,
     saving: false,
     failed: false,
@@ -744,7 +875,7 @@ function AuthTunnelCard(props: CardProps & {
   // A new Host revision is a new form identity. Reset during render rather
   // than mirroring an external store through an Effect.
   if (!shell.saving && shell.revision !== snapshot.revision) {
-    setShell({ revision: snapshot.revision, dirty: false, saving: false, failed: false })
+    setShell({ revision: snapshot.revision, formVersion: shell.formVersion + 1, dirty: false, saving: false, failed: false })
   }
 
   if (snapshot.status !== 'ready' || snapshot.value === undefined) return null
@@ -752,27 +883,40 @@ function AuthTunnelCard(props: CardProps & {
   const save = async (draft: Draft): Promise<void> => {
     const target = parseDraft(draft)
     const writes = savePlan(draft, target)
+    const password = draft.password.trim()
     const current = record(snapshot.value)
+    const currentPasswordRef = typeof current.passwordRef === 'string'
+      ? current.passwordRef
+      : target.passwordRef
     const runtimeChanged = writes.some(write => !Object.is(current[write.field], target[write.field]))
     const startingRevision = snapshot.revision
     setShell(current => ({ ...current, saving: true, failed: false }))
-    let committed: SettingsNamespaceView | undefined
+    let succeeded = false
     try {
-      committed = await commitSettingsWrites(props.api, startingRevision, writes)
+      await commitCardChanges(
+        props.api,
+        startingRevision,
+        writes,
+        current.enabled === true,
+        currentPasswordRef,
+        target.passwordRef,
+        password,
+      )
+      succeeded = true
     } catch {
       // The generic failure copy is intentional: credential references and
       // Host diagnostics must not be reflected into the settings page.
     }
     const latest = props.scope.getSnapshot()
-    const result = committed
-    const failed = result === undefined || writes.some(write => !writeSatisfied(result, write))
+    const failed = !succeeded
     const draftSurvived = latest.revision === startingRevision
-    setShell({
+    setShell(current => ({
       revision: latest.revision,
+      formVersion: failed ? current.formVersion : current.formVersion + 1,
       dirty: failed && draftSurvived,
       saving: false,
       failed,
-    })
+    }))
     if (!failed && runtimeChanged) props.runtime.settingsCommitted(target.enabled)
     void props.runtime.refresh()
   }
@@ -805,7 +949,7 @@ function AuthTunnelCard(props: CardProps & {
           </div>
           <p role="note" style={styles.note}>{props.t('live')}</p>
           <SettingsForm
-            key={String(snapshot.revision)}
+            key={`${String(snapshot.revision)}:${String(shell.formVersion)}`}
             t={props.t}
             snapshot={snapshot}
             dirty={shell.dirty}

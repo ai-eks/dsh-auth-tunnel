@@ -62,7 +62,16 @@ cloudflare tunnel: https://<random>.trycloudflare.com
 
 ### Web 设置
 
-保持 Loader 的 `auth-tunnel` 行启用后,打开 **Settings → Plugins → 插件配置 → Auth Tunnel** 即可编辑全部配置。页面中的 **启用公网隧道** 开关保存后会立即启动或停止密码门和 `cloudflared`,并保留这张设置卡片。页面同时显示应用中、运行中、已停止或失败状态以及当前公网 URL。密码和 Tunnel Token 仍只保存在凭据服务中;页面填写的是 `passwordRef` / `tokenRef` 引用名,不会读取或展示凭据明文。
+保持 Loader 的 `auth-tunnel` 行启用后,打开 **Settings → Plugins → 插件配置 → Auth Tunnel** 即可编辑全部配置。页面中的 **启用公网隧道** 开关保存后会立即启动或停止密码门和 `cloudflared`,并保留这张设置卡片。页面同时显示应用中、运行中、已停止或失败状态以及当前公网 URL。
+
+页面可以把新的访问密码一次性写入 `passwordRef` 指向的凭据:输入框保存后立即清空,Host 和页面都不会回传或展示明文。这里的“一次性”指只输入一次;密码本身仍可重复登录,直到再次替换,不是登录一次即作废的 OTP。Tunnel Token 仍应先写入凭据服务,页面的 `tokenRef` 只填写对应引用名。
+
+| 关联配置 | Quick | Token |
+|---|---|---|
+| 访问密码 | 必需;两种模式共用,可在页面仅写入一次 | 必需;两种模式共用,可在页面仅写入一次 |
+| Tunnel Token | 不需要 | 必需;`tokenRef` 指向已保存的 Token |
+| 公网主机名 | 不需要;自动获得临时 `trycloudflare.com` 地址 | 必需;填写 Cloudflare 已绑定域名 |
+| Gate 端口 | 建议 `0`,自动分配 | 必须固定为 `1–65535`,并与 ingress 一致 |
 
 页面保存的配置会自动应用,无需重启 DeepSeek Harness。`passwordRef` 和 `sessionTtlHours` 原地更新;`mode`、`tokenRef`、`gatePort` 或 `executable` 等隧道级变更会只重建插件自己的密码门或 `cloudflared`。新配置启动失败时,页面会显示错误并尽量保留旧隧道。切换回 Quick 模式时会保留 Token 模式字段,方便之后切回;Quick 模式会忽略这些字段。日常启停应使用页面开关;设置 Loader `disabled: true` 会卸载 Host 的 `auth-tunnel` 设置命名空间和卡片本身。
 
@@ -90,7 +99,7 @@ DSH_TUNNEL_TOKEN: 'eyJhIjo...'
     gatePort: 7677
 ```
 
-`publicHostname` 只能填写 DNS 主机名,不能带 `https://`、端口或路径。也可以在上述 Web 设置卡片中完成同样的配置并立即应用;修改 `gatePort` 后,仍需确保 Cloudflare Dashboard ingress 指向相同端口。
+`publicHostname` 只能填写 DNS 主机名,不能带 `https://`、端口或路径。除 Tunnel Token 明文本身外,其余配置都可以在上述 Web 设置卡片中完成并立即应用;修改 `gatePort` 后,仍需确保 Cloudflare Dashboard ingress 指向相同端口。
 
 ### 配置参考
 

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
-  apply, commitSettingsWrites, RuntimeStatusStore, runtimeStatusLocaleKey, validateSettingsValues,
+  apply, commitCardChanges, commitCredentialWrite, commitSettingsWrites, RuntimeStatusStore,
+  runtimeStatusLocaleKey, validateSettingsValues,
   type AuthTunnelSettings, type RuntimeStatusSnapshot, type SettingsWrite,
 } from '../src/client/index.tsx'
 
@@ -12,6 +13,27 @@ const quick: AuthTunnelSettings = {
   gatePort: 0,
   executable: 'cloudflared',
   startupTimeoutMs: 15_000,
+}
+
+function successfulCardApi(user: Record<string, unknown>, order: string[]) {
+  const mutate = vi.fn(() => {
+    order.push('settings')
+    return Promise.resolve({
+      rpcId: 'test',
+      result: {
+        ok: true as const,
+        value: {
+          ns: 'auth-tunnel', schema: {}, value: {}, user,
+          applies: 'live' as const, secrets: [], revision: 8,
+        },
+      },
+    })
+  })
+  const set = vi.fn(() => {
+    order.push('credential')
+    return Promise.resolve({ rpcId: 'test', result: { ok: true as const, value: {} } })
+  })
+  return { api: { settings: { mutate }, credentials: { set } } as never, mutate, set }
 }
 
 describe('auth-tunnel settings card contract', () => {
@@ -71,6 +93,82 @@ describe('auth-tunnel settings card contract', () => {
       ],
     })
     expect(committed.revision).toBe(8)
+  })
+
+  it('writes an access password only through the write-only credentials domain', async () => {
+    const set = vi.fn(() => Promise.resolve({
+      rpcId: 'test',
+      result: { ok: true as const, value: {} },
+    }))
+
+    await commitCredentialWrite({ credentials: { set } } as never, 'DSH_WEB_PASSWORD', 'new-password')
+
+    expect(set).toHaveBeenCalledTimes(1)
+    expect(set).toHaveBeenCalledWith({ ref: 'DSH_WEB_PASSWORD', value: 'new-password' })
+  })
+
+  it('surfaces a rejected credential write as a failed save', async () => {
+    const set = vi.fn(() => Promise.resolve({
+      rpcId: 'test',
+      result: { ok: false as const, error: { code: 'credential-rejected', message: 'read only' } },
+    }))
+
+    await expect(commitCredentialWrite(
+      { credentials: { set } } as never,
+      'DSH_WEB_PASSWORD',
+      'new-password',
+    )).rejects.toThrow('read only')
+  })
+
+  it('commits settings before rotating the active password so a public session can finish saving', async () => {
+    const order: string[] = []
+    const { api } = successfulCardApi({ sessionTtlHours: 24 }, order)
+
+    await commitCardChanges(
+      api,
+      7,
+      [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+      true,
+      'DSH_WEB_PASSWORD',
+      'DSH_WEB_PASSWORD',
+      'rotated-password',
+    )
+
+    expect(order).toEqual(['settings', 'credential'])
+  })
+
+  it('populates a newly selected password reference before settings activate it', async () => {
+    const order: string[] = []
+    const { api } = successfulCardApi({ passwordRef: 'NEXT_WEB_PASSWORD' }, order)
+
+    await commitCardChanges(
+      api,
+      7,
+      [{ field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' }],
+      true,
+      'DSH_WEB_PASSWORD',
+      'NEXT_WEB_PASSWORD',
+      'next-password',
+    )
+
+    expect(order).toEqual(['credential', 'settings'])
+  })
+
+  it('stores the password before enabling a currently stopped tunnel', async () => {
+    const order: string[] = []
+    const { api } = successfulCardApi({ enabled: true }, order)
+
+    await commitCardChanges(
+      api,
+      7,
+      [{ field: 'enabled', op: 'set', value: true }],
+      false,
+      'DSH_WEB_PASSWORD',
+      'DSH_WEB_PASSWORD',
+      'first-password',
+    )
+
+    expect(order).toEqual(['credential', 'settings'])
   })
 
   it('registers its browser card under the Host settings namespace', () => {

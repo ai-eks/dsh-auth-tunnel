@@ -62,7 +62,16 @@ Open that URL and enter `DSH_WEB_PASSWORD` on the login page. Share the URL, not
 
 ### Web settings
 
-With the Loader `auth-tunnel` row enabled, open **Settings → Plugins → Plugin configuration → Auth Tunnel** to edit every option. Saving the **Enable public tunnel** switch immediately starts or stops the gate and `cloudflared` while keeping this card available. The card also shows applying, running, stopped, or failed state and the current public URL. Passwords and Tunnel Tokens remain in the credentials service: the card edits only the `passwordRef` / `tokenRef` names and never reads or displays credential values.
+With the Loader `auth-tunnel` row enabled, open **Settings → Plugins → Plugin configuration → Auth Tunnel** to edit every option. Saving the **Enable public tunnel** switch immediately starts or stops the gate and `cloudflared` while keeping this card available. The card also shows applying, running, stopped, or failed state and the current public URL.
+
+The card can write a new access password once to the credential named by `passwordRef`: the input clears after saving, and neither the Host nor the page returns or displays the literal. "Once" describes the write-only input; the password remains reusable until replaced and is not a login-once OTP. Store the Tunnel Token in the credential service first; `tokenRef` names that stored credential.
+
+| Related setting | Quick | Token |
+|---|---|---|
+| Access password | Required and shared by both modes; can be entered once on the page | Required and shared by both modes; can be entered once on the page |
+| Tunnel Token | Not used | Required; `tokenRef` names the stored Token |
+| Public hostname | Not used; a temporary `trycloudflare.com` URL is assigned | Required; enter the hostname bound in Cloudflare |
+| Gate port | Keep `0` for automatic allocation | Fixed `1–65535`, matching Cloudflare ingress |
 
 Saved values apply automatically without restarting DeepSeek Harness. `passwordRef` and `sessionTtlHours` update in place; tunnel-level changes such as `mode`, `tokenRef`, `gatePort`, or `executable` rebuild only the plugin's gate or `cloudflared`. If the replacement cannot start, the card reports the error and keeps the previous tunnel whenever possible. Switching back to Quick preserves the Token-mode fields for a later switch, and Quick ignores them. Keep the Loader row enabled for normal on/off control: setting Loader `disabled: true` unloads both the Host `auth-tunnel` settings namespace and its card.
 
@@ -90,7 +99,7 @@ Override the bundle row in `$DSH_HOME/profiles/web/cordis.patch.yml`:
     gatePort: 7677
 ```
 
-`publicHostname` is only the DNS hostname: do not include `https://`, a port, or a path. The same configuration can be made and applied immediately through the Web settings card above. After changing `gatePort`, the Cloudflare Dashboard ingress must still point at the same port.
+`publicHostname` is only the DNS hostname: do not include `https://`, a port, or a path. Except for the Tunnel Token literal itself, the same configuration can be made and applied immediately through the Web settings card above. After changing `gatePort`, the Cloudflare Dashboard ingress must still point at the same port.
 
 ### Configuration reference
 
