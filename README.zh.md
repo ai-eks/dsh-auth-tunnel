@@ -20,6 +20,12 @@
 dsh plugin --profile web add github:ai-eks/dsh-auth-tunnel
 ```
 
+当前分支适配 DeepSeek Harness `0.1.0-rc.7` 及以上版本。Harness `0.1.0-rc.6` 必须固定安装对应的不可变 tag:
+
+```sh
+dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#v0.1.0-rc.6'
+```
+
 Git 安装通过 `prepare` 构建检出的源码。pnpm 10 及以上版本可能先要求允许该构建;按照 `dsh` 打印的 profile `pnpm-workspace.yaml` 路径和准确包名配置后,重新执行命令。
 
 使用本地 checkout 时,先构建再添加路径:
@@ -54,6 +60,25 @@ cloudflare tunnel: https://<random>.trycloudflare.com
 
 打开这个 URL,在登录页输入 `DSH_WEB_PASSWORD` 对应的密码。只分享 URL,不要分享密码。启用的行也会显示在 Web Settings → Plugins 中。
 
+### Web 设置
+
+保持 Loader 的 `auth-tunnel` 行启用后,打开 **Settings → Plugins → 插件配置 → Auth Tunnel** 即可编辑全部配置。页面中的 **启用公网隧道** 开关保存后会立即启动或停止密码门和 `cloudflared`,并保留这张设置卡片。页面同时显示应用中、运行中、已停止或失败状态以及当前公网 URL。
+
+![Auth Tunnel 插件配置](docs/images/auth-tunnel-settings.zh.png)
+
+**允许远程页面修改设置** 默认关闭。先在本机开启并刷新公网页面后,已通过访问密码登录的页面即可读取和保存 Auth Tunnel 卡片及语言偏好。这些写入走插件自有的鉴权接口,因此兼容未修改的 DeepSeek Harness `0.1.0-rc.7`;通用 Host settings 与 credentials RPC 仍保持关闭。同一时刻只接受一个远程写入;前一项配置仍在应用时,新的写入会返回冲突,页面重新读取后即可重试。从远程页面关闭该开关时,本次保存会完整返回后再关闭访问;重新开启必须使用本机页面或设置文件。
+
+页面通过独立的 **更新密码** 按钮写入当前已保存的 `passwordRef` 凭据,密码与配置不会放在同一次事务里提交。更新成功后输入框立即清空,Host 和页面都不会回传或展示明文;密码本身仍可重复登录,直到再次替换,不是登录一次即作废的 OTP。若要更换 `passwordRef`,请先创建目标凭据并保存引用,再单独更新密码。Tunnel Token 仍应先写入凭据服务,页面的 `tokenRef` 只填写对应引用名。
+
+| 关联配置 | Quick | Token |
+|---|---|---|
+| 访问密码 | 必需;两种模式共用,通过只写按钮单独更新 | 必需;两种模式共用,通过只写按钮单独更新 |
+| Tunnel Token | 不需要 | 必需;`tokenRef` 指向已保存的 Token |
+| 公网主机名 | 不需要;自动获得临时 `trycloudflare.com` 地址 | 必需;填写 Cloudflare 已绑定域名 |
+| Gate 端口 | 建议 `0`,自动分配 | 必须固定为 `1–65535`,并与 ingress 一致 |
+
+页面保存的配置会自动应用,无需重启 DeepSeek Harness。`passwordRef` 和 `sessionTtlHours` 原地更新;`mode`、`tokenRef`、`gatePort` 或 `executable` 等隧道级变更会先启动候选实例,再替换插件自己的密码门或 `cloudflared`。候选实例启动失败时,页面会显示错误并保留旧隧道;切换成功时公网页面可能短暂断开,请打开新显示的地址,重新读取后再重试失败操作。切换回 Quick 模式时会保留 Token 模式字段,方便之后切回;Quick 模式会忽略这些字段。日常启停应使用页面开关;设置 Loader `disabled: true` 会卸载 Host 的 `auth-tunnel` 设置命名空间和卡片本身。
+
 ### 命名隧道模式
 
 公网域名需要保持稳定时使用 token 模式。在 Cloudflare 创建命名隧道,绑定 `gui.example.com` 之类的域名,并让 dashboard ingress 指向固定 loopback 密码门,例如 `http://127.0.0.1:7677`。
@@ -71,18 +96,21 @@ DSH_TUNNEL_TOKEN: 'eyJhIjo...'
 - id: auth-tunnel
   disabled: false
   config:
+    enabled: true
     mode: token
     tokenRef: DSH_TUNNEL_TOKEN
     publicHostname: gui.example.com
     gatePort: 7677
 ```
 
-`publicHostname` 只能填写 DNS 主机名,不能带 `https://`、端口或路径。profile patch 在 bundle 层之后应用,启动器会监听该文件,保存后会自动重载这行配置。
+`publicHostname` 只能填写 DNS 主机名,不能带 `https://`、端口或路径。除 Tunnel Token 明文本身外,其余配置都可以在上述 Web 设置卡片中完成并立即应用;修改 `gatePort` 后,仍需确保 Cloudflare Dashboard ingress 指向相同端口。
 
 ### 配置参考
 
 | 键 | 类型 | 默认值 | 作用 |
 |---|---|---|---|
+| `enabled` | boolean | `true` | 是否运行密码门和 `cloudflared`;页面保存 `false` 后立即停止公网访问但保留设置页面。 |
+| `allowRemoteSettings` | boolean | `false` | 是否允许已认证公网页面更新 Auth Tunnel 配置、只写访问密码和语言偏好。 |
 | `passwordRef` | string(credential-ref) | `DSH_WEB_PASSWORD` | 解析共享访问密码的凭据引用;未配置会导致启动失败。 |
 | `sessionTtlHours` | number ≥ 0.01 | `720` | Cookie 有效期,单位为小时,默认 30 天。 |
 | `mode` | `quick` \| `token` | `quick` | 临时 quick 隧道或命名 token 隧道。 |
@@ -94,8 +122,8 @@ DSH_TUNNEL_TOKEN: 'eyJhIjo...'
 
 ## 已知限制
 
-- **共享密码、单用户信任**:每个密码持有者都可以访问完整 Web GUI,包括 Host 配置面。当前没有速率限制、锁定、按用户会话或服务端吊销表。轮换密码会使所有会话失效;更严肃的部署应使用 Cloudflare Access 或其他身份感知代理。
-- **单隧道、无自动重启**:`cloudflared` 意外退出时会记录错误,但不会自动重启;需要重启 `dsh`。
+- **共享密码、单用户信任**:每个密码持有者都可以访问完整 Web GUI;开启 `allowRemoteSettings` 后还可使用 Auth Tunnel 卡片、只写密码输入和语言偏好,其他 Host 配置方法仍被拦截。当前没有速率限制、锁定、按用户会话或服务端吊销表。轮换密码会使所有会话失效;更严肃的部署应使用 Cloudflare Access 或其他身份感知代理。
+- **单隧道、无自动重启**:`cloudflared` 意外退出时会记录并显示错误,但不会自动重启;在页面关闭再开启隧道即可恢复。
 - **Quick URL 每次启动都会变化**:需要固定 URL 时应使用 token 模式和自有域名。
 - **Loopback 保持未认证**:密码只保护隧道路径;本机浏览器和进程仍可直接访问原始 Web GUI。
 - **子进程环境最小化**:只继承 `PATH`、`HOME` 和 `TMPDIR`;公司代理应在插件之外为 `cloudflared` 配置。
@@ -131,7 +159,7 @@ bundle 会禁用启动时选择的原生目录选择器,并挂载应用内目录
 - **quick** 执行 `cloudflared tunnel --url http://127.0.0.1:<gate>`,并从子进程输出读取生成的 `*.trycloudflare.com` URL。
 - **token** 通过子进程环境变量 `TUNNEL_TOKEN` 传递 Tunnel Token,执行 `cloudflared tunnel run`,并等待连接注册标记。token 不会出现在 argv 中。
 
-只有密码门开始监听且隧道报告就绪后,插件激活才会完成。凭据或模式字段无效、密码门端口被占用、可执行文件缺失、子进程提前退出或等待超时,都会在公布公网 URL 前让插件加载失败。拆卸时会关闭密码门,向 `cloudflared` 发送 `SIGTERM`,必要时在 2000 ms 后升级为 `SIGKILL`,并移除 shell 与提示词贡献。
+只有密码门开始监听且隧道报告就绪后,初次插件激活才会完成。凭据或模式字段无效、密码门端口被占用、可执行文件缺失、子进程提前退出或等待超时,都会在公布公网 URL 前让初次加载失败。运行期间的配置变更会串行合并;需要重建时先启动新资源,成功后再替换旧资源,失败则保留旧隧道并通过设置页状态接口报告。拆卸或页面关闭时会关闭密码门,向 `cloudflared` 发送 `SIGTERM`,必要时在 2000 ms 后升级为 `SIGKILL`,并移除 shell 与提示词贡献。
 
 ## 模型体验
 
