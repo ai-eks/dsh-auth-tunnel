@@ -1915,8 +1915,12 @@ class AuthTunnelRuntime {
       }
     } catch (error) {
       gate.closeConnections()
+      if (server !== undefined) this.detachPreCommitRemoteMutations(false)
       this.liveGates.delete(gate)
-      if (server !== undefined) await closeGate(server)
+      if (server !== undefined) {
+        await this.remoteMutations.committedTail
+        await closeGate(server)
+      }
       throw error
     }
   }

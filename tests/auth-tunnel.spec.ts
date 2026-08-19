@@ -2498,6 +2498,83 @@ describe('tunnel lifecycle', () => {
     expect(await liveFixturePids()).toEqual([])
   })
 
+  it('returns a committed disable response before cleaning up a staged token gate', { timeout: 60_000 }, async () => {
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const gatePort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const composition = await loadComposition({
+      mode: 'token',
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
+      gatePort,
+      allowRemoteSettings: true,
+      executable: await fixtureExecutable('fake-cloudflared-silent.sh'),
+      startupTimeoutMs: 10_000,
+    }, { wait: false, seeds: { DSH_TUNNEL_TOKEN: 'fixture-token' } })
+    const base = `http://127.0.0.1:${String(gatePort)}`
+    const childDeadline = Date.now() + 5000
+    while ((await liveFixturePids()).length === 0) {
+      if (Date.now() >= childDeadline) throw new Error('staged cloudflared did not start')
+      await sleep(25)
+    }
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      headers: { cookie },
+    })).json() as { settings: { revision: number } }
+    const originalEnd = ServerResponse.prototype.end
+    let releaseResponse = (): void => {}
+    let markResponseHeld = (): void => {}
+    const responseHeld = new Promise<void>((resolve) => { markResponseHeld = resolve })
+    let held = false
+    vi.spyOn(ServerResponse.prototype, 'end').mockImplementation((function (
+      this: ServerResponse,
+      ...args: unknown[]
+    ): ServerResponse {
+      if (!held && this.req.url === '/dsh-auth-tunnel/settings') {
+        held = true
+        releaseResponse = () => { Reflect.apply(originalEnd, this, args) }
+        markResponseHeld()
+        return this
+      }
+      return Reflect.apply(originalEnd, this, args) as ServerResponse
+    }) as typeof ServerResponse.prototype.end)
+
+    let responseSettled = false
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'enabled', op: 'set', value: false }],
+        password: '',
+      }),
+    }).catch(() => undefined).finally(() => { responseSettled = true })
+    await responseHeld
+    let released = false
+    try {
+      const stoppedDeadline = Date.now() + 5000
+      while ((await liveFixturePids()).length !== 0) {
+        if (Date.now() >= stoppedDeadline) throw new Error('staged cloudflared did not stop')
+        await sleep(25)
+      }
+      await sleep(100)
+      expect(responseSettled).toBe(false)
+      releaseResponse()
+      released = true
+      const response = await responseTask
+      expect(response?.status).toBe(200)
+      expect(await response?.json()).toMatchObject({ settings: { value: { enabled: false } } })
+      await composition.loaded.loader.await()
+      await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
+      expect(await liveFixturePids()).toEqual([])
+    } finally {
+      if (!released) releaseResponse()
+    }
+  })
+
   it('a live disable stays latched before staged startup is created', { timeout: 60_000 }, async () => {
     const composition = await loadComposition({
       mode: 'quick',
