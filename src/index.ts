@@ -1565,7 +1565,9 @@ class AuthTunnelRuntime {
     if (this.disposed) return
     const passwordRefChanged = this.configured !== undefined
       && this.configured.passwordRef !== config.passwordRef
-    if (!config.enabled || passwordRefChanged) this.passwordChecks.abort()
+    const startupChanged = this.configured !== undefined
+      && changesTunnelStartup(this.configured, config)
+    if (!config.enabled || passwordRefChanged || startupChanged) this.passwordChecks.abort()
     if (config.enabled && this.passwordChecks.signal.aborted) this.passwordChecks = new AbortController()
     const staged = this.stagedStartup
     if (staged !== undefined && (!config.enabled || changesTunnelStartup(staged.owner, config))) {

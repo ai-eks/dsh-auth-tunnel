@@ -3716,6 +3716,48 @@ describe('rc7 plugin settings', () => {
     }
   })
 
+  it('supersedes a stalled pre-spawn password check with the latest startup target', { timeout: 60_000 }, async () => {
+    const quickExecutable = await fixtureExecutable('fake-cloudflared-quick.sh')
+    const delayedExecutable = await fixtureExecutable('fake-cloudflared-delayed.sh')
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const nextGatePort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const composition = await bootQuick({ executable: quickExecutable })
+    const before = await composition.runtimeStatus()
+    let releaseResolve = (): void => {}
+    composition.credentials().resolveBarrier = new Promise<void>((resolve) => { releaseResolve = resolve })
+    composition.credentials().resolveBarrierRef = 'DSH_WEB_PASSWORD'
+    let markResolveStarted = (): void => {}
+    const resolveStarted = new Promise<void>((resolve) => { markResolveStarted = resolve })
+    composition.credentials().resolveStarted = (ref) => {
+      if (ref !== 'DSH_WEB_PASSWORD') return
+      composition.credentials().resolveStarted = undefined
+      markResolveStarted()
+    }
+
+    await composition.settings().update(namespace, { executable: delayedExecutable })
+    await resolveStarted
+    composition.credentials().resolveBarrier = undefined
+    composition.credentials().resolveBarrierRef = undefined
+    try {
+      await composition.settings().update(namespace, {
+        executable: quickExecutable,
+        gatePort: nextGatePort,
+      })
+      await waitForStatus(
+        composition,
+        status => status.revision > before.revision && status.phase === 'running' && status.running,
+        3000,
+      )
+      expect((await fetch(`http://127.0.0.1:${String(nextGatePort)}/dsh-auth-tunnel/login`)).status).toBe(200)
+    } finally {
+      releaseResolve()
+    }
+  })
+
   it('disables the active tunnel while tunnel-token resolution is stalled', { timeout: 60_000 }, async () => {
     const probeServer = createNetServer()
     probeServer.listen(0, '127.0.0.1')
