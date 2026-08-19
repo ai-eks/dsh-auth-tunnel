@@ -556,6 +556,7 @@ interface RemoteMutationFence {
 
 class PasswordGate {
   private auth: { passwordRef: string; ttlMs: number; allowRemoteSettings: boolean }
+  private publicAccessEnabled = true
   private remoteWritesEnabled: boolean
   private remoteMutationGeneration = 0
   private authGeneration = 0
@@ -587,7 +588,7 @@ class PasswordGate {
       ttlMs: config.sessionTtlHours * 3600 * 1000,
       allowRemoteSettings: config.allowRemoteSettings,
     }
-    this.remoteWritesEnabled = config.allowRemoteSettings
+    this.remoteWritesEnabled = this.publicAccessEnabled && config.allowRemoteSettings
   }
 
   /** Drop connections authenticated with the previous credential value. */
@@ -605,7 +606,14 @@ class PasswordGate {
 
   /** Invalidate pending authentication before shutting down the gate server. */
   closeConnections(): void {
-    this.revokeRemoteSettings()
+    this.revokePublicAccess()
+  }
+
+  /** Reject new public traffic while allowing already-running local handlers to finish. */
+  revokePublicAccess(): void {
+    if (!this.publicAccessEnabled) return
+    this.publicAccessEnabled = false
+    this.revokeRemoteMutations()
     this.revokeAuthenticatedConnections()
   }
 
@@ -752,6 +760,10 @@ class PasswordGate {
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     /* v8 ignore next -- node:http always sets url on server requests */
     const url = new URL(req.url ?? '/', 'http://x')
+    if (!this.publicAccessEnabled) {
+      writeJson(res, 503, { error: 'tunnel disabled' })
+      return
+    }
     if (url.pathname === LOGIN_PATH || url.pathname === LOGOUT_PATH) {
       await this.handleHandshake(url, req, res)
       return
@@ -760,8 +772,11 @@ class PasswordGate {
       this.proxy(req, res, false)
       return
     }
+    const remoteMutationRequest = req.method === 'POST'
+      && (url.pathname === AUTH_TUNNEL_REMOTE_SETTINGS_PATH || url.pathname === AUTH_TUNNEL_REMOTE_LOCALE_PATH)
     const authGeneration = this.authGeneration
-    if (!await this.authenticated(req) || authGeneration !== this.authGeneration) {
+    if (!await this.authenticated(req)
+      || (authGeneration !== this.authGeneration && !remoteMutationRequest)) {
       await this.challenge(req, res)
       return
     }
@@ -976,7 +991,7 @@ class PasswordGate {
     try {
       const locale = objectRecord(body).locale
       if (locale !== 'zh' && locale !== 'en') throw new TypeError('unsupported locale')
-      await this.serializeRemoteMutation(async (enterCommitPhase) => {
+      const mutateLocale = async (enterCommitPhase: () => void): Promise<void> => {
         const authorizationPasswordRef = this.auth.passwordRef
         const authorizationCredentialGeneration = this.credentialGeneration(authorizationPasswordRef)
         await this.requireRemoteMutationAuthorization(req)
@@ -1026,6 +1041,14 @@ class PasswordGate {
           throw error
         }
         await writeJsonComplete(res, 200, { locale })
+      }
+      await this.serializeRemoteMutation(async (enterCommitPhase) => {
+        try {
+          await mutateLocale(enterCommitPhase)
+        } catch (error) {
+          this.ctx.logger.warn(`auth-tunnel: remote locale write rejected: ${error instanceof Error ? error.message : String(error)}`)
+          await writeJsonComplete(res, 409, { error: 'language was not saved' })
+        }
       })
     } catch (error) {
       this.ctx.logger.warn(`auth-tunnel: remote locale write rejected: ${error instanceof Error ? error.message : String(error)}`)
@@ -1132,6 +1155,11 @@ class PasswordGate {
 
   /** Forward one accepted upgrade handshake by piping the raw connection to the upstream. */
   private async handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
+    if (!this.publicAccessEnabled) {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n')
+      socket.destroy()
+      return
+    }
     const authGeneration = this.authGeneration
     if (!await this.authenticated(req)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n')
@@ -1492,6 +1520,7 @@ class AuthTunnelRuntime {
       }
     }
     if (!config.enabled) {
+      for (const gate of this.liveGates) gate.revokePublicAccess()
       this.stagedStartup?.abort()
       const handoff = this.finishHandoff
       if (handoff !== undefined) {

@@ -51,6 +51,12 @@ class StubCredentials extends Service {
   /** Test knob: reject the next credential write before it changes storage. */
   failNextSet = false
 
+  /** Test knob: hold a credential write after it enters the commit phase. */
+  setBarrier: Promise<void> | undefined
+
+  /** Test knob: observe a credential write before its barrier. */
+  setStarted: ((ref: string) => void) | undefined
+
   /** Test knob: hold credential resolution before startup creates a controller. */
   resolveDelayMs = 0
 
@@ -67,11 +73,13 @@ class StubCredentials extends Service {
   afterResolve: ((ref: string) => void) | undefined
 
   /** Test knob: set or delete one credential. */
-  set(ref: string, value: string | undefined): void {
+  async set(ref: string, value: string | undefined): Promise<void> {
     if (this.failNextSet) {
       this.failNextSet = false
       throw new Error('credential persistence failed')
     }
+    this.setStarted?.(ref)
+    if (this.setBarrier !== undefined) await this.setBarrier
     if (value === undefined) {
       this.values.delete(ref)
     } else {
@@ -1345,6 +1353,83 @@ describe('password gate over the loopback webserver', () => {
     expect(composition.settings().get(settingsNamespace('locale'))).toEqual({})
   })
 
+  it('keeps a failed locale response fenced during a tunnel handoff', { timeout: 60_000 }, async () => {
+    const quickExecutable = await fixtureExecutable('fake-cloudflared-quick.sh')
+    const delayedExecutable = await fixtureExecutable('fake-cloudflared-delayed.sh')
+    const composition = await bootQuick({ allowRemoteSettings: true, executable: quickExecutable })
+    composition.settings().register(settingsNamespace('locale'), z.object({
+      preference: z.union(['zh', 'en']).required(false),
+    }))
+    const originalPid = (await liveFixturePids())[0]!
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    let releasePersist = (): void => {}
+    composition.settings().persistBarrier = new Promise<void>((resolve) => { releasePersist = resolve })
+    let markPersistStarted = (): void => {}
+    const persistStarted = new Promise<void>((resolve) => { markPersistStarted = resolve })
+    composition.settings().persistStarted = markPersistStarted
+    const originalEnd = ServerResponse.prototype.end
+    let releaseResponse = (): void => {}
+    let markResponseHeld = (): void => {}
+    const responseHeld = new Promise<void>((resolve) => { markResponseHeld = resolve })
+    let held = false
+    vi.spyOn(ServerResponse.prototype, 'end').mockImplementation((function (
+      this: ServerResponse,
+      ...args: unknown[]
+    ): ServerResponse {
+      if (!held && this.req.url === '/dsh-auth-tunnel/locale') {
+        held = true
+        releaseResponse = () => { Reflect.apply(originalEnd, this, args) }
+        markResponseHeld()
+        return this
+      }
+      return Reflect.apply(originalEnd, this, args) as ServerResponse
+    }) as typeof ServerResponse.prototype.end)
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/locale`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ locale: 'en' }),
+    }).catch(() => undefined)
+    await persistStarted
+    const beforeCredential = await composition.runtimeStatus()
+    await composition.credentials().set('DSH_WEB_PASSWORD', 'local-admin-password')
+    composition.settings().persistStarted = undefined
+    composition.settings().persistBarrier = undefined
+    releasePersist()
+    await responseHeld
+    let responseReleased = false
+    try {
+      await waitForStatus(
+        composition,
+        status => status.revision > beforeCredential.revision && status.phase === 'running',
+      )
+      const beforeHandoff = await composition.runtimeStatus()
+      await composition.settings().update(settingsNamespace('auth-tunnel'), { executable: delayedExecutable })
+      await waitForStatus(
+        composition,
+        status => status.revision > beforeHandoff.revision && status.phase === 'running',
+      )
+      await sleep(3700)
+      expect(await liveFixturePids()).toContain(originalPid)
+
+      releaseResponse()
+      responseReleased = true
+      expect((await responseTask)?.status).toBe(409)
+      const retiredDeadline = Date.now() + 5000
+      while ((await liveFixturePids()).includes(originalPid)) {
+        if (Date.now() >= retiredDeadline) throw new Error('failed locale response did not release the handoff')
+        await sleep(25)
+      }
+      expect(composition.settings().get(settingsNamespace('locale'))).toEqual({})
+    } finally {
+      composition.settings().persistStarted = undefined
+      composition.settings().persistBarrier = undefined
+      releasePersist()
+      if (!responseReleased) releaseResponse()
+    }
+  })
+
   it('does not let pre-commit credential resolution delay local tunnel shutdown', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true }, {
       seeds: { NEXT_WEB_PASSWORD: 'next-password' },
@@ -1403,6 +1488,61 @@ describe('password gate over the loopback webserver', () => {
     releaseResolve()
     await responseTask
     expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
+  })
+
+  it('revokes public access while a committed credential write delays shutdown', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    composition.loaded.webServer.register({
+      kind: 'exact', path: '/api/disable-probe', handler: (_req, res) => {
+        res.writeHead(200)
+        res.end('ok')
+      },
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    expect((await fetch(`${base}/api/disable-probe`, { headers: { cookie } })).status).toBe(200)
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    let releaseSet = (): void => {}
+    composition.credentials().setBarrier = new Promise<void>((resolve) => { releaseSet = resolve })
+    let markSetStarted = (): void => {}
+    const setStarted = new Promise<void>((resolve) => { markSetStarted = resolve })
+    composition.credentials().setStarted = (ref) => {
+      if (ref !== 'DSH_WEB_PASSWORD') return
+      composition.credentials().setStarted = undefined
+      markSetStarted()
+    }
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [],
+        password: 'replacement-password',
+      }),
+    }).catch(() => undefined)
+    await setStarted
+    let released = false
+    try {
+      await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
+
+      const denied = await fetch(`${base}/api/disable-probe`, { headers: { cookie } })
+      expect(denied.status).toBe(503)
+      expect(await composition.runtimeStatus()).toMatchObject({ phase: 'applying', running: true })
+      expect(await liveFixturePids()).toHaveLength(1)
+
+      releaseSet()
+      released = true
+      expect((await responseTask)?.status).toBe(200)
+      await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
+      expect(await liveFixturePids()).toEqual([])
+    } finally {
+      composition.credentials().setBarrier = undefined
+      composition.credentials().setStarted = undefined
+      if (!released) releaseSet()
+    }
   })
 
   it('releases the remote mutation fence when the writer disconnects before the response', { timeout: 60_000 }, async () => {
