@@ -819,13 +819,51 @@ describe('auth-tunnel settings card contract', () => {
         return stop
       }),
     }
-    const remote = { refresh: vi.fn(() => Promise.resolve(undefined)) }
+    const remote = { refreshAfterCurrentRead: vi.fn(() => Promise.resolve()) }
 
     const dispose = installRemoteSettingsRuntimeRecovery(runtime as never, remote as never)
     runtimeChanged()
-    expect(remote.refresh).toHaveBeenCalledOnce()
+    expect(remote.refreshAfterCurrentRead).toHaveBeenCalledOnce()
     dispose()
     expect(stop).toHaveBeenCalledOnce()
+  })
+
+  it('queues runtime recovery behind an in-flight forbidden settings read', async () => {
+    const document = parseRemoteSettingsDocument({
+      settings: {
+        value: { ...quick, allowRemoteSettings: true },
+        base: quick,
+        user: { allowRemoteSettings: true },
+        revision: 3,
+        writable: true,
+      },
+    })
+    const forbidden = Object.assign(new Error('forbidden'), { status: 403 })
+    let rejectPending = (_error: unknown): void => {}
+    const pending = new Promise<typeof document>((_resolve, reject) => { rejectPending = reject })
+    const read = vi.fn()
+      .mockResolvedValueOnce(document)
+      .mockImplementationOnce(() => pending)
+      .mockResolvedValue(document)
+    const store = new RemoteSettingsStore({ read, commit: vi.fn() })
+    let runtimeChanged = (): void => {}
+    const dispose = installRemoteSettingsRuntimeRecovery({
+      subscribe: (listener: () => void) => {
+        runtimeChanged = listener
+        return () => {}
+      },
+    } as never, store)
+
+    await store.refresh()
+    const stale = store.refresh()
+    runtimeChanged()
+    rejectPending(forbidden)
+    await stale
+
+    await vi.waitFor(() => { expect(read).toHaveBeenCalledTimes(3) })
+    expect(store.getSnapshot()).toMatchObject({ status: 'ready', writable: true })
+    dispose()
+    store.dispose()
   })
 
   it('loads and commits the authenticated remote scope without Harness settingsScope', async () => {

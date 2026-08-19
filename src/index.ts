@@ -1636,7 +1636,10 @@ class AuthTunnelRuntime {
       staged.controller.abort()
     }
     for (const gate of this.liveGates) gate.credentialUpdated(ref)
-    if (accessPasswordUpdated) this.detachPreCommitRemoteMutations(false)
+    if (accessPasswordUpdated) {
+      this.passwordChecks.abort()
+      this.detachPreCommitRemoteMutations(false)
+    }
     if (config !== undefined && (accessPasswordUpdated || tokenUpdated)) {
       this.request(config)
     }
@@ -2148,14 +2151,10 @@ class AuthTunnelRuntime {
     })
   }
 
-  /** Expose the retained rollback child to credential-update tracking while it is waiting. */
+  /** Track a retained rollback child until it is stopped or restored. */
   private async waitForHandoffWithFallback(fallback: ActiveTunnel): Promise<void> {
     this.handoffFallbacks.add(fallback)
-    try {
-      await this.waitForHandoff()
-    } finally {
-      this.handoffFallbacks.delete(fallback)
-    }
+    await this.waitForHandoff()
   }
 
   private restorePreviousAfterFailedHandoff(candidate: ActiveTunnel, previous: ActiveTunnel): boolean {
@@ -2167,6 +2166,7 @@ class AuthTunnelRuntime {
       sessionTtlHours: candidate.config.sessionTtlHours,
       allowRemoteSettings: candidate.config.allowRemoteSettings,
     }
+    this.handoffFallbacks.delete(previous)
     this.active = previous
     previous.gate.updateAuth(previous.config)
     this.publish(previous.publicUrl)
@@ -2175,6 +2175,7 @@ class AuthTunnelRuntime {
   }
 
   private async stopChild(active: ActiveTunnel): Promise<void> {
+    this.handoffFallbacks.delete(active)
     this.intentionalExits.add(active.child)
     await killTree(active.child)
   }

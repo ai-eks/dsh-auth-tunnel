@@ -680,6 +680,12 @@ export class RemoteSettingsStore {
     return this.task
   }
 
+  readonly refreshAfterCurrentRead = async (): Promise<void> => {
+    const current = this.task
+    if (current !== undefined) await current
+    await this.refresh()
+  }
+
   async commit(request: RemoteSettingsCommitRequest): Promise<void> {
     if (this.disposed) return
     try {
@@ -723,9 +729,9 @@ export class RemoteSettingsStore {
 /** Retry a revoked remote-settings read when the Host runtime reports a new state. */
 export function installRemoteSettingsRuntimeRecovery(
   runtime: Pick<RuntimeStatusStore, 'subscribe'>,
-  store: Pick<RemoteSettingsStore, 'refresh'>,
+  store: Pick<RemoteSettingsStore, 'refreshAfterCurrentRead'>,
 ): () => void {
-  return runtime.subscribe(() => { void store.refresh() })
+  return runtime.subscribe(() => { void store.refreshAfterCurrentRead() })
 }
 
 function savePlan(draft: Draft, target: AuthTunnelSettings): SettingsWrite[] {
