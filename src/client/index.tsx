@@ -377,7 +377,8 @@ export class RuntimeStatusStore {
       next = await this.read()
       this.consecutiveFailures = 0
       if (this.pendingAfterRevision !== undefined) {
-        if (next.revision <= this.pendingAfterRevision) return
+        const restarted = next.revision < this.snapshot.revision
+        if (!restarted && next.revision <= this.pendingAfterRevision) return
         this.pendingAfterRevision = undefined
       }
       this.reliable = true
@@ -608,7 +609,7 @@ export class RemoteSettingsStore {
   private readonly listeners = new Set<() => void>()
   private task: Promise<RemoteSettingsDocument | undefined> | undefined
   private retryTimer: ReturnType<typeof setTimeout> | undefined
-  private retryFailedReads = false
+  private retryUnavailableReads = true
   private disposed = false
 
   constructor(private readonly transport: RemoteSettingsTransport = {
@@ -641,7 +642,7 @@ export class RemoteSettingsStore {
     }
     this.task = this.transport.read().then((document) => {
       if (!this.disposed) {
-        this.retryFailedReads = false
+        this.retryUnavailableReads = true
         this.document = document
         this.publish(document.snapshot)
       }
@@ -650,7 +651,7 @@ export class RemoteSettingsStore {
       if (!this.disposed) {
         const status = record(error).status
         if (status === 401 || status === 403) {
-          this.retryFailedReads = this.document !== undefined
+          this.retryUnavailableReads = false
           if (this.snapshot.status === 'ready') {
             const snapshot = { ...this.snapshot, writable: false }
             if (this.document !== undefined) this.document = { ...this.document, snapshot }
@@ -659,7 +660,7 @@ export class RemoteSettingsStore {
             this.publish({ ...INITIAL_REMOTE_SETTINGS_SNAPSHOT, status: 'unavailable' })
           }
         } else {
-          this.retryFailedReads = true
+          this.retryUnavailableReads = true
           if (this.snapshot.status !== 'unavailable') {
             const snapshot: SettingsScopeSnapshot<AuthTunnelSettings> = {
               ...this.snapshot,
@@ -704,10 +705,8 @@ export class RemoteSettingsStore {
   }
 
   private scheduleRetry(): void {
-    const retryableSnapshot = this.snapshot.status === 'unavailable'
-      || (this.snapshot.status === 'ready' && !this.snapshot.writable)
-    if (this.disposed || !this.retryFailedReads
-      || this.listeners.size === 0 || !retryableSnapshot) return
+    if (this.disposed || !this.retryUnavailableReads
+      || this.listeners.size === 0 || this.snapshot.status !== 'unavailable') return
     this.retryTimer = setTimeout(() => {
       this.retryTimer = undefined
       void this.refresh()
@@ -719,6 +718,14 @@ export class RemoteSettingsStore {
     this.snapshot = snapshot
     for (const listener of this.listeners) listener()
   }
+}
+
+/** Retry a revoked remote-settings read when the Host runtime reports a new state. */
+export function installRemoteSettingsRuntimeRecovery(
+  runtime: Pick<RuntimeStatusStore, 'subscribe'>,
+  store: Pick<RemoteSettingsStore, 'refresh'>,
+): () => void {
+  return runtime.subscribe(() => { void store.refresh() })
 }
 
 function savePlan(draft: Draft, target: AuthTunnelSettings): SettingsWrite[] {
@@ -1429,18 +1436,20 @@ export function installRemoteLocalePersistence(ctx: ClientContext, store: Remote
   let task: Promise<void> | undefined
   let retryTimer: ReturnType<typeof setTimeout> | undefined
   let retries = 0
+  let waitingForRecovery = false
   const flush = (): void => {
-    if (disposed || task !== undefined || requested === undefined) return
+    if (disposed || waitingForRecovery || task !== undefined || requested === undefined) return
     const locale = requested
     task = persistRemoteLocale(locale).then(() => {
       if (requested === locale) {
         requested = undefined
         retries = 0
+        waitingForRecovery = false
       }
     }, () => {
       if (requested !== locale) return
       if (retries >= REMOTE_LOCALE_RETRY_LIMIT) {
-        requested = undefined
+        waitingForRecovery = true
         return
       }
       retries += 1
@@ -1450,11 +1459,12 @@ export function installRemoteLocalePersistence(ctx: ClientContext, store: Remote
       }, REMOTE_SETTINGS_RETRY_MS)
     }).finally(() => {
       task = undefined
-      if (requested !== undefined && retryTimer === undefined) flush()
+      if (!waitingForRecovery && requested !== undefined && retryTimer === undefined) flush()
     })
   }
   const persist = (locale: 'zh' | 'en'): void => {
-    if (requested !== locale) retries = 0
+    retries = 0
+    waitingForRecovery = false
     requested = locale
     if (retryTimer !== undefined) {
       clearTimeout(retryTimer)
@@ -1470,14 +1480,21 @@ export function installRemoteLocalePersistence(ctx: ClientContext, store: Remote
     }
     persist(snapshot.active)
   })
-  let stopStore: (() => void) | undefined
   const adoptLoadedDocument = (): void => {
-    if (disposed || loaded) return
+    if (disposed) return
     const document = store.getDocument()
     if (document === undefined) return
+    if (loaded) {
+      const snapshot = store.getSnapshot()
+      if (waitingForRecovery && requested !== undefined
+        && snapshot.status === 'ready' && snapshot.writable) {
+        retries = 0
+        waitingForRecovery = false
+        flush()
+      }
+      return
+    }
     loaded = true
-    stopStore?.()
-    stopStore = undefined
     if (pending !== undefined) {
       persist(pending)
       pending = undefined
@@ -1491,7 +1508,7 @@ export function installRemoteLocalePersistence(ctx: ClientContext, store: Remote
       adopting = false
     }
   }
-  stopStore = store.subscribe(adoptLoadedDocument)
+  const stopStore = store.subscribe(adoptLoadedDocument)
   adoptLoadedDocument()
   return () => {
     disposed = true
@@ -1507,6 +1524,7 @@ export function apply(ctx: ClientContext): void {
   const connection = ctx.get('connection') as ConnectionHandle
   let scope: Pick<SettingsScope<AuthTunnelSettings>, 'getSnapshot' | 'subscribe'>
   let commit: CardCommit
+  let remote: RemoteSettingsStore | undefined
   if (connection.isLoopback) {
     const source = ctx.settingsScope.bind<AuthTunnelSettings>({ namespace: SETTINGS_NAMESPACE })
     // Methods on the scope controller use `this`; stable wrappers are also the
@@ -1517,15 +1535,23 @@ export function apply(ctx: ClientContext): void {
     }
     commit = (...args) => commitCardChanges(connection.api, ...args)
   } else {
-    const remote = new RemoteSettingsStore()
-    scope = remote
+    const remoteStore = new RemoteSettingsStore()
+    remote = remoteStore
+    scope = remoteStore
     commit = (revision, writes, _current, _target, password, _currentUser) => revision === undefined
       ? Promise.reject(new Error('settings revision is unavailable'))
-      : remote.commit({ expectedRevision: revision, writes, password })
-    ctx.effect(() => installRemoteLocalePersistence(ctx, remote), 'auth-tunnel: remote locale persistence')
-    ctx.effect(() => () => { remote.dispose() }, 'auth-tunnel: remote settings')
+      : remoteStore.commit({ expectedRevision: revision, writes, password })
+    ctx.effect(() => installRemoteLocalePersistence(ctx, remoteStore), 'auth-tunnel: remote locale persistence')
+    ctx.effect(() => () => { remoteStore.dispose() }, 'auth-tunnel: remote settings')
   }
   const runtime = new RuntimeStatusStore()
+  if (remote !== undefined) {
+    const remoteStore = remote
+    ctx.effect(
+      () => installRemoteSettingsRuntimeRecovery(runtime, remoteStore),
+      'auth-tunnel: remote settings runtime recovery',
+    )
+  }
   ctx.effect(() => () => { runtime.dispose() }, 'auth-tunnel: runtime status')
   ctx.effect(() => ctx.locale.register(LOCALE_NAMESPACE, { zh, en }), 'auth-tunnel: settings dictionaries')
   const Card = (props: CardProps) => <AuthTunnelCard {...props} scope={scope} commit={commit} runtime={runtime} />

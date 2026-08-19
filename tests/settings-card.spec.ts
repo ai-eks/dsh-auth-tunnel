@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   apply, commitCardChanges, commitCredentialWrite, commitSettingsWrites, parseRemoteSettingsDocument,
-  installRemoteLocalePersistence, RemoteSettingsStore, RuntimeStatusStore, runtimeStatusLocaleKey,
+  installRemoteLocalePersistence, installRemoteSettingsRuntimeRecovery,
+  RemoteSettingsStore, RuntimeStatusStore, runtimeStatusLocaleKey,
   validateSettingsValues,
   type AuthTunnelSettings, type RuntimeStatusSnapshot, type SettingsWrite,
 } from '../src/client/index.tsx'
@@ -809,6 +810,24 @@ describe('auth-tunnel settings card contract', () => {
     expect(dictionaryNamespace).toBe('settings.auth-tunnel')
   })
 
+  it('refreshes remote settings when runtime status changes', () => {
+    let runtimeChanged = (): void => {}
+    const stop = vi.fn()
+    const runtime = {
+      subscribe: vi.fn((listener: () => void) => {
+        runtimeChanged = listener
+        return stop
+      }),
+    }
+    const remote = { refresh: vi.fn(() => Promise.resolve(undefined)) }
+
+    const dispose = installRemoteSettingsRuntimeRecovery(runtime as never, remote as never)
+    runtimeChanged()
+    expect(remote.refresh).toHaveBeenCalledOnce()
+    dispose()
+    expect(stop).toHaveBeenCalledOnce()
+  })
+
   it('loads and commits the authenticated remote scope without Harness settingsScope', async () => {
     const document = (revision: number, sessionTtlHours: number) => parseRemoteSettingsDocument({
       settings: {
@@ -972,7 +991,7 @@ describe('auth-tunnel settings card contract', () => {
     }
   })
 
-  it('retries a forbidden refresh after a loaded remote scope so a rolled-back handoff can recover', async () => {
+  it('waits for a recovery signal after a loaded remote scope becomes forbidden', async () => {
     vi.useFakeTimers()
     try {
       const document = parseRemoteSettingsDocument({
@@ -995,7 +1014,10 @@ describe('auth-tunnel settings card contract', () => {
       await store.refresh()
       await store.refresh()
       expect(store.getSnapshot()).toMatchObject({ status: 'ready', writable: false })
-      await vi.advanceTimersByTimeAsync(1000)
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(read).toHaveBeenCalledTimes(2)
+
+      await store.refresh()
       expect(read).toHaveBeenCalledTimes(3)
       expect(store.getSnapshot()).toMatchObject({ status: 'ready', revision: 3, writable: true })
 
@@ -1106,6 +1128,57 @@ describe('auth-tunnel settings card contract', () => {
     }
   })
 
+  it('keeps a failed locale write queued until remote settings recover', async () => {
+    vi.useFakeTimers()
+    const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('handoff'))
+    const first = parseRemoteSettingsDocument({
+      settings: {
+        value: { ...quick, allowRemoteSettings: true },
+        base: quick,
+        user: { allowRemoteSettings: true },
+        revision: 3,
+        writable: true,
+      },
+      locale: 'zh',
+    })
+    const recovered = { ...first, snapshot: { ...first.snapshot, revision: 4 } }
+    let live = first
+    const store = new RemoteSettingsStore({
+      read: vi.fn(() => Promise.resolve(live)),
+      commit: vi.fn(),
+    })
+    let localeChanged = (_snapshot: { active: 'zh' | 'en' }): void => {}
+    await store.refresh()
+    const dispose = installRemoteLocalePersistence({
+      on: vi.fn((_event, listener) => {
+        localeChanged = listener as typeof localeChanged
+        return () => {}
+      }),
+      locale: { setLocale: vi.fn() },
+    } as never, store)
+
+    try {
+      localeChanged({ active: 'en' })
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(fetch).toHaveBeenCalledTimes(6)
+
+      fetch.mockResolvedValue(new Response('{}', { status: 200 }))
+      live = recovered
+      await store.refresh()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(fetch).toHaveBeenCalledTimes(7)
+      expect(fetch).toHaveBeenLastCalledWith('/dsh-auth-tunnel/locale', expect.objectContaining({
+        body: JSON.stringify({ locale: 'en' }),
+      }))
+    } finally {
+      dispose()
+      store.dispose()
+      fetch.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
   it('refreshes the remote settings snapshot after a rejected commit', async () => {
     const latest = parseRemoteSettingsDocument({
       settings: {
@@ -1185,5 +1258,21 @@ describe('auth-tunnel settings card contract', () => {
     await unavailable.refresh()
     expect(unavailable.getSnapshot()).toEqual({ phase: 'unavailable', running: false, revision: 0 })
     unavailable.dispose()
+  })
+
+  it('accepts a lower runtime revision as a new process while a settings fence is pending', async () => {
+    let live: RuntimeStatusSnapshot = {
+      phase: 'running', running: true, revision: 7, publicUrl: 'https://gui.example.com',
+    }
+    const store = new RuntimeStatusStore(() => Promise.resolve(live))
+
+    await store.refresh()
+    store.settingsCommitted(true)
+    expect(store.getSnapshot()).toMatchObject({ phase: 'applying', revision: 7 })
+
+    live = { phase: 'running', running: true, revision: 1, publicUrl: 'https://restarted.example.com' }
+    await store.refresh()
+    expect(store.getSnapshot()).toBe(live)
+    store.dispose()
   })
 })
