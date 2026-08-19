@@ -1323,19 +1323,58 @@ describe('password gate over the loopback webserver', () => {
       }),
     })
     await responseHeld
-    await waitForStatus(
-      composition,
-      status => status.revision > before.revision && status.phase === 'running',
-    )
-    await sleep(3700)
-    expect(await liveFixturePids()).toContain(originalPid)
+    let released = false
+    let blockedTask: Promise<Response | undefined> | undefined
+    try {
+      await waitForStatus(
+        composition,
+        status => status.revision > before.revision && status.phase === 'running',
+      )
+      await sleep(3700)
+      expect(await liveFixturePids()).toContain(originalPid)
+      const duringHandoff = composition.settings().describe()
+        .find(entry => entry.ns === settingsNamespace('auth-tunnel'))
+      expect(duringHandoff).toBeDefined()
+      blockedTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          expectedRevision: duringHandoff!.revision,
+          writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+          password: '',
+        }),
+      }).catch(() => undefined)
+      const blocked = await Promise.race([
+        blockedTask,
+        sleep(1000).then(() => undefined),
+      ])
+      expect(blocked?.status).toBe(409)
 
-    releaseResponse()
-    expect((await responseTask).status).toBe(200)
-    const retiredDeadline = Date.now() + 5000
-    while ((await liveFixturePids()).includes(originalPid)) {
-      if (Date.now() >= retiredDeadline) throw new Error('previous tunnel child was not retired')
-      await sleep(25)
+      releaseResponse()
+      released = true
+      expect((await responseTask).status).toBe(200)
+      const retiredDeadline = Date.now() + 5000
+      while ((await liveFixturePids()).includes(originalPid)) {
+        if (Date.now() >= retiredDeadline) throw new Error('previous tunnel child was not retired')
+        await sleep(25)
+      }
+      const reopened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, {
+        headers: { cookie },
+      })).json() as { settings: { revision: number } }
+      const saved = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+        method: 'POST',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          expectedRevision: reopened.settings.revision,
+          writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+          password: '',
+        }),
+      })
+      expect(saved.status).toBe(200)
+    } finally {
+      if (!released) releaseResponse()
+      await responseTask.catch(() => undefined)
+      await blockedTask
     }
   })
 
@@ -1405,6 +1444,88 @@ describe('password gate over the loopback webserver', () => {
       )
       expect(restored.message).toContain('kept the previous public URL')
       expect(await liveFixturePids()).toEqual([originalPid])
+    } finally {
+      if (!released) releaseResponse()
+    }
+  })
+
+  it('rebuilds a fixed shared gate when both handoff children die during the response fence', { timeout: 60_000 }, async () => {
+    const quickExecutable = await fixtureExecutable('fake-cloudflared-quick.sh')
+    const crashingExecutable = await fixtureExecutable('fake-cloudflared-late-crash.sh')
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const gatePort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const composition = await bootQuick({
+      allowRemoteSettings: true,
+      executable: quickExecutable,
+      gatePort,
+    })
+    const originalPid = (await liveFixturePids())[0]!
+    const base = `http://127.0.0.1:${String(gatePort)}`
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    const originalEnd = ServerResponse.prototype.end
+    let releaseResponse = (): void => {}
+    let markResponseHeld = (): void => {}
+    const responseHeld = new Promise<void>((resolve) => { markResponseHeld = resolve })
+    let held = false
+    vi.spyOn(ServerResponse.prototype, 'end').mockImplementation((function (
+      this: ServerResponse,
+      ...args: unknown[]
+    ): ServerResponse {
+      if (!held && this.req.url === '/dsh-auth-tunnel/settings') {
+        held = true
+        releaseResponse = () => { Reflect.apply(originalEnd, this, args) }
+        markResponseHeld()
+        return this
+      }
+      return Reflect.apply(originalEnd, this, args) as ServerResponse
+    }) as typeof ServerResponse.prototype.end)
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'executable', op: 'set', value: crashingExecutable }],
+        password: '',
+      }),
+    }).catch(() => undefined)
+    await responseHeld
+    let released = false
+    try {
+      await waitForStatus(
+        composition,
+        status => status.phase === 'running' && status.publicUrl?.includes('late-crash') === true,
+      )
+      process.kill(Number(originalPid), 'SIGTERM')
+      const failed = await waitForStatus(
+        composition,
+        status => status.phase === 'error' && !status.running,
+        7000,
+      )
+
+      releaseResponse()
+      released = true
+      expect((await responseTask)?.status).toBe(200)
+      const stoppedDeadline = Date.now() + 5000
+      while ((await liveFixturePids()).length !== 0) {
+        if (Date.now() >= stoppedDeadline) throw new Error('failed shared-gate handoff did not stop both children')
+        await sleep(25)
+      }
+
+      await composition.settings().update(settingsNamespace('auth-tunnel'), { executable: quickExecutable })
+      await waitForStatus(
+        composition,
+        status => status.revision > failed.revision && status.phase === 'running',
+        7000,
+      )
+      expect((await fetch(`${base}/dsh-auth-tunnel/login`)).status).toBe(200)
     } finally {
       if (!released) releaseResponse()
     }

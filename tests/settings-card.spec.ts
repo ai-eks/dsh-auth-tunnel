@@ -50,7 +50,29 @@ function successfulCardApi(user: Record<string, unknown>, order: string[], confi
       },
     })
   })
-  return { api: { settings: { mutate }, credentials: { describe, set } } as never, describe, mutate, set }
+  const settingsDescribe = vi.fn(() => {
+    order.push('settings-read')
+    return Promise.resolve({
+      rpcId: 'test',
+      result: {
+        ok: true as const,
+        value: {
+          writable: true,
+          hasDocument: true,
+          namespaces: [{
+            ns: 'auth-tunnel', schema: {}, value: { ...quick, ...user }, user,
+            applies: 'live' as const, secrets: [], revision: 8,
+          }],
+        },
+      },
+    })
+  })
+  return {
+    api: { settings: { mutate, describe: settingsDescribe }, credentials: { describe, set } } as never,
+    describe,
+    mutate,
+    set,
+  }
 }
 
 describe('auth-tunnel settings card contract', () => {
@@ -158,7 +180,7 @@ describe('auth-tunnel settings card contract', () => {
       {},
     )
 
-    expect(order).toEqual(['settings', 'credential'])
+    expect(order).toEqual(['settings', 'credential', 'settings-read'])
     expect(set).toHaveBeenCalledWith({ ref: 'DSH_WEB_PASSWORD', value: '  rotated-password  ' })
   })
 
@@ -616,6 +638,57 @@ describe('auth-tunnel settings card contract', () => {
       ops: [],
     })
     expect(set).not.toHaveBeenCalled()
+  })
+
+  it('rechecks the selected password reference after a local credential write', async () => {
+    const mutate = vi.fn(() => Promise.resolve({
+      rpcId: 'test',
+      result: {
+        ok: true as const,
+        value: {
+          ns: 'auth-tunnel', schema: {}, value: quick, user: {},
+          applies: 'live' as const, secrets: [], revision: 8,
+        },
+      },
+    }))
+    const describe = vi.fn(() => Promise.resolve({
+      rpcId: 'test',
+      result: {
+        ok: true as const,
+        value: {
+          writable: true,
+          hasDocument: true,
+          namespaces: [{
+            ns: 'auth-tunnel', schema: {}, value: { ...quick, passwordRef: 'ALT_WEB_PASSWORD' },
+            user: { passwordRef: 'ALT_WEB_PASSWORD' }, applies: 'live' as const, secrets: [], revision: 9,
+          }],
+        },
+      },
+    }))
+    let releaseSet = (): void => {}
+    const setBarrier = new Promise<void>((resolve) => { releaseSet = resolve })
+    let markSetStarted = (): void => {}
+    const setStarted = new Promise<void>((resolve) => { markSetStarted = resolve })
+    const set = vi.fn(async () => {
+      markSetStarted()
+      await setBarrier
+      return { rpcId: 'test', result: { ok: true as const, value: {} } }
+    })
+
+    const save = commitCardChanges(
+      { settings: { mutate, describe }, credentials: { describe: vi.fn(), set } } as never,
+      7,
+      [],
+      quick,
+      quick,
+      'replacement',
+      {},
+    )
+    await setStarted
+    releaseSet()
+
+    await expect(save).rejects.toThrow('password reference changed')
+    expect(describe).toHaveBeenCalledWith({})
   })
 
   it('rejects a local password that cannot fit through the login endpoint', async () => {

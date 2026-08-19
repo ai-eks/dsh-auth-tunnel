@@ -705,6 +705,7 @@ class PasswordGate {
 
   /** Keep authenticated remote writes ordered across concurrent browser tabs. */
   private serializeRemoteMutation<T>(mutation: (enterCommitPhase: () => void) => Promise<T>): Promise<T> {
+    if (!this.remoteWritesEnabled) return Promise.reject(new Error('remote settings authorization changed'))
     const mutationGeneration = this.remoteMutationGeneration
     let releaseCommitted: (() => void) | undefined
     const enterCommitPhase = (): void => {
@@ -1844,9 +1845,16 @@ class AuthTunnelRuntime {
           return
         }
         if (!candidate.alive) {
-          this.restorePreviousAfterFailedHandoff(candidate, previous)
+          if (!this.restorePreviousAfterFailedHandoff(candidate, previous)) {
+            this.active = undefined
+            this.publish(undefined)
+            await Promise.all([this.stop(candidate), this.stopChild(previous)])
+          } else {
+            await this.stopChild(candidate)
+          }
           return
         }
+        candidate.gate.revokeRemoteMutations()
         this.detachPreCommitRemoteMutations(false)
         if (!await this.waitForCommittedRemoteMutations()) {
           await this.stopChild(previous)
@@ -1856,11 +1864,20 @@ class AuthTunnelRuntime {
           if (!this.restorePreviousAfterFailedHandoff(candidate, previous)) {
             this.active = undefined
             this.publish(undefined)
-            await this.stopChild(previous)
+            await Promise.all([this.stop(candidate), this.stopChild(previous)])
+          } else {
+            await this.stopChild(candidate)
           }
           return
         }
         await this.stopChild(previous)
+        if (!candidate.alive) {
+          this.active = undefined
+          this.publish(undefined)
+          await this.stop(candidate)
+          return
+        }
+        candidate.gate.updateAuth(candidate.config)
       }
       this.appliedTokenCredentialGeneration = tokenGeneration
       return
@@ -1933,10 +1950,17 @@ class AuthTunnelRuntime {
       return undefined
     }
     if (!candidate.alive) {
-      this.restorePreviousAfterFailedHandoff(candidate, current)
+      const restored = this.restorePreviousAfterFailedHandoff(candidate, current)
+      if (!restored) {
+        this.active = undefined
+        this.publish(undefined)
+        await Promise.all([this.stop(candidate), this.stopChild(current)])
+        return undefined
+      }
       await this.stopChild(candidate)
       return current
     }
+    candidate.gate.revokeRemoteMutations()
     this.detachPreCommitRemoteMutations(false)
     if (!await this.waitForCommittedRemoteMutations()) {
       await this.stopChild(current)
@@ -1948,12 +1972,19 @@ class AuthTunnelRuntime {
       if (!restored) {
         this.active = undefined
         this.publish(undefined)
-        await this.stopChild(current)
+        await Promise.all([this.stop(candidate), this.stopChild(current)])
         return undefined
       }
       return current
     }
     await this.stopChild(current)
+    if (!candidate.alive) {
+      this.active = undefined
+      this.publish(undefined)
+      await this.stop(candidate)
+      return undefined
+    }
+    candidate.gate.updateAuth(candidate.config)
     this.appliedTokenCredentialGeneration = tokenGeneration
     return candidate
   }

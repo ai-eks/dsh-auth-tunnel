@@ -948,6 +948,11 @@ export async function commitCardChanges(
   if (password !== '') {
     try {
       await commitCredentialWrite(api, target.passwordRef, password)
+      const completed = await readSettingsNamespace(api)
+      if (record(completed.value).passwordRef !== target.passwordRef
+        || writes.some(write => !writeSatisfied(completed, write))) {
+        throw new Error('settings password reference changed during credential write')
+      }
     } catch (error) {
       await rollbackCommittedSettings()
       throw error
