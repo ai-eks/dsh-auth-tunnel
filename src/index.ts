@@ -1675,9 +1675,16 @@ class AuthTunnelRuntime {
     if (current.config.mode === 'token'
       && this.appliedTokenCredentialGeneration !== activeTokenGeneration
       && (next.mode !== 'token' || next.tokenRef !== current.config.tokenRef)) {
-      const refreshed = await this.refreshRetainedTokenTunnel(current, activeTokenGeneration)
-      if (refreshed === undefined) return
-      current = refreshed
+      try {
+        const refreshed = await this.refreshRetainedTokenTunnel(current, activeTokenGeneration)
+        if (refreshed === undefined) return
+        current = refreshed
+      } catch (error) {
+        if (this.disposed || error === TUNNEL_STARTUP_CANCELLED) throw error
+        if (this.desired?.enabled === false) throw TUNNEL_STARTUP_CANCELLED
+        this.ctx.logger.warn(`auth-tunnel: could not refresh retained token fallback before applying target: ${errorMessage(error)}`)
+        current = this.active ?? current
+      }
     }
 
     await this.requirePassword(next.passwordRef)

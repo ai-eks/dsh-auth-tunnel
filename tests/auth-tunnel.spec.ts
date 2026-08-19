@@ -2985,6 +2985,39 @@ describe('rc7 plugin settings', () => {
     expect(replacementPids).not.toEqual(originalPids)
   })
 
+  it('switches to a valid target when the discarded fallback token no longer resolves', { timeout: 60_000 }, async () => {
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const gatePort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const composition = await loadComposition({
+      mode: 'token',
+      tokenRef: 'TOKEN_A',
+      publicHostname: 'gui.example.com',
+      gatePort,
+      executable: await fixtureExecutable('fake-cloudflared-token-recording.sh'),
+      startupTimeoutMs: 15_000,
+    }, { seeds: { TOKEN_A: 'fixture-token-a', TOKEN_B: 'fixture-token-b' } })
+
+    composition.credentials().set('TOKEN_A', undefined)
+    await composition.settings().update(namespace, { tokenRef: 'TOKEN_B' })
+
+    const deadline = Date.now() + 7000
+    let applied = ''
+    while (Date.now() < deadline) {
+      const pids = await liveFixturePids()
+      if (pids.length === 1) {
+        applied = await readFile(join(tmpdir(), `${FAKE_PREFIX}${pids[0]!}.token`), 'utf8').catch(() => '')
+        if (applied === 'fixture-token-b') break
+      }
+      await sleep(25)
+    }
+    expect(applied).toBe('fixture-token-b')
+    expect(await composition.runtimeStatus()).toMatchObject({ phase: 'running', running: true })
+  })
+
   it('restarts the retained token tunnel after a different configured token fails', { timeout: 60_000 }, async () => {
     const probeServer = createNetServer()
     probeServer.listen(0, '127.0.0.1')

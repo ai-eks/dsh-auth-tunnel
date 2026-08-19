@@ -648,8 +648,14 @@ export class RemoteSettingsStore {
           }
         } else {
           this.retryUnavailableReads = true
-          if (this.snapshot.status === 'loading') {
-            this.publish({ ...INITIAL_REMOTE_SETTINGS_SNAPSHOT, status: 'unavailable' })
+          if (this.snapshot.status !== 'unavailable') {
+            const snapshot: SettingsScopeSnapshot<AuthTunnelSettings> = {
+              ...this.snapshot,
+              status: 'unavailable',
+              writable: false,
+            }
+            if (this.document !== undefined) this.document = { ...this.document, snapshot }
+            this.publish(snapshot)
           }
         }
       }

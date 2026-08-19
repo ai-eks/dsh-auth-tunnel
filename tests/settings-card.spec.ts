@@ -720,6 +720,42 @@ describe('auth-tunnel settings card contract', () => {
     }
   })
 
+  it('retries a transient remote settings refresh after a ready snapshot', async () => {
+    vi.useFakeTimers()
+    try {
+      const document = (revision: number, sessionTtlHours: number) => parseRemoteSettingsDocument({
+        settings: {
+          value: { ...quick, allowRemoteSettings: true, sessionTtlHours },
+          base: quick,
+          user: { allowRemoteSettings: true, sessionTtlHours },
+          revision,
+          writable: true,
+        },
+      })
+      const read = vi.fn()
+        .mockResolvedValueOnce(document(3, 720))
+        .mockRejectedValueOnce(new Error('handoff'))
+        .mockResolvedValue(document(4, 24))
+      const store = new RemoteSettingsStore({ read, commit: vi.fn() })
+      const unsubscribe = store.subscribe(() => {})
+
+      await store.refresh()
+      expect(store.getSnapshot()).toMatchObject({ status: 'ready', revision: 3 })
+      await store.refresh()
+      expect(store.getSnapshot()).toMatchObject({ status: 'unavailable', revision: 3, writable: false })
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(read).toHaveBeenCalledTimes(3)
+      expect(store.getSnapshot()).toMatchObject({
+        status: 'ready', revision: 4, value: { sessionTtlHours: 24 },
+      })
+
+      unsubscribe()
+      store.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('does not retry an initial forbidden remote settings read', async () => {
     vi.useFakeTimers()
     try {
