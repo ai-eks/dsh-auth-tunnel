@@ -112,6 +112,9 @@ export function validateConfig(config: Config): void {
   if (!Number.isSafeInteger(sessionExpiry)) {
     throw new Error('auth-tunnel: sessionTtlHours exceeds the verifiable expiration range')
   }
+  if (config.mode === 'token' && config.tokenRef !== undefined && config.passwordRef === config.tokenRef) {
+    throw new Error('auth-tunnel: access password credential conflicts with the tunnel token credential')
+  }
   if (!config.enabled) return
   if (config.mode !== 'token') return
   if (config.tokenRef === undefined) {
@@ -615,6 +618,13 @@ class PasswordGate {
     this.publicAccessEnabled = false
     this.revokeRemoteMutations()
     this.revokeAuthenticatedConnections()
+  }
+
+  /** Resume a live gate when a pending disable is superseded before teardown. */
+  restorePublicAccess(config: { passwordRef: string; sessionTtlHours: number; allowRemoteSettings: boolean }): void {
+    if (this.publicAccessEnabled) return
+    this.publicAccessEnabled = true
+    this.updateAuth(config)
   }
 
   /** Revoke the settings surface immediately without disturbing ordinary sessions. */
@@ -1501,6 +1511,9 @@ class AuthTunnelRuntime {
     if (this.disposed) return
     if (!config.enabled) this.passwordChecks.abort()
     else if (this.passwordChecks.signal.aborted) this.passwordChecks = new AbortController()
+    if (config.enabled && this.configured?.enabled === false) {
+      for (const gate of this.liveGates) gate.restorePublicAccess(config)
+    }
     const passwordRefChanged = this.configured !== undefined
       && this.configured.passwordRef !== config.passwordRef
     if (!config.enabled || !config.allowRemoteSettings || passwordRefChanged) {
@@ -1547,6 +1560,7 @@ class AuthTunnelRuntime {
   /** Retry the latest desired settings after its access credential is repaired. */
   credentialUpdated(ref: string): void {
     const config = this.configured
+    const accessPasswordUpdated = config?.passwordRef === ref
     const configuredTokenUpdated = config?.mode === 'token' && config.tokenRef === ref
     const activeTokenUpdated = this.active?.config.mode === 'token' && this.active.config.tokenRef === ref
     const fallbackTokenUpdated = [...this.handoffFallbacks].some(
@@ -1555,7 +1569,8 @@ class AuthTunnelRuntime {
     const tokenUpdated = configuredTokenUpdated || activeTokenUpdated || fallbackTokenUpdated
     if (tokenUpdated) this.tokenCredentialGenerations.set(ref, (this.tokenCredentialGenerations.get(ref) ?? 0) + 1)
     for (const gate of this.liveGates) gate.credentialUpdated(ref)
-    if (config !== undefined && (config.passwordRef === ref || tokenUpdated)) {
+    if (accessPasswordUpdated) this.detachPreCommitRemoteMutations(false)
+    if (config !== undefined && (accessPasswordUpdated || tokenUpdated)) {
       this.request(config)
     }
   }

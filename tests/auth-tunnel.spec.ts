@@ -1490,6 +1490,68 @@ describe('password gate over the loopback webserver', () => {
     expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
   })
 
+  it('detaches a stale pre-commit save after the access password rotates', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true }, {
+      seeds: { NEXT_WEB_PASSWORD: 'next-password' },
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    let releaseResolve = (): void => {}
+    composition.credentials().resolveBarrier = new Promise<void>((resolve) => { releaseResolve = resolve })
+    composition.credentials().resolveBarrierRef = 'NEXT_WEB_PASSWORD'
+    let markResolveStarted = (): void => {}
+    const resolveStarted = new Promise<void>((resolve) => { markResolveStarted = resolve })
+    composition.credentials().resolveStarted = (ref) => {
+      if (ref !== 'NEXT_WEB_PASSWORD') return
+      composition.credentials().resolveStarted = undefined
+      markResolveStarted()
+    }
+    const staleTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' }],
+        password: '',
+      }),
+    }).catch(() => undefined)
+    await resolveStarted
+
+    await composition.credentials().set('DSH_WEB_PASSWORD', 'rotated-password')
+    const freshCookie = (await login(base, undefined, 'rotated-password')).get('set-cookie')!.split(';', 1)[0]!
+    const freshOpened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      headers: { cookie: freshCookie },
+    })).json() as { settings: { revision: number } }
+    const freshSave = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie: freshCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: freshOpened.settings.revision,
+        writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+        password: '',
+      }),
+    })
+    try {
+      const outcome = await Promise.race([
+        freshSave,
+        sleep(3000).then(() => undefined),
+      ])
+      expect(outcome?.status).toBe(200)
+    } finally {
+      composition.credentials().resolveBarrier = undefined
+      composition.credentials().resolveBarrierRef = undefined
+      releaseResolve()
+    }
+    expect((await staleTask)?.status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel'))).toMatchObject({
+      passwordRef: 'DSH_WEB_PASSWORD',
+      sessionTtlHours: 24,
+    })
+  })
+
   it('revokes public access while a committed credential write delays shutdown', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     composition.loaded.webServer.register({
@@ -2621,6 +2683,21 @@ describe('activation dependencies and boot failures', () => {
     expect(await liveFixturePids()).toEqual([])
   })
 
+  it('rejects a shared access-password and tunnel-token credential at boot', { timeout: 60_000 }, async () => {
+    await expectBootFailure({
+      mode: 'token',
+      passwordRef: 'SHARED_SECRET',
+      tokenRef: 'SHARED_SECRET',
+      publicHostname: 'gui.example.com',
+      gatePort: 32_313,
+      executable: await fixtureExecutable('fake-cloudflared-token.sh'),
+      startupTimeoutMs: 15_000,
+    }, /access password credential conflicts with the tunnel token credential/, {
+      seeds: { SHARED_SECRET: 'shared-secret' },
+    })
+    expect(await liveFixturePids()).toEqual([])
+  })
+
   it('token mode: runs the named tunnel over the env-var token against the fixed gate port', { timeout: 60_000 }, async () => {
     // Reserve one free loopback port for the gate; the dashboard ingress
     // would point at exactly this address.
@@ -3077,6 +3154,30 @@ describe('rc7 plugin settings', () => {
     await waitForStatus(composition, status => status.phase === 'running')
     expect((await liveFixturePids()).length).toBe(1)
     expect((await fetch(`${await composition.gateBase()}/dsh-auth-tunnel/login`)).status).toBe(200)
+  })
+
+  it('restores a live gate when a pending disable is immediately superseded', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick()
+    composition.loaded.webServer.register({
+      kind: 'exact', path: '/api/re-enabled', handler: (_req, res) => {
+        res.writeHead(200)
+        res.end('ok')
+      },
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const originalPids = await liveFixturePids()
+    const before = await composition.runtimeStatus()
+
+    await composition.settings().update(namespace, { enabled: false })
+    await composition.settings().update(namespace, { enabled: true })
+    await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'running' && status.running,
+    )
+
+    expect((await fetch(`${base}/api/re-enabled`, { headers: { cookie } })).status).toBe(200)
+    expect(await liveFixturePids()).toEqual(originalPids)
   })
 
   it('disables the active tunnel while password validation is stalled', { timeout: 60_000 }, async () => {
