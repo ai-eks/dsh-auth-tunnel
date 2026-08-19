@@ -692,14 +692,13 @@ describe('password gate over the loopback webserver', () => {
       .toMatchObject({ value: 's3kret-passw0rd' })
   })
 
-  it('does not leave a new remote credential when settings persistence fails', { timeout: 60_000 }, async () => {
+  it('requires a new remote password reference to be configured separately', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     const base = await composition.gateBase()
     const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
     const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
       settings: { revision: number }
     }
-    composition.settings().failNextPersist = true
 
     const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
       method: 'POST',
@@ -712,6 +711,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
     expect(await composition.credentials().resolve('NEW_REMOTE_PASSWORD')).toBeUndefined()
   })
 
@@ -809,7 +809,9 @@ describe('password gate over the loopback webserver', () => {
   })
 
   it('fences the credential that authorized a reference-changing remote save', { timeout: 60_000 }, async () => {
-    const composition = await bootQuick({ allowRemoteSettings: true })
+    const composition = await bootQuick({ allowRemoteSettings: true }, {
+      seeds: { NEXT_WEB_PASSWORD: 'next-password' },
+    })
     const base = await composition.gateBase()
     const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
     const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
@@ -827,7 +829,7 @@ describe('password gate over the loopback webserver', () => {
       body: JSON.stringify({
         expectedRevision: opened.settings.revision,
         writes: [{ field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' }],
-        password: 'stale-remote-password',
+        password: '',
       }),
     })
     await persistStarted
@@ -840,7 +842,8 @@ describe('password gate over the loopback webserver', () => {
     expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
     expect(await composition.credentials().resolve('DSH_WEB_PASSWORD'))
       .toMatchObject({ value: 'local-admin-password' })
-    expect(await composition.credentials().resolve('NEXT_WEB_PASSWORD')).toBeUndefined()
+    expect(await composition.credentials().resolve('NEXT_WEB_PASSWORD'))
+      .toMatchObject({ value: 'next-password' })
   })
 
   it('rolls back a passwordless reference change when the target credential is deleted during persistence', { timeout: 60_000 }, async () => {
@@ -3323,6 +3326,43 @@ describe('rc7 plugin settings', () => {
     }
   })
 
+  it('supersedes a stalled enabled password check with the latest enabled reference', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick(undefined, {
+      seeds: {
+        ALT_WEB_PASSWORD: 'alternate-password',
+        NEXT_WEB_PASSWORD: 'next-password',
+      },
+    })
+    const base = await composition.gateBase()
+    const before = await composition.runtimeStatus()
+    let releaseResolve = (): void => {}
+    composition.credentials().resolveBarrier = new Promise<void>((resolve) => { releaseResolve = resolve })
+    composition.credentials().resolveBarrierRef = 'ALT_WEB_PASSWORD'
+    let markResolveStarted = (): void => {}
+    const resolveStarted = new Promise<void>((resolve) => { markResolveStarted = resolve })
+    composition.credentials().resolveStarted = (ref) => {
+      if (ref !== 'ALT_WEB_PASSWORD') return
+      composition.credentials().resolveStarted = undefined
+      markResolveStarted()
+    }
+
+    await composition.settings().update(namespace, { passwordRef: 'ALT_WEB_PASSWORD' })
+    await resolveStarted
+    try {
+      await composition.settings().update(namespace, { passwordRef: 'NEXT_WEB_PASSWORD' })
+      await waitForStatus(
+        composition,
+        status => status.revision > before.revision && status.phase === 'running' && status.running,
+        3000,
+      )
+      await login(base, undefined, 'next-password')
+    } finally {
+      composition.credentials().resolveBarrier = undefined
+      composition.credentials().resolveBarrierRef = undefined
+      releaseResolve()
+    }
+  })
+
   it('disables the active tunnel while tunnel-token resolution is stalled', { timeout: 60_000 }, async () => {
     const probeServer = createNetServer()
     probeServer.listen(0, '127.0.0.1')
@@ -3361,6 +3401,56 @@ describe('rc7 plugin settings', () => {
       expect(Date.now() - startedAt).toBeLessThan(3000)
       expect(await liveFixturePids()).toEqual([])
       await expect(fetch(`${base}/dsh-auth-tunnel/login`)).rejects.toThrow()
+    } finally {
+      composition.credentials().resolveBarrier = undefined
+      composition.credentials().resolveBarrierRef = undefined
+      releaseResolve()
+    }
+  })
+
+  it('supersedes a stalled enabled token startup with the latest enabled target', { timeout: 60_000 }, async () => {
+    const probeServer = createNetServer()
+    probeServer.listen(0, '127.0.0.1')
+    await once(probeServer, 'listening')
+    const gatePort = (probeServer.address() as AddressInfo).port
+    probeServer.close()
+    await once(probeServer, 'close')
+    const tokenExecutable = await fixtureExecutable('fake-cloudflared-token-recording.sh')
+    const composition = await bootQuick(undefined, {
+      seeds: { TOKEN_A: 'fixture-token-a', TOKEN_B: 'fixture-token-b' },
+    })
+    let releaseResolve = (): void => {}
+    composition.credentials().resolveBarrier = new Promise<void>((resolve) => { releaseResolve = resolve })
+    composition.credentials().resolveBarrierRef = 'TOKEN_A'
+    let markResolveStarted = (): void => {}
+    const resolveStarted = new Promise<void>((resolve) => { markResolveStarted = resolve })
+    composition.credentials().resolveStarted = (ref) => {
+      if (ref !== 'TOKEN_A') return
+      composition.credentials().resolveStarted = undefined
+      markResolveStarted()
+    }
+
+    await composition.settings().update(namespace, {
+      mode: 'token',
+      tokenRef: 'TOKEN_A',
+      publicHostname: 'gui.example.com',
+      gatePort,
+      executable: tokenExecutable,
+    })
+    await resolveStarted
+    await composition.settings().update(namespace, { tokenRef: 'TOKEN_B' })
+    try {
+      const deadline = Date.now() + 3000
+      let applied = false
+      while (Date.now() < deadline) {
+        for (const pid of await liveFixturePids()) {
+          const token = await readFile(join(tmpdir(), `${FAKE_PREFIX}${pid}.token`), 'utf8').catch(() => '')
+          if (token === 'fixture-token-b') applied = true
+        }
+        if (applied) break
+        await sleep(25)
+      }
+      expect(applied).toBe(true)
     } finally {
       composition.credentials().resolveBarrier = undefined
       composition.credentials().resolveBarrierRef = undefined

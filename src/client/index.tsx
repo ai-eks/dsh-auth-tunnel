@@ -76,7 +76,7 @@ const zh: Record<LocaleKey, string> = {
   quickRequirements: 'Quick 只需要上方的访问密码；无需 Cloudflare Token 或自有域名，Gate 端口保持 0 即可自动分配。',
   tokenRequirements: 'Token 启用前必须准备 Tunnel Token、已绑定的公网域名和固定 Gate 端口；Cloudflare ingress 必须指向该端口。',
   passwordRef: '密码凭据引用',
-  passwordRefHint: '保存下方密码时写入的凭据名；一般保持 DSH_WEB_PASSWORD。',
+  passwordRefHint: '一般保持 DSH_WEB_PASSWORD。若要切换引用，请先在 Host Credentials 中创建目标凭据，再将下方密码留空后保存。',
   password: '设置或替换访问密码',
   passwordHint: '仅在本次保存时写入凭据服务，保存后清空且永不回显。该密码可重复登录，直到再次替换；不是登录一次即失效的 OTP。替换后现有公网会话会失效，请使用新密码重新登录。',
   passwordPlaceholder: '留空表示不修改当前密码',
@@ -141,7 +141,7 @@ const en: Record<LocaleKey, string> = {
   quickRequirements: 'Quick only needs the access password above. It needs no Cloudflare Token or custom domain, and gate port 0 selects a port automatically.',
   tokenRequirements: 'Before enabling Token mode, provide a Tunnel Token, bound public hostname, and fixed gate port. Cloudflare ingress must target that port.',
   passwordRef: 'Password credential reference',
-  passwordRefHint: 'Credential name written when saving the password below; normally keep DSH_WEB_PASSWORD.',
+  passwordRefHint: 'Normally keep DSH_WEB_PASSWORD. To switch references, create the target in Host Credentials first, then save here with the password below left blank.',
   password: 'Set or replace access password',
   passwordHint: 'Written to the credential service only on this save, then cleared and never revealed. It remains reusable until replaced; it is not a single-use OTP. Replacing it invalidates existing public sessions, which must sign in again.',
   passwordPlaceholder: 'Leave blank to keep the current password',
@@ -798,16 +798,13 @@ export async function commitCardChanges(
     throw new Error('access password credential conflicts with the tunnel token credential')
   }
   if (target.passwordRef !== current.passwordRef) {
+    if (password !== '') {
+      throw new Error('a new access password credential must be configured separately')
+    }
     const response = await api.credentials.describe({ refs: [target.passwordRef] })
     if (!response.result.ok) throw new Error(response.result.error.message)
     const configured = response.result.value.credentials[target.passwordRef]?.configured
-    if (password === '') {
-      if (configured !== true) throw new Error('access password credential is not configured')
-    } else {
-      if (configured !== false) {
-        throw new Error('access password credential already exists')
-      }
-    }
+    if (configured !== true) throw new Error('access password credential is not configured')
   }
   const deferEnable = password !== '' && !current.enabled && target.enabled
   const deferRemoteSettings = password !== '' && !current.allowRemoteSettings && target.allowRemoteSettings

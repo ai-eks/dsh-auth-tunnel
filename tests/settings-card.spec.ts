@@ -179,11 +179,11 @@ describe('auth-tunnel settings card contract', () => {
     expect(set).not.toHaveBeenCalled()
   })
 
-  it('commits a newly selected password reference before writing its credential', async () => {
+  it('requires a newly selected password reference to be configured separately', async () => {
     const order: string[] = []
     const { api } = successfulCardApi({ passwordRef: 'NEXT_WEB_PASSWORD' }, order)
 
-    await commitCardChanges(
+    await expect(commitCardChanges(
       api,
       7,
       [{ field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' }],
@@ -191,31 +191,24 @@ describe('auth-tunnel settings card contract', () => {
       { ...quick, passwordRef: 'NEXT_WEB_PASSWORD' },
       'next-password',
       {},
-    )
+    )).rejects.toThrow('configured separately')
 
-    expect(order).toEqual(['credential-check', 'settings', 'credential'])
+    expect(order).toEqual([])
   })
 
-  it('does not create a new local credential when the settings mutation fails', async () => {
+  it('does not replace the current credential when the settings mutation fails', async () => {
     const set = vi.fn()
     const mutate = vi.fn(() => Promise.resolve({
       rpcId: 'test',
       result: { ok: false as const, error: { code: 'conflict', message: 'settings revision changed' } },
     }))
-    const describe = vi.fn(() => Promise.resolve({
-      rpcId: 'test',
-      result: {
-        ok: true as const,
-        value: { credentials: { NEXT_WEB_PASSWORD: { configured: false, writable: true } } },
-      },
-    }))
 
     await expect(commitCardChanges(
-      { settings: { mutate }, credentials: { describe, set } } as never,
+      { settings: { mutate }, credentials: { describe: vi.fn(), set } } as never,
       7,
-      [{ field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' }],
+      [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
       quick,
-      { ...quick, passwordRef: 'NEXT_WEB_PASSWORD' },
+      { ...quick, sessionTtlHours: 24 },
       'next-password',
       {},
     )).rejects.toThrow('settings revision changed')
@@ -277,15 +270,15 @@ describe('auth-tunnel settings card contract', () => {
     })
   })
 
-  it('preserves a newly created credential when enabling loses its revision fence', async () => {
+  it('preserves a replaced credential when enabling loses its revision fence', async () => {
     const mutate = vi.fn()
       .mockResolvedValueOnce({
         rpcId: 'test',
         result: {
           ok: true as const,
           value: {
-            ns: 'auth-tunnel', schema: {}, value: { ...quick, enabled: false, passwordRef: 'NEXT_WEB_PASSWORD' },
-            user: { enabled: false, passwordRef: 'NEXT_WEB_PASSWORD' },
+            ns: 'auth-tunnel', schema: {}, value: { ...quick, enabled: false },
+            user: { enabled: false },
             applies: 'live' as const, secrets: [], revision: 8,
           },
         },
@@ -294,13 +287,6 @@ describe('auth-tunnel settings card contract', () => {
         rpcId: 'test',
         result: { ok: false as const, error: { code: 'conflict', message: 'settings revision changed' } },
       })
-    const describe = vi.fn(() => Promise.resolve({
-      rpcId: 'test',
-      result: {
-        ok: true as const,
-        value: { credentials: { NEXT_WEB_PASSWORD: { configured: false, writable: true } } },
-      },
-    }))
     const set = vi.fn(() => Promise.resolve({
       rpcId: 'test', result: { ok: true as const, value: {} },
     }))
@@ -309,14 +295,11 @@ describe('auth-tunnel settings card contract', () => {
     }))
 
     await expect(commitCardChanges(
-      { settings: { mutate }, credentials: { describe, set, unset } } as never,
+      { settings: { mutate }, credentials: { describe: vi.fn(), set, unset } } as never,
       7,
-      [
-        { field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' },
-        { field: 'enabled', op: 'set', value: true },
-      ],
+      [{ field: 'enabled', op: 'set', value: true }],
       { ...quick, enabled: false },
-      { ...quick, passwordRef: 'NEXT_WEB_PASSWORD' },
+      quick,
       'first-password',
       { enabled: false },
     )).rejects.toThrow('settings revision changed')
@@ -324,9 +307,9 @@ describe('auth-tunnel settings card contract', () => {
     expect(mutate).toHaveBeenNthCalledWith(1, {
       ns: 'auth-tunnel',
       expectedRevision: 7,
-      ops: [{ op: 'set', path: ['passwordRef'], value: 'NEXT_WEB_PASSWORD' }],
+      ops: [],
     })
-    expect(set).toHaveBeenCalledWith({ ref: 'NEXT_WEB_PASSWORD', value: 'first-password' })
+    expect(set).toHaveBeenCalledWith({ ref: 'DSH_WEB_PASSWORD', value: 'first-password' })
     expect(unset).not.toHaveBeenCalled()
     expect(mutate).toHaveBeenNthCalledWith(2, {
       ns: 'auth-tunnel',
@@ -342,8 +325,8 @@ describe('auth-tunnel settings card contract', () => {
         result: {
           ok: true as const,
           value: {
-            ns: 'auth-tunnel', schema: {}, value: { ...quick, enabled: false, passwordRef: 'NEXT_WEB_PASSWORD' },
-            user: { enabled: false, passwordRef: 'NEXT_WEB_PASSWORD' },
+            ns: 'auth-tunnel', schema: {}, value: { ...quick, enabled: false, sessionTtlHours: 24 },
+            user: { enabled: false, sessionTtlHours: 24 },
             applies: 'live' as const, secrets: [], revision: 8,
           },
         },
@@ -358,27 +341,20 @@ describe('auth-tunnel settings card contract', () => {
           },
         },
       })
-    const describe = vi.fn(() => Promise.resolve({
-      rpcId: 'test',
-      result: {
-        ok: true as const,
-        value: { credentials: { NEXT_WEB_PASSWORD: { configured: false, writable: true } } },
-      },
-    }))
     const set = vi.fn(() => Promise.resolve({
       rpcId: 'test',
       result: { ok: false as const, error: { code: 'credential-rejected', message: 'read only' } },
     }))
 
     await expect(commitCardChanges(
-      { settings: { mutate }, credentials: { describe, set } } as never,
+      { settings: { mutate }, credentials: { describe: vi.fn(), set } } as never,
       7,
       [
-        { field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' },
+        { field: 'sessionTtlHours', op: 'set', value: 24 },
         { field: 'enabled', op: 'set', value: true },
       ],
       { ...quick, enabled: false },
-      { ...quick, passwordRef: 'NEXT_WEB_PASSWORD' },
+      { ...quick, sessionTtlHours: 24 },
       'first-password',
       { enabled: false },
     )).rejects.toThrow('read only')
@@ -387,7 +363,7 @@ describe('auth-tunnel settings card contract', () => {
     expect(mutate).toHaveBeenNthCalledWith(2, {
       ns: 'auth-tunnel',
       expectedRevision: 8,
-      ops: [{ op: 'unset', path: ['passwordRef'] }],
+      ops: [{ op: 'unset', path: ['sessionTtlHours'] }],
     })
   })
 
@@ -431,7 +407,7 @@ describe('auth-tunnel settings card contract', () => {
     expect(mutate).not.toHaveBeenCalled()
   })
 
-  it('rejects a local password write targeting another configured credential', async () => {
+  it('rejects replacing another configured credential while switching references', async () => {
     const order: string[] = []
     const { api, mutate, set } = successfulCardApi({}, order, ['OTHER_HOST_SECRET'])
 
@@ -443,9 +419,9 @@ describe('auth-tunnel settings card contract', () => {
       { ...quick, passwordRef: 'OTHER_HOST_SECRET' },
       'replacement',
       {},
-    )).rejects.toThrow('already exists')
+    )).rejects.toThrow('configured separately')
 
-    expect(order).toEqual(['credential-check'])
+    expect(order).toEqual([])
     expect(set).not.toHaveBeenCalled()
     expect(mutate).not.toHaveBeenCalled()
   })

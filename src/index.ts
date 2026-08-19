@@ -906,12 +906,12 @@ class PasswordGate {
           const authorizationCredentialGeneration = this.credentialGeneration(current.passwordRef)
           const credentialGeneration = this.credentialGeneration(target.passwordRef)
           if (target.passwordRef !== current.passwordRef) {
-            const targetCredential = await this.ctx.credentials.resolve(credentialRef(target.passwordRef))
-            if (password === '' && (targetCredential === undefined || targetCredential.value === '')) {
-              throw new Error('access password credential is not configured')
+            if (password !== '') {
+              throw new Error('a new access password credential must be configured separately')
             }
-            if (password !== '' && targetCredential !== undefined) {
-              throw new Error('access password credential already exists')
+            const targetCredential = await this.ctx.credentials.resolve(credentialRef(target.passwordRef))
+            if (targetCredential === undefined || targetCredential.value === '') {
+              throw new Error('access password credential is not configured')
             }
           }
           if (!current.allowRemoteSettings) throw new Error('remote settings disabled')
@@ -1413,7 +1413,11 @@ class AuthTunnelRuntime {
   private disposed = false
   private readonly shutdown = new AbortController()
   private passwordChecks = new AbortController()
-  private stagedStartup: AbortController | undefined
+  private stagedStartup: {
+    controller: AbortController
+    owner: InternalConfig
+    tokenRef?: string
+  } | undefined
   private finishHandoff: (() => void) | undefined
   private readonly remoteMutations: RemoteMutationFence = {
     tail: Promise.resolve(),
@@ -1509,13 +1513,17 @@ class AuthTunnelRuntime {
   /** Coalesce scalar settings writes, then reconcile only the latest snapshot. */
   request(config: InternalConfig): void {
     if (this.disposed) return
-    if (!config.enabled) this.passwordChecks.abort()
-    else if (this.passwordChecks.signal.aborted) this.passwordChecks = new AbortController()
+    const passwordRefChanged = this.configured !== undefined
+      && this.configured.passwordRef !== config.passwordRef
+    if (!config.enabled || passwordRefChanged) this.passwordChecks.abort()
+    if (config.enabled && this.passwordChecks.signal.aborted) this.passwordChecks = new AbortController()
+    const staged = this.stagedStartup
+    if (staged !== undefined && (!config.enabled || changesTunnelRoute(staged.owner, config))) {
+      staged.controller.abort()
+    }
     if (config.enabled && this.configured?.enabled === false) {
       for (const gate of this.liveGates) gate.restorePublicAccess(config)
     }
-    const passwordRefChanged = this.configured !== undefined
-      && this.configured.passwordRef !== config.passwordRef
     if (!config.enabled || !config.allowRemoteSettings || passwordRefChanged) {
       this.detachPreCommitRemoteMutations(true)
     }
@@ -1534,7 +1542,6 @@ class AuthTunnelRuntime {
     }
     if (!config.enabled) {
       for (const gate of this.liveGates) gate.revokePublicAccess()
-      this.stagedStartup?.abort()
       const handoff = this.finishHandoff
       if (handoff !== undefined) {
         const finish = (): void => {
@@ -1568,6 +1575,11 @@ class AuthTunnelRuntime {
     )
     const tokenUpdated = configuredTokenUpdated || activeTokenUpdated || fallbackTokenUpdated
     if (tokenUpdated) this.tokenCredentialGenerations.set(ref, (this.tokenCredentialGenerations.get(ref) ?? 0) + 1)
+    const staged = this.stagedStartup
+    if (staged !== undefined && (staged.tokenRef === ref
+      || (staged.owner.mode === 'token' && staged.owner.tokenRef === ref))) {
+      staged.controller.abort()
+    }
     for (const gate of this.liveGates) gate.credentialUpdated(ref)
     if (accessPasswordUpdated) this.detachPreCommitRemoteMutations(false)
     if (config !== undefined && (accessPasswordUpdated || tokenUpdated)) {
@@ -1589,7 +1601,7 @@ class AuthTunnelRuntime {
     this.publish(undefined)
     this.shutdown.abort()
     this.passwordChecks.abort()
-    this.stagedStartup?.abort()
+    this.stagedStartup?.controller.abort()
     await Promise.all([
       this.drainTask,
       active === undefined ? Promise.resolve() : this.stop(active),
@@ -1676,7 +1688,7 @@ class AuthTunnelRuntime {
       && this.appliedTokenCredentialGeneration !== activeTokenGeneration
       && (next.mode !== 'token' || next.tokenRef !== current.config.tokenRef)) {
       try {
-        const refreshed = await this.refreshRetainedTokenTunnel(current, activeTokenGeneration)
+        const refreshed = await this.refreshRetainedTokenTunnel(current, activeTokenGeneration, next)
         if (refreshed === undefined) return
         current = refreshed
       } catch (error) {
@@ -1825,8 +1837,13 @@ class AuthTunnelRuntime {
   private async refreshRetainedTokenTunnel(
     current: ActiveTunnel,
     tokenGeneration: number,
+    target: InternalConfig,
   ): Promise<ActiveTunnel | undefined> {
-    const spawned = await this.spawnStaged(current.config, `http://127.0.0.1:${String(current.port)}`)
+    const spawned = await this.spawnStaged(
+      current.config,
+      `http://127.0.0.1:${String(current.port)}`,
+      target,
+    )
     if (this.disposed) {
       this.intentionalExits.add(spawned.child)
       await killTree(spawned.child)
@@ -1892,11 +1909,11 @@ class AuthTunnelRuntime {
   }
 
   private async startFull(config: InternalConfig): Promise<ActiveTunnel> {
-    if (this.startupCancelled()) throw TUNNEL_STARTUP_CANCELLED
+    if (this.startupCancelled(config)) throw TUNNEL_STARTUP_CANCELLED
     let gateConfig = this.withCurrentAuth(config)
     while (true) {
       await this.requirePassword(gateConfig.passwordRef)
-      if (this.startupCancelled()) throw TUNNEL_STARTUP_CANCELLED
+      if (this.startupCancelled(config)) throw TUNNEL_STARTUP_CANCELLED
       const latest = this.withCurrentAuth(config)
       if (latest.passwordRef === gateConfig.passwordRef) {
         gateConfig = latest
@@ -1974,19 +1991,26 @@ class AuthTunnelRuntime {
   private async spawnStaged(
     config: InternalConfig,
     target: string,
+    owner = config,
   ): Promise<{ child: ChildProcess; publicUrl: string }> {
-    const startup = new AbortController()
+    const startup = {
+      controller: new AbortController(),
+      owner,
+      ...(config.mode === 'token' && config.tokenRef !== undefined ? { tokenRef: config.tokenRef } : {}),
+    }
     this.stagedStartup = startup
-    if (this.startupCancelled()) startup.abort()
+    if (this.startupCancelled(owner)) startup.controller.abort()
     try {
-      return await spawnTunnel(this.ctx, config, target, startup.signal)
+      return await spawnTunnel(this.ctx, config, target, startup.controller.signal)
     } finally {
       if (this.stagedStartup === startup) this.stagedStartup = undefined
     }
   }
 
-  private startupCancelled(): boolean {
-    return this.disposed || this.shutdown.signal.aborted || this.desired?.enabled === false
+  private startupCancelled(owner: InternalConfig): boolean {
+    const latest = this.configured
+    return this.disposed || this.shutdown.signal.aborted
+      || (latest !== undefined && (!latest.enabled || changesTunnelRoute(owner, latest)))
   }
 
   private waitForHandoff(): Promise<void> {
