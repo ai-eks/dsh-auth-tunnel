@@ -262,6 +262,7 @@ const REMOTE_LOCALE_PATH = '/dsh-auth-tunnel/locale'
 const REMOTE_SETTINGS_RETRY_MS = 1000
 const REMOTE_LOCALE_RETRY_LIMIT = 5
 const RUNTIME_STATUS_FAILURE_TOLERANCE = 1
+const RUNTIME_STATUS_PENDING_FENCE_MS = 5000
 const MAX_LOGIN_BODY_BYTES = 16 * 1024
 const INITIAL_RUNTIME_STATUS: RuntimeStatusSnapshot = {
   phase: 'unavailable',
@@ -317,6 +318,7 @@ export class RuntimeStatusStore {
   private reliable = false
   private consecutiveFailures = 0
   private pendingAfterRevision: number | undefined
+  private pendingDeadline = 0
   private readonly listeners = new Set<() => void>()
   private timer: ReturnType<typeof setTimeout> | undefined
   private task: Promise<void> | undefined
@@ -354,6 +356,7 @@ export class RuntimeStatusStore {
     this.consecutiveFailures = 0
     if (this.snapshot.revision > afterRevision) return
     this.pendingAfterRevision = afterRevision
+    this.pendingDeadline = Date.now() + RUNTIME_STATUS_PENDING_FENCE_MS
     this.publish(enabled
       ? {
           phase: 'applying',
@@ -378,8 +381,10 @@ export class RuntimeStatusStore {
       this.consecutiveFailures = 0
       if (this.pendingAfterRevision !== undefined) {
         const restarted = next.revision < this.snapshot.revision
-        if (!restarted && next.revision <= this.pendingAfterRevision) return
+        const expired = Date.now() >= this.pendingDeadline
+        if (!restarted && !expired && next.revision <= this.pendingAfterRevision) return
         this.pendingAfterRevision = undefined
+        this.pendingDeadline = 0
       }
       this.reliable = true
     } catch {
@@ -610,6 +615,7 @@ export class RemoteSettingsStore {
   private task: Promise<RemoteSettingsDocument | undefined> | undefined
   private retryTimer: ReturnType<typeof setTimeout> | undefined
   private retryUnavailableReads = true
+  private documentGeneration = 0
   private disposed = false
 
   constructor(private readonly transport: RemoteSettingsTransport = {
@@ -640,15 +646,16 @@ export class RemoteSettingsStore {
       clearTimeout(this.retryTimer)
       this.retryTimer = undefined
     }
+    const generation = this.documentGeneration
     this.task = this.transport.read().then((document) => {
-      if (!this.disposed) {
+      if (!this.disposed && generation === this.documentGeneration) {
         this.retryUnavailableReads = true
         this.document = document
         this.publish(document.snapshot)
       }
       return document
     }, (error: unknown) => {
-      if (!this.disposed) {
+      if (!this.disposed && generation === this.documentGeneration) {
         const status = record(error).status
         if (status === 401 || status === 403) {
           this.retryUnavailableReads = false
@@ -691,6 +698,7 @@ export class RemoteSettingsStore {
     try {
       const document = await this.transport.commit(request)
       if (!this.disposed) {
+        this.documentGeneration += 1
         const committed = document.snapshot.value?.allowRemoteSettings === false
           ? { ...document, snapshot: { ...document.snapshot, writable: false } }
           : document
@@ -698,7 +706,7 @@ export class RemoteSettingsStore {
         this.publish(committed.snapshot)
       }
     } catch (error) {
-      await this.refresh()
+      await this.refreshAfterCurrentRead()
       throw error
     }
   }

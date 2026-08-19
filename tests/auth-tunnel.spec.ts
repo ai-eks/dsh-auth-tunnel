@@ -2533,9 +2533,10 @@ describe('upgrade pass-through', () => {
     const closed = once(socket, 'close').then(() => 'closed')
     await composition.settings().update(settingsNamespace('auth-tunnel'), { passwordRef: 'MISSING_PASSWORD' })
     const outcome = await Promise.race([closed, sleep(750).then(() => 'timeout')])
-    await waitForStatus(composition, status => status.phase === 'error' && status.running)
+    const failed = await waitForStatus(composition, status => status.phase === 'error' && !status.running)
     socket.destroy()
     expect(outcome).toBe('closed')
+    expect(failed).not.toHaveProperty('publicUrl')
   })
 })
 
@@ -3249,8 +3250,11 @@ describe('rc7 plugin settings', () => {
       composition,
       status => status.revision > beforeFailure.revision && status.phase === 'error',
     )
-    expect(failed).toMatchObject({ running: true, publicUrl: QUICK_URL })
+    expect(failed).toMatchObject({ running: false })
+    expect(failed).not.toHaveProperty('publicUrl')
     expect(failed.message).toContain('MISSING_PASSWORD')
+    expect(composition.shellEnv().contributors).toEqual([])
+    expect(composition.systemPrompt().sections).toEqual([])
     const unavailable = await fetch(`${base}/dsh-auth-tunnel/login`, {
       method: 'POST', redirect: 'manual',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -3259,11 +3263,14 @@ describe('rc7 plugin settings', () => {
     expect(unavailable.status).toBe(503)
 
     expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(401)
-    composition.credentials().set('MISSING_PASSWORD', 'repaired-password')
-    await waitForStatus(
+    await composition.credentials().set('MISSING_PASSWORD', 'repaired-password')
+    const repaired = await waitForStatus(
       composition,
       status => status.revision > failed.revision && status.phase === 'running',
     )
+    expect(repaired.publicUrl).toBe(QUICK_URL)
+    expect(composition.shellEnv().contributors).toHaveLength(1)
+    expect(composition.systemPrompt().sections).toHaveLength(1)
     await login(base, undefined, 'repaired-password')
     expect((await liveFixturePids()).length).toBe(1)
   })

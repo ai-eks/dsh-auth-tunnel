@@ -1261,6 +1261,8 @@ class PasswordGate {
 const TUNNEL_STARTUP_CANCELLED = new Error('auth-tunnel: tunnel startup cancelled')
 const PASSWORD_RESOLUTION_CANCELLED = new Error('auth-tunnel: password resolution cancelled')
 
+class AccessPasswordUnavailableError extends Error {}
+
 /** Await one asynchronous lookup until its owning runtime transition is cancelled. */
 async function untilAbort<T>(
   task: () => Promise<T>,
@@ -1705,7 +1707,9 @@ class AuthTunnelRuntime {
         if (this.disposed) return
         if (error === PASSWORD_RESOLUTION_CANCELLED || error === TUNNEL_STARTUP_CANCELLED) continue
         const message = errorMessage(error)
-        const running = this.active?.alive === true
+        const accessUnavailable = error instanceof AccessPasswordUnavailableError
+        if (accessUnavailable) this.publish(undefined)
+        const running = !accessUnavailable && this.active?.alive === true
         this.setStatus('error', running, running ? this.active?.publicUrl : undefined, message)
         this.ctx.logger.error(`auth-tunnel: could not apply live settings: ${message}`)
       }
@@ -1905,7 +1909,7 @@ class AuthTunnelRuntime {
       this.passwordChecks.signal,
       PASSWORD_RESOLUTION_CANCELLED,
     ) === undefined) {
-      throw new Error(`auth-tunnel: credential reference "${ref}" is not configured`)
+      throw new AccessPasswordUnavailableError(`auth-tunnel: credential reference "${ref}" is not configured`)
     }
   }
 

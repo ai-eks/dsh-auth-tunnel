@@ -905,6 +905,36 @@ describe('auth-tunnel settings card contract', () => {
     store.dispose()
   })
 
+  it('does not let a read started before a successful commit overwrite the committed document', async () => {
+    const document = (revision: number, sessionTtlHours: number) => parseRemoteSettingsDocument({
+      settings: {
+        value: { ...quick, allowRemoteSettings: true, sessionTtlHours },
+        base: quick,
+        user: { allowRemoteSettings: true, sessionTtlHours },
+        revision,
+        writable: true,
+      },
+    })
+    let resolveRead = (_document: ReturnType<typeof document>): void => {}
+    const pendingRead = new Promise<ReturnType<typeof document>>((resolve) => { resolveRead = resolve })
+    const store = new RemoteSettingsStore({
+      read: vi.fn(() => pendingRead),
+      commit: vi.fn(() => Promise.resolve(document(4, 24))),
+    })
+
+    const readTask = store.refresh()
+    await store.commit({
+      expectedRevision: 3,
+      writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+      password: '',
+    })
+    resolveRead(document(3, 720))
+    await readTask
+
+    expect(store.getSnapshot()).toMatchObject({ revision: 4, value: { sessionTtlHours: 24 } })
+    store.dispose()
+  })
+
   it('makes the remote scope read-only after it revokes its own access', async () => {
     const document = (allowRemoteSettings: boolean) => parseRemoteSettingsDocument({
       settings: {
@@ -1312,5 +1342,28 @@ describe('auth-tunnel settings card contract', () => {
     await store.refresh()
     expect(store.getSnapshot()).toBe(live)
     store.dispose()
+  })
+
+  it('expires a pending fence when a restarted runtime recovers at the same revision', async () => {
+    vi.useFakeTimers()
+    try {
+      let live: RuntimeStatusSnapshot = {
+        phase: 'running', running: true, revision: 7, publicUrl: 'https://gui.example.com',
+      }
+      const store = new RuntimeStatusStore(() => Promise.resolve(live))
+
+      await store.refresh()
+      store.settingsCommitted(true)
+      live = { phase: 'running', running: true, revision: 7, publicUrl: 'https://restarted.example.com' }
+      await store.refresh()
+      expect(store.getSnapshot()).toMatchObject({ phase: 'applying', revision: 7 })
+
+      await vi.advanceTimersByTimeAsync(5000)
+      await store.refresh()
+      expect(store.getSnapshot()).toBe(live)
+      store.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
