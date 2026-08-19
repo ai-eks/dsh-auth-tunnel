@@ -157,6 +157,7 @@ const OUTPUT_TAIL_CHARS = 8192
 const KILL_GRACE_MS = 2000
 const TUNNEL_ADOPTION_CHECK_MS = 25
 const TUNNEL_HANDOFF_MS = 3500
+const SETTINGS_ROLLBACK_ATTEMPTS = 3
 const QUICK_URL_PATTERN = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',
@@ -514,6 +515,47 @@ function settingsWriteSatisfied(descriptor: SettingsDescriptor, write: RemoteSet
   const user = descriptor.user === undefined ? {} : objectRecord(descriptor.user)
   if (write.op === 'unset') return !Object.hasOwn(user, write.field)
   return Object.hasOwn(user, write.field) && Object.is(user[write.field], write.value)
+}
+
+/** Restore only fields that still contain this failed remote write. */
+async function rollbackRemoteSettings(
+  ctx: Context,
+  committed: SettingsDescriptor,
+  writes: readonly RemoteSettingsWrite[],
+  rollbackWrites: readonly RemoteSettingsWrite[],
+): Promise<void> {
+  const settings = ctx.get('settings')
+  if (settings === undefined) throw new Error('settings service is unavailable')
+  let current = committed
+  let lastError: unknown
+  for (let attempt = 0; attempt < SETTINGS_ROLLBACK_ATTEMPTS; attempt += 1) {
+    const applicable: RemoteSettingsWrite[] = []
+    for (let index = 0; index < writes.length; index += 1) {
+      const write = writes[index]
+      const rollback = rollbackWrites[index]
+      if (write !== undefined && rollback !== undefined && settingsWriteSatisfied(current, write)) {
+        applicable.push(rollback)
+      }
+    }
+    if (applicable.length === 0) return
+    const rollbackOps: SettingsPathOp[] = applicable.map(write => write.op === 'set'
+      ? { op: 'set', path: [write.field], value: write.value }
+      : { op: 'unset', path: [write.field] })
+    try {
+      await settings.mutate(AUTH_TUNNEL_SETTINGS_NAMESPACE, rollbackOps, current.revision)
+      const restored = descriptorFor(ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE).descriptor
+      if (applicable.some(write => !settingsWriteSatisfied(restored, write))) {
+        throw new Error('settings rollback was not committed')
+      }
+      return
+    } catch (error) {
+      lastError = error
+      const latest = descriptorFor(ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE).descriptor
+      if (latest.revision === current.revision) throw error
+      current = latest
+    }
+  }
+  throw lastError ?? new Error('settings rollback was not committed')
 }
 
 function changesTunnelRoute(current: InternalConfig, target: InternalConfig): boolean {
@@ -951,20 +993,12 @@ class PasswordGate {
               throw new Error('settings write was not committed')
             }
             credentialRevision = committed.revision
-            rollbackSettings = async () => {
-              const rollbackOps: SettingsPathOp[] = rollbackWrites.map(write => write.op === 'set'
-                ? { op: 'set', path: [write.field], value: write.value }
-                : { op: 'unset', path: [write.field] })
-              await settings.mutate(
-                AUTH_TUNNEL_SETTINGS_NAMESPACE,
-                rollbackOps,
-                committed.revision,
-              )
-              const restored = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE).descriptor
-              if (rollbackWrites.some(write => !settingsWriteSatisfied(restored, write))) {
-                throw new Error('settings rollback was not committed')
-              }
-            }
+            rollbackSettings = () => rollbackRemoteSettings(
+              this.ctx,
+              committed,
+              request.writes,
+              rollbackWrites,
+            )
           }
           try {
             const latest = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
@@ -1669,6 +1703,7 @@ class AuthTunnelRuntime {
     validateConfig(next)
     if (!next.enabled) {
       await this.remoteMutations.committedTail
+      if (this.configured?.enabled === true) return
       const previous = this.active
       this.active = undefined
       this.publish(undefined)

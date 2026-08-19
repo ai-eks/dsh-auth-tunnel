@@ -260,6 +260,8 @@ const RUNTIME_STATUS_PATH = '/dsh-auth-tunnel/status'
 const REMOTE_SETTINGS_PATH = '/dsh-auth-tunnel/settings'
 const REMOTE_LOCALE_PATH = '/dsh-auth-tunnel/locale'
 const REMOTE_SETTINGS_RETRY_MS = 1000
+const REMOTE_LOCALE_RETRY_LIMIT = 5
+const RUNTIME_STATUS_FAILURE_TOLERANCE = 1
 const MAX_LOGIN_BODY_BYTES = 16 * 1024
 const INITIAL_RUNTIME_STATUS: RuntimeStatusSnapshot = {
   phase: 'unavailable',
@@ -313,6 +315,7 @@ function sameRuntimeStatus(left: RuntimeStatusSnapshot, right: RuntimeStatusSnap
 export class RuntimeStatusStore {
   private snapshot = INITIAL_RUNTIME_STATUS
   private reliable = false
+  private consecutiveFailures = 0
   private pendingAfterRevision: number | undefined
   private readonly listeners = new Set<() => void>()
   private timer: ReturnType<typeof setTimeout> | undefined
@@ -348,6 +351,7 @@ export class RuntimeStatusStore {
   /** Reflect one committed settings write while the Host runtime reconciles it. */
   settingsCommitted(enabled: boolean, afterRevision = this.snapshot.revision): void {
     this.reliable = true
+    this.consecutiveFailures = 0
     if (this.snapshot.revision > afterRevision) return
     this.pendingAfterRevision = afterRevision
     this.publish(enabled
@@ -371,6 +375,7 @@ export class RuntimeStatusStore {
     let next: RuntimeStatusSnapshot
     try {
       next = await this.read()
+      this.consecutiveFailures = 0
       if (this.pendingAfterRevision !== undefined) {
         if (next.revision <= this.pendingAfterRevision) return
         this.pendingAfterRevision = undefined
@@ -380,7 +385,9 @@ export class RuntimeStatusStore {
       // Tunnel replacement can briefly interrupt the route used by a public
       // browser. Keep the last confirmed/committed state instead of flashing
       // an unavailable badge after every single failed poll.
-      if (this.reliable) return
+      this.consecutiveFailures += 1
+      if (this.reliable && this.consecutiveFailures <= RUNTIME_STATUS_FAILURE_TOLERANCE) return
+      this.reliable = false
       next = { phase: 'unavailable', running: false, revision: this.snapshot.revision }
     }
     this.publish(next)
@@ -443,6 +450,7 @@ function numberDraft(text: string): number {
 }
 
 function parseDraft(draft: Draft): AuthTunnelSettings {
+  const mode = draft.values.mode as TunnelMode
   const tokenRef = draft.values.tokenRef.trim()
   const publicHostname = draft.values.publicHostname.trim()
   return {
@@ -450,9 +458,11 @@ function parseDraft(draft: Draft): AuthTunnelSettings {
     allowRemoteSettings: draft.values.allowRemoteSettings === 'true',
     passwordRef: draft.values.passwordRef.trim(),
     sessionTtlHours: numberDraft(draft.values.sessionTtlHours),
-    mode: draft.values.mode as TunnelMode,
-    ...(tokenRef === '' ? {} : { tokenRef }),
-    ...(publicHostname === '' ? {} : { publicHostname }),
+    mode,
+    ...(tokenRef === '' || (mode === 'quick' && draft.edits.tokenRef !== undefined) ? {} : { tokenRef }),
+    ...(publicHostname === '' || (mode === 'quick' && draft.edits.publicHostname !== undefined)
+      ? {}
+      : { publicHostname }),
     gatePort: numberDraft(draft.values.gatePort),
     executable: draft.values.executable.trim(),
     startupTimeoutMs: numberDraft(draft.values.startupTimeoutMs),
@@ -469,7 +479,9 @@ export function validateSettingsValues(value: AuthTunnelSettings): Partial<Recor
     errors.sessionTtlHours = 'invalidNumber'
   }
   if (value.mode !== 'quick' && value.mode !== 'token') errors.mode = 'required'
-  if (value.publicHostname !== undefined && !PUBLIC_HOSTNAME_PATTERN.test(value.publicHostname)) {
+  if (value.mode === 'token'
+    && value.publicHostname !== undefined
+    && !PUBLIC_HOSTNAME_PATTERN.test(value.publicHostname)) {
     errors.publicHostname = 'invalidHostname'
   }
   if (!Number.isInteger(value.gatePort) || value.gatePort < 0 || value.gatePort > 65535) {
@@ -778,6 +790,49 @@ export async function commitSettingsWrites(
   return response.result.value
 }
 
+async function readSettingsNamespace(api: Pick<IApiClient, 'settings'>): Promise<SettingsNamespaceView> {
+  const response = await api.settings.describe({})
+  if (!response.result.ok) throw new Error(response.result.error.message)
+  const namespace = response.result.value.namespaces.find(entry => entry.ns === SETTINGS_NAMESPACE)
+  if (namespace === undefined) throw new Error('auth-tunnel settings namespace is unavailable')
+  return namespace
+}
+
+/** Restore only fields that still contain this failed save, rebasing over unrelated edits. */
+async function rollbackSettingsWrites(
+  api: Pick<IApiClient, 'settings'>,
+  committed: SettingsNamespaceView,
+  writes: readonly SettingsWrite[],
+  rollbackWrites: readonly SettingsWrite[],
+): Promise<void> {
+  let current = committed
+  let lastError: unknown
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const applicable: SettingsWrite[] = []
+    for (let index = 0; index < writes.length; index += 1) {
+      const write = writes[index]
+      const rollback = rollbackWrites[index]
+      if (write !== undefined && rollback !== undefined && writeSatisfied(current, write)) {
+        applicable.push(rollback)
+      }
+    }
+    if (applicable.length === 0) return
+    try {
+      const restored = await commitSettingsWrites(api, current.revision, applicable)
+      if (applicable.some(write => !writeSatisfied(restored, write))) {
+        throw new Error('settings rollback was not committed')
+      }
+      return
+    } catch (error) {
+      lastError = error
+      const latest = await readSettingsNamespace(api)
+      if (latest.revision === current.revision) throw error
+      current = latest
+    }
+  }
+  throw lastError ?? new Error('settings rollback was not committed')
+}
+
 /** Commit card settings and an optional password without breaking the current public request path. */
 export async function commitCardChanges(
   api: CardApi,
@@ -840,10 +895,7 @@ export async function commitCardChanges(
               value: openedUser[write.field] as Exclude<AuthTunnelSettings[FieldKey], undefined>,
             }
           : { field: write.field, op: 'unset' })
-        const restored = await commitSettingsWrites(api, prepared.revision, rollbackWrites)
-        if (rollbackWrites.some(write => !writeSatisfied(restored, write))) {
-          throw new Error('settings rollback was not committed')
-        }
+        await rollbackSettingsWrites(api, prepared, setupWrites, rollbackWrites)
       }
       throw error
     }
@@ -882,10 +934,7 @@ export async function commitCardChanges(
   }
   const rollbackCommittedSettings = async (): Promise<void> => {
     if (committed === undefined || rollbackWrites === undefined) return
-    const restored = await commitSettingsWrites(api, committed.revision, rollbackWrites)
-    if (rollbackWrites.some(write => !writeSatisfied(restored, write))) {
-      throw new Error('settings rollback was not committed')
-    }
+    await rollbackSettingsWrites(api, committed, writes, rollbackWrites)
   }
   if (password === '' && changesPasswordRef
     && writes.some(write => write.field === 'passwordRef')) {
@@ -1369,11 +1418,42 @@ export function installRemoteLocalePersistence(ctx: ClientContext, store: Remote
   let loaded = false
   let adopting = false
   let pending: 'zh' | 'en' | undefined
-  let tail = Promise.resolve()
+  let requested: 'zh' | 'en' | undefined
+  let task: Promise<void> | undefined
+  let retryTimer: ReturnType<typeof setTimeout> | undefined
+  let retries = 0
+  const flush = (): void => {
+    if (disposed || task !== undefined || requested === undefined) return
+    const locale = requested
+    task = persistRemoteLocale(locale).then(() => {
+      if (requested === locale) {
+        requested = undefined
+        retries = 0
+      }
+    }, () => {
+      if (requested !== locale) return
+      if (retries >= REMOTE_LOCALE_RETRY_LIMIT) {
+        requested = undefined
+        return
+      }
+      retries += 1
+      retryTimer = setTimeout(() => {
+        retryTimer = undefined
+        flush()
+      }, REMOTE_SETTINGS_RETRY_MS)
+    }).finally(() => {
+      task = undefined
+      if (requested !== undefined && retryTimer === undefined) flush()
+    })
+  }
   const persist = (locale: 'zh' | 'en'): void => {
-    tail = tail.catch(() => undefined).then(async () => {
-      if (!disposed) await persistRemoteLocale(locale)
-    }).catch(() => undefined)
+    if (requested !== locale) retries = 0
+    requested = locale
+    if (retryTimer !== undefined) {
+      clearTimeout(retryTimer)
+      retryTimer = undefined
+    }
+    flush()
   }
   const stop = ctx.on('locale/change', (snapshot) => {
     if (adopting) return
@@ -1408,6 +1488,8 @@ export function installRemoteLocalePersistence(ctx: ClientContext, store: Remote
   adoptLoadedDocument()
   return () => {
     disposed = true
+    if (retryTimer !== undefined) clearTimeout(retryTimer)
+    retryTimer = undefined
     stopStore?.()
     stop()
   }

@@ -56,6 +56,7 @@ function successfulCardApi(user: Record<string, unknown>, order: string[], confi
 describe('auth-tunnel settings card contract', () => {
   it('validates token-only requirements before saving', () => {
     expect(validateSettingsValues(quick)).toEqual({})
+    expect(validateSettingsValues({ ...quick, publicHostname: 'https://invalid.example.com' })).toEqual({})
     expect(validateSettingsValues({ ...quick, mode: 'token' })).toEqual({
       tokenRef: 'tokenRefRequired',
       publicHostname: 'hostnameRequired',
@@ -494,6 +495,85 @@ describe('auth-tunnel settings card contract', () => {
     })
   })
 
+  it('rebases a passwordless reference rollback over an unrelated settings edit', async () => {
+    const describeCredential = vi.fn()
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: {
+          ok: true as const,
+          value: { credentials: { NEXT_WEB_PASSWORD: { configured: true, writable: true } } },
+        },
+      })
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: {
+          ok: true as const,
+          value: { credentials: { NEXT_WEB_PASSWORD: { configured: false, writable: true } } },
+        },
+      })
+    const describeSettings = vi.fn(() => Promise.resolve({
+      rpcId: 'test',
+      result: {
+        ok: true as const,
+        value: {
+          writable: true,
+          hasDocument: true,
+          namespaces: [{
+            ns: 'auth-tunnel', schema: {},
+            value: { ...quick, passwordRef: 'NEXT_WEB_PASSWORD', startupTimeoutMs: 20_000 },
+            user: { passwordRef: 'NEXT_WEB_PASSWORD', startupTimeoutMs: 20_000 },
+            applies: 'live' as const, secrets: [], revision: 9,
+          }],
+        },
+      },
+    }))
+    const mutate = vi.fn()
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: {
+          ok: true as const,
+          value: {
+            ns: 'auth-tunnel', schema: {}, value: { ...quick, passwordRef: 'NEXT_WEB_PASSWORD' },
+            user: { passwordRef: 'NEXT_WEB_PASSWORD' }, applies: 'live' as const, secrets: [], revision: 8,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: { ok: false as const, error: { code: 'conflict', message: 'settings revision changed' } },
+      })
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: {
+          ok: true as const,
+          value: {
+            ns: 'auth-tunnel', schema: {}, value: { ...quick, startupTimeoutMs: 20_000 },
+            user: { startupTimeoutMs: 20_000 }, applies: 'live' as const, secrets: [], revision: 10,
+          },
+        },
+      })
+
+    await expect(commitCardChanges(
+      {
+        settings: { mutate, describe: describeSettings },
+        credentials: { describe: describeCredential, set: vi.fn() },
+      } as never,
+      7,
+      [{ field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' }],
+      quick,
+      { ...quick, passwordRef: 'NEXT_WEB_PASSWORD' },
+      '',
+      {},
+    )).rejects.toThrow('not configured')
+
+    expect(describeSettings).toHaveBeenCalledWith({})
+    expect(mutate).toHaveBeenNthCalledWith(3, {
+      ns: 'auth-tunnel',
+      expectedRevision: 9,
+      ops: [{ op: 'unset', path: ['passwordRef'] }],
+    })
+  })
+
   it('rejects replacing another configured credential while switching references', async () => {
     const order: string[] = []
     const { api, mutate, set } = successfulCardApi({}, order, ['OTHER_HOST_SECRET'])
@@ -873,6 +953,52 @@ describe('auth-tunnel settings card contract', () => {
     }
   })
 
+  it('retries a transient remote locale write', async () => {
+    vi.useFakeTimers()
+    const fetch = vi.spyOn(globalThis, 'fetch')
+      .mockRejectedValueOnce(new Error('handoff'))
+      .mockResolvedValue(new Response('{}', { status: 200 }))
+    const document = parseRemoteSettingsDocument({
+      settings: {
+        value: { ...quick, allowRemoteSettings: true },
+        base: quick,
+        user: { allowRemoteSettings: true },
+        revision: 3,
+        writable: true,
+      },
+      locale: 'zh',
+    })
+    const store = new RemoteSettingsStore({
+      read: vi.fn(() => Promise.resolve(document)),
+      commit: vi.fn(),
+    })
+    let localeChanged = (_snapshot: { active: 'zh' | 'en' }): void => {}
+    await store.refresh()
+    const dispose = installRemoteLocalePersistence({
+      on: vi.fn((_event, listener) => {
+        localeChanged = listener as typeof localeChanged
+        return () => {}
+      }),
+      locale: { setLocale: vi.fn() },
+    } as never, store)
+
+    try {
+      localeChanged({ active: 'en' })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(fetch).toHaveBeenCalledOnce()
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(fetch).toHaveBeenCalledTimes(2)
+      expect(fetch).toHaveBeenLastCalledWith('/dsh-auth-tunnel/locale', expect.objectContaining({
+        body: JSON.stringify({ locale: 'en' }),
+      }))
+    } finally {
+      dispose()
+      store.dispose()
+      fetch.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
   it('refreshes the remote settings snapshot after a rejected commit', async () => {
     const latest = parseRemoteSettingsDocument({
       settings: {
@@ -919,6 +1045,8 @@ describe('auth-tunnel settings card contract', () => {
     fail = true
     await store.refresh()
     expect(store.getSnapshot()).toBe(running)
+    await store.refresh()
+    expect(store.getSnapshot()).toEqual({ phase: 'unavailable', running: false, revision: 7 })
     store.settingsCommitted(false)
     expect(store.getSnapshot()).toEqual({ phase: 'stopped', running: false, revision: 7 })
     fail = false

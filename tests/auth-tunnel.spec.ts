@@ -51,6 +51,9 @@ class StubCredentials extends Service {
   /** Test knob: reject the next credential write before it changes storage. */
   failNextSet = false
 
+  /** Test knob: reject the next credential write after its commit-phase barrier. */
+  failNextSetAfterBarrier = false
+
   /** Test knob: hold a credential write after it enters the commit phase. */
   setBarrier: Promise<void> | undefined
 
@@ -80,6 +83,10 @@ class StubCredentials extends Service {
     }
     this.setStarted?.(ref)
     if (this.setBarrier !== undefined) await this.setBarrier
+    if (this.failNextSetAfterBarrier) {
+      this.failNextSetAfterBarrier = false
+      throw new Error('credential persistence failed')
+    }
     if (value === undefined) {
       this.values.delete(ref)
     } else {
@@ -763,6 +770,50 @@ describe('password gate over the loopback webserver', () => {
     expect(composition.settings().get(settingsNamespace('auth-tunnel')).sessionTtlHours).toBe(720)
     expect(await composition.credentials().resolve('DSH_WEB_PASSWORD'))
       .toMatchObject({ value: 's3kret-passw0rd' })
+  })
+
+  it('rebases a remote settings rollback over an unrelated local edit', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    let releaseSet = (): void => {}
+    composition.credentials().setBarrier = new Promise<void>((resolve) => { releaseSet = resolve })
+    composition.credentials().failNextSetAfterBarrier = true
+    let markSetStarted = (): void => {}
+    const setStarted = new Promise<void>((resolve) => { markSetStarted = resolve })
+    composition.credentials().setStarted = (ref) => {
+      if (ref !== 'DSH_WEB_PASSWORD') return
+      composition.credentials().setStarted = undefined
+      markSetStarted()
+    }
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+        password: 'replacement-password',
+      }),
+    })
+    await setStarted
+    try {
+      await composition.settings().update(settingsNamespace('auth-tunnel'), { startupTimeoutMs: 20_000 })
+      releaseSet()
+      expect((await responseTask).status).toBe(409)
+    } finally {
+      composition.credentials().setBarrier = undefined
+      composition.credentials().setStarted = undefined
+      releaseSet()
+    }
+
+    expect(composition.settings().get(settingsNamespace('auth-tunnel'))).toMatchObject({
+      sessionTtlHours: 720,
+      startupTimeoutMs: 20_000,
+    })
   })
 
   it('rolls back remote settings when the access credential changes during persistence', { timeout: 60_000 }, async () => {
@@ -1635,6 +1686,58 @@ describe('password gate over the loopback webserver', () => {
       expect((await responseTask)?.status).toBe(200)
       await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
       expect(await liveFixturePids()).toEqual([])
+    } finally {
+      composition.credentials().setBarrier = undefined
+      composition.credentials().setStarted = undefined
+      if (!released) releaseSet()
+    }
+  })
+
+  it('keeps the active tunnel when a fenced disable is superseded by enable', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    composition.loaded.webServer.register({
+      kind: 'exact', path: '/api/re-enabled-after-fence', handler: (_req, res) => {
+        res.writeHead(200)
+        res.end('ok')
+      },
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    const originalPids = await liveFixturePids()
+    let releaseSet = (): void => {}
+    composition.credentials().setBarrier = new Promise<void>((resolve) => { releaseSet = resolve })
+    let markSetStarted = (): void => {}
+    const setStarted = new Promise<void>((resolve) => { markSetStarted = resolve })
+    composition.credentials().setStarted = (ref) => {
+      if (ref !== 'DSH_WEB_PASSWORD') return
+      composition.credentials().setStarted = undefined
+      markSetStarted()
+    }
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [],
+        password: 'replacement-password',
+      }),
+    })
+    await setStarted
+    let released = false
+    try {
+      await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
+      await sleep(250)
+      await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: true })
+      expect((await fetch(`${base}/api/re-enabled-after-fence`, { headers: { cookie } })).status).toBe(200)
+
+      releaseSet()
+      released = true
+      expect((await responseTask).status).toBe(200)
+      await waitForStatus(composition, status => status.phase === 'running' && status.running)
+      expect(await liveFixturePids()).toEqual(originalPids)
     } finally {
       composition.credentials().setBarrier = undefined
       composition.credentials().setStarted = undefined
