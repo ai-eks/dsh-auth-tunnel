@@ -628,6 +628,34 @@ describe('password gate over the loopback webserver', () => {
     expect(composition.settings().get(settingsNamespace('auth-tunnel')).sessionTtlHours).toBe(24)
   })
 
+  it('rejects a remote Quick route change before replacing its discoverable URL', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const before = await composition.runtimeStatus()
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'gatePort', op: 'set', value: 32_345 }],
+        password: '',
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).gatePort).toBe(0)
+    expect(await composition.runtimeStatus()).toMatchObject({
+      phase: 'running',
+      publicUrl: before.publicUrl,
+    })
+    expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(200)
+  })
+
   it('rejects a remote save that rotates the active password and tunnel route together', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     const base = await composition.gateBase()

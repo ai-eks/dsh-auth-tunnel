@@ -517,6 +517,15 @@ function changesTunnelRoute(current: InternalConfig, target: InternalConfig): bo
     || current.publicHostname !== target.publicHostname
 }
 
+/** A public client cannot discover a newly allocated Quick URL after its current route closes. */
+function replacesRemoteQuickUrl(current: InternalConfig, target: InternalConfig): boolean {
+  return target.enabled
+    && target.mode === 'quick'
+    && (current.mode !== 'quick'
+      || current.gatePort !== target.gatePort
+      || current.executable !== target.executable)
+}
+
 /** Settings that change the outcome or lifetime of one in-flight startup. */
 function changesTunnelStartup(current: InternalConfig, target: InternalConfig): boolean {
   return changesTunnelRoute(current, target)
@@ -883,6 +892,9 @@ class PasswordGate {
       }
       if (!current.allowRemoteSettings) throw new Error('remote settings disabled')
       await this.requireRemoteMutationAuthorization(req)
+      if (replacesRemoteQuickUrl(current, target)) {
+        throw new Error('Quick tunnel route changes must be saved from a local page')
+      }
       if (target.passwordRef !== current.passwordRef) {
         const targetCredential = await this.ctx.credentials.resolve(credentialRef(target.passwordRef))
         if (targetCredential === undefined || targetCredential.value === '') {
