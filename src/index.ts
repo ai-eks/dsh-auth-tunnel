@@ -1013,6 +1013,13 @@ class PasswordGate {
             if (password !== '') {
               enterCommitPhase()
               await this.ctx.credentials.set(credentialRef(target.passwordRef), password)
+              const completed = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
+              const completedConfig = Config(objectRecord(completed.descriptor.value) as unknown as InternalConfig)
+              if (!completed.writable
+                || completedConfig.passwordRef !== target.passwordRef
+                || request.writes.some(write => !settingsWriteSatisfied(completed.descriptor, write))) {
+                throw new Error('settings changed during credential write')
+              }
             }
           } catch (error) {
             await rollbackSettings?.()
@@ -1702,7 +1709,7 @@ class AuthTunnelRuntime {
   private async reconcile(next: InternalConfig): Promise<void> {
     validateConfig(next)
     if (!next.enabled) {
-      await this.remoteMutations.committedTail
+      if (!await this.waitForCommittedRemoteMutations()) return
       if (this.configured?.enabled === true) return
       const previous = this.active
       this.active = undefined
@@ -1766,7 +1773,10 @@ class AuthTunnelRuntime {
         await this.waitForHandoffWithFallback(previous)
         this.detachPreCommitRemoteMutations(false)
         previous.gate.revokeRemoteSettings()
-        await this.remoteMutations.committedTail
+        if (!await this.waitForCommittedRemoteMutations()) {
+          await this.stop(previous)
+          return
+        }
         if (this.disposed) {
           await this.stop(previous)
           return
@@ -1838,7 +1848,10 @@ class AuthTunnelRuntime {
           return
         }
         this.detachPreCommitRemoteMutations(false)
-        await this.remoteMutations.committedTail
+        if (!await this.waitForCommittedRemoteMutations()) {
+          await this.stopChild(previous)
+          return
+        }
         if (!candidate.alive) {
           if (!this.restorePreviousAfterFailedHandoff(candidate, previous)) {
             this.active = undefined
@@ -1925,7 +1938,10 @@ class AuthTunnelRuntime {
       return current
     }
     this.detachPreCommitRemoteMutations(false)
-    await this.remoteMutations.committedTail
+    if (!await this.waitForCommittedRemoteMutations()) {
+      await this.stopChild(current)
+      return undefined
+    }
     if (!candidate.alive) {
       const restored = this.restorePreviousAfterFailedHandoff(candidate, current)
       await this.stopChild(candidate)
@@ -1988,7 +2004,7 @@ class AuthTunnelRuntime {
       if (server !== undefined) this.detachPreCommitRemoteMutations(false)
       this.liveGates.delete(gate)
       if (server !== undefined) {
-        await this.remoteMutations.committedTail
+        await this.waitForCommittedRemoteMutations()
         await closeGate(server)
       }
       throw error
@@ -2057,6 +2073,26 @@ class AuthTunnelRuntime {
     const latest = this.configured
     return this.disposed || this.shutdown.signal.aborted
       || (latest !== undefined && (!latest.enabled || changesTunnelStartup(owner, latest)))
+  }
+
+  /** Let teardown stop transitional runtimes without waiting on external credential storage. */
+  private async waitForCommittedRemoteMutations(): Promise<boolean> {
+    const signal = this.shutdown.signal
+    if (signal.aborted) return false
+    let abort = (): void => {}
+    const cancelled = new Promise<false>((resolve) => {
+      abort = (): void => { resolve(false) }
+      signal.addEventListener('abort', abort, { once: true })
+      if (signal.aborted) abort()
+    })
+    try {
+      return await Promise.race([
+        this.remoteMutations.committedTail.then(() => true),
+        cancelled,
+      ])
+    } finally {
+      signal.removeEventListener('abort', abort)
+    }
   }
 
   private waitForHandoff(): Promise<void> {

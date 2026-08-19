@@ -699,6 +699,50 @@ describe('password gate over the loopback webserver', () => {
       .toMatchObject({ value: 's3kret-passw0rd' })
   })
 
+  it('rejects a password rotation when the selected reference changes during the credential write', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true }, {
+      seeds: { ALT_WEB_PASSWORD: 'alternate-password' },
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    let releaseSet = (): void => {}
+    composition.credentials().setBarrier = new Promise<void>((resolve) => { releaseSet = resolve })
+    let markSetStarted = (): void => {}
+    const setStarted = new Promise<void>((resolve) => { markSetStarted = resolve })
+    composition.credentials().setStarted = (ref) => {
+      if (ref !== 'DSH_WEB_PASSWORD') return
+      composition.credentials().setStarted = undefined
+      markSetStarted()
+    }
+
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [],
+        password: 'replacement-password',
+      }),
+    })
+    await setStarted
+    try {
+      await composition.settings().update(settingsNamespace('auth-tunnel'), { passwordRef: 'ALT_WEB_PASSWORD' })
+      releaseSet()
+      expect((await responseTask).status).toBe(409)
+    } finally {
+      composition.credentials().setBarrier = undefined
+      composition.credentials().setStarted = undefined
+      releaseSet()
+    }
+
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('ALT_WEB_PASSWORD')
+    expect(await composition.credentials().resolve('ALT_WEB_PASSWORD'))
+      .toMatchObject({ value: 'alternate-password' })
+  })
+
   it('requires a new remote password reference to be configured separately', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     const base = await composition.gateBase()
@@ -2614,6 +2658,54 @@ describe('tunnel lifecycle', () => {
     expect(elapsed).toBeLessThan(4000)
     expect(await liveFixturePids()).toEqual([])
     await expect(fetch(`${base}/dsh-auth-tunnel/login`)).rejects.toThrow()
+  })
+
+  it('teardown does not wait for a stalled committed credential write', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const credentials = composition.credentials()
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    let releaseSet = (): void => {}
+    credentials.setBarrier = new Promise<void>((resolve) => { releaseSet = resolve })
+    let markSetStarted = (): void => {}
+    const setStarted = new Promise<void>((resolve) => { markSetStarted = resolve })
+    credentials.setStarted = (ref) => {
+      if (ref !== 'DSH_WEB_PASSWORD') return
+      credentials.setStarted = undefined
+      markSetStarted()
+    }
+    const responseTask = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [],
+        password: 'replacement-password',
+      }),
+    }).catch(() => undefined)
+    await setStarted
+    let disposeTask: Promise<void> | undefined
+    try {
+      await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
+      await sleep(250)
+      disposeTask = context!.fiber.dispose()
+      const disposed = await Promise.race([
+        disposeTask.then(() => true),
+        sleep(2000).then(() => false),
+      ])
+      expect(disposed).toBe(true)
+      context = undefined
+      expect(await liveFixturePids()).toEqual([])
+    } finally {
+      credentials.setBarrier = undefined
+      credentials.setStarted = undefined
+      releaseSet()
+      await responseTask
+      await disposeTask
+    }
   })
 
   it('a live disable cancels a staged startup without waiting for its timeout', { timeout: 60_000 }, async () => {
