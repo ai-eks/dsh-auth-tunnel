@@ -168,23 +168,6 @@ const HOP_BY_HOP_HEADERS = new Set([
   'transfer-encoding',
   'upgrade',
 ])
-const BLOCKED_REMOTE_CONFIGURATION_METHODS = new Set([
-  'settings.openDocument',
-  'settings.update',
-  'settings.replace',
-  'settings.mutate',
-  'credentials.describe',
-  'credentials.set',
-  'credentials.unset',
-  'llm.discoverModels',
-])
-
-/** Configuration-plane method named by one browser API request, when any. */
-function remoteConfigurationMethod(url: URL): string | undefined {
-  if (!url.pathname.startsWith('/api/')) return undefined
-  return url.pathname.slice('/api/'.length)
-}
-
 /** The model-facing prompt section text for one live public URL.
  * @param publicUrl - the discovered quick-tunnel URL or the configured hostname URL.
  * @returns the `app:public-access` section body.
@@ -476,19 +459,6 @@ function remoteSettingsDocument(ctx: Context): Record<string, unknown> {
       writable,
     },
     ...(preference === 'zh' || preference === 'en' ? { locale: preference } : {}),
-  }
-}
-
-function settingsNamespaceView(descriptor: SettingsDescriptor): Record<string, unknown> {
-  return {
-    ns: String(descriptor.ns),
-    schema: descriptor.schema,
-    value: descriptor.value,
-    ...(descriptor.base === undefined ? {} : { base: descriptor.base }),
-    ...(descriptor.user === undefined ? {} : { user: descriptor.user }),
-    applies: descriptor.applies,
-    secrets: (descriptor.secrets ?? []).map(secret => ({ path: [...secret.path], set: secret.set })),
-    revision: descriptor.revision,
   }
 }
 
@@ -787,68 +757,12 @@ class PasswordGate {
       else await this.handleRemoteLocale(req, res)
       return
     }
-    const configurationMethod = remoteConfigurationMethod(url)
-    if (configurationMethod === 'settings.describe' || (configurationMethod !== undefined && BLOCKED_REMOTE_CONFIGURATION_METHODS.has(configurationMethod))) {
-      if (!this.auth.allowRemoteSettings) {
-        writeJson(res, 403, { error: 'remote settings disabled' })
-        return
-      }
-      if (configurationMethod === 'settings.describe') {
-        await this.handleSettingsDescribe(req, res)
-        return
-      }
-      writeJson(res, 403, { error: 'remote configuration method unavailable' })
-      return
-    }
+    // The core configuration plane (settings.*/credentials.*/llm.*) rides the
+    // same proxy as everything else: its responses are redacted or value-free
+    // and a secret crosses the wire only inside a write payload, so a page the
+    // password gate authenticated gets the Host's configuration surface
+    // exactly as a local page does.
     this.proxy(req, res, true)
-  }
-
-  /** Serve the core plugin-directory read with only this plugin's namespace. */
-  private async handleSettingsDescribe(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (req.method !== 'POST') {
-      res.writeHead(405, { allow: 'POST', 'cache-control': 'no-store' })
-      res.end()
-      return
-    }
-    const body = await readJson(req, res)
-    if (body === undefined) return
-    try {
-      const message = objectRecord(body)
-      objectRecord(message.payload)
-      if (message.type !== 'client-request' || message.method !== 'settings.describe' || typeof message.rpcId !== 'string') {
-        throw new TypeError('invalid settings describe envelope')
-      }
-      if (!await this.remoteSettingsAuthorized(req)) {
-        writeJson(res, 403, { error: 'remote settings authorization changed' })
-        return
-      }
-      const settings = this.ctx.get('settings')
-      if (settings === undefined) {
-        writeJson(res, 200, {
-          type: 'server-response',
-          rpcId: message.rpcId,
-          result: { ok: false, error: { code: 'internal', message: 'settings service unavailable', details: {} } },
-        })
-        return
-      }
-      const namespaces = settings.describe({ redactSecrets: true })
-        .filter(entry => entry.ns === AUTH_TUNNEL_SETTINGS_NAMESPACE)
-        .map(settingsNamespaceView)
-      writeJson(res, 200, {
-        type: 'server-response',
-        rpcId: message.rpcId,
-        result: {
-          ok: true,
-          value: {
-            writable: settings.writable,
-            hasDocument: settings.documentPath !== undefined,
-            namespaces,
-          },
-        },
-      })
-    } catch {
-      writeJson(res, 400, { error: 'invalid settings describe request' })
-    }
   }
 
   /** Read or commit the authenticated plugin settings card. */
