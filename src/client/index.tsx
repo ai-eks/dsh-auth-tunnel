@@ -608,7 +608,7 @@ export class RemoteSettingsStore {
   private readonly listeners = new Set<() => void>()
   private task: Promise<RemoteSettingsDocument | undefined> | undefined
   private retryTimer: ReturnType<typeof setTimeout> | undefined
-  private retryUnavailableReads = true
+  private retryFailedReads = false
   private disposed = false
 
   constructor(private readonly transport: RemoteSettingsTransport = {
@@ -641,7 +641,7 @@ export class RemoteSettingsStore {
     }
     this.task = this.transport.read().then((document) => {
       if (!this.disposed) {
-        this.retryUnavailableReads = true
+        this.retryFailedReads = false
         this.document = document
         this.publish(document.snapshot)
       }
@@ -650,7 +650,7 @@ export class RemoteSettingsStore {
       if (!this.disposed) {
         const status = record(error).status
         if (status === 401 || status === 403) {
-          this.retryUnavailableReads = false
+          this.retryFailedReads = this.document !== undefined
           if (this.snapshot.status === 'ready') {
             const snapshot = { ...this.snapshot, writable: false }
             if (this.document !== undefined) this.document = { ...this.document, snapshot }
@@ -659,7 +659,7 @@ export class RemoteSettingsStore {
             this.publish({ ...INITIAL_REMOTE_SETTINGS_SNAPSHOT, status: 'unavailable' })
           }
         } else {
-          this.retryUnavailableReads = true
+          this.retryFailedReads = true
           if (this.snapshot.status !== 'unavailable') {
             const snapshot: SettingsScopeSnapshot<AuthTunnelSettings> = {
               ...this.snapshot,
@@ -704,8 +704,10 @@ export class RemoteSettingsStore {
   }
 
   private scheduleRetry(): void {
-    if (this.disposed || !this.retryUnavailableReads
-      || this.listeners.size === 0 || this.snapshot.status !== 'unavailable') return
+    const retryableSnapshot = this.snapshot.status === 'unavailable'
+      || (this.snapshot.status === 'ready' && !this.snapshot.writable)
+    if (this.disposed || !this.retryFailedReads
+      || this.listeners.size === 0 || !retryableSnapshot) return
     this.retryTimer = setTimeout(() => {
       this.retryTimer = undefined
       void this.refresh()

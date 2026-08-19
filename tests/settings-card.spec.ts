@@ -972,6 +972,40 @@ describe('auth-tunnel settings card contract', () => {
     }
   })
 
+  it('retries a forbidden refresh after a loaded remote scope so a rolled-back handoff can recover', async () => {
+    vi.useFakeTimers()
+    try {
+      const document = parseRemoteSettingsDocument({
+        settings: {
+          value: { ...quick, allowRemoteSettings: true },
+          base: quick,
+          user: { allowRemoteSettings: true },
+          revision: 3,
+          writable: true,
+        },
+      })
+      const forbidden = Object.assign(new Error('forbidden'), { status: 403 })
+      const read = vi.fn()
+        .mockResolvedValueOnce(document)
+        .mockRejectedValueOnce(forbidden)
+        .mockResolvedValue(document)
+      const store = new RemoteSettingsStore({ read, commit: vi.fn() })
+      const unsubscribe = store.subscribe(() => {})
+
+      await store.refresh()
+      await store.refresh()
+      expect(store.getSnapshot()).toMatchObject({ status: 'ready', writable: false })
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(read).toHaveBeenCalledTimes(3)
+      expect(store.getSnapshot()).toMatchObject({ status: 'ready', revision: 3, writable: true })
+
+      unsubscribe()
+      store.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('does not retry an initial forbidden remote settings read', async () => {
     vi.useFakeTimers()
     try {
