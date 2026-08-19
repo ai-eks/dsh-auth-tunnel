@@ -64,6 +64,8 @@ Open that URL and enter `DSH_WEB_PASSWORD` on the login page. Share the URL, not
 
 With the Loader `auth-tunnel` row enabled, open **Settings → Plugins → Plugin configuration → Auth Tunnel** to edit every option. Saving the **Enable public tunnel** switch immediately starts or stops the gate and `cloudflared` while keeping this card available. The card also shows applying, running, stopped, or failed state and the current public URL.
 
+![Auth Tunnel plugin configuration](docs/images/auth-tunnel-settings.en.png)
+
 **Allow remote pages to change settings** is disabled by default. Enable it locally and refresh the public page to let pages that passed the access-password login read and save the Auth Tunnel card and Language preference. These writes use authenticated endpoints owned by this plugin, so they work with the unmodified DeepSeek Harness `0.1.0-rc.7`; generic Host settings and credential RPCs remain blocked. Turning the switch off remotely completes that save before access closes, and enabling it again must be done from a local page or the settings document.
 
 The card can write a new access password once to the credential named by `passwordRef`: the input clears after saving, and neither the Host nor the page returns or displays the literal. "Once" describes the write-only input; the password remains reusable until replaced and is not a login-once OTP. Store the Tunnel Token in the credential service first; `tokenRef` names that stored credential.
