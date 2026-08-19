@@ -797,14 +797,18 @@ export async function commitCardChanges(
   if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
     throw new Error('access password credential conflicts with the tunnel token credential')
   }
-  if (target.passwordRef !== current.passwordRef) {
-    if (password !== '') {
-      throw new Error('a new access password credential must be configured separately')
-    }
+  const changesPasswordRef = target.passwordRef !== current.passwordRef
+  const requireTargetCredential = async (): Promise<void> => {
     const response = await api.credentials.describe({ refs: [target.passwordRef] })
     if (!response.result.ok) throw new Error(response.result.error.message)
     const configured = response.result.value.credentials[target.passwordRef]?.configured
     if (configured !== true) throw new Error('access password credential is not configured')
+  }
+  if (changesPasswordRef) {
+    if (password !== '') {
+      throw new Error('a new access password credential must be configured separately')
+    }
+    await requireTargetCredential()
   }
   const deferEnable = password !== '' && !current.enabled && target.enabled
   const deferRemoteSettings = password !== '' && !current.allowRemoteSettings && target.allowRemoteSettings
@@ -875,16 +879,27 @@ export async function commitCardChanges(
     }
     committed = result
   }
+  const rollbackCommittedSettings = async (): Promise<void> => {
+    if (committed === undefined || rollbackWrites === undefined) return
+    const restored = await commitSettingsWrites(api, committed.revision, rollbackWrites)
+    if (rollbackWrites.some(write => !writeSatisfied(restored, write))) {
+      throw new Error('settings rollback was not committed')
+    }
+  }
+  if (password === '' && changesPasswordRef
+    && writes.some(write => write.field === 'passwordRef')) {
+    try {
+      await requireTargetCredential()
+    } catch (error) {
+      await rollbackCommittedSettings()
+      throw error
+    }
+  }
   if (password !== '') {
     try {
       await commitCredentialWrite(api, target.passwordRef, password)
     } catch (error) {
-      if (committed !== undefined && rollbackWrites !== undefined) {
-        const restored = await commitSettingsWrites(api, committed.revision, rollbackWrites)
-        if (rollbackWrites.some(write => !writeSatisfied(restored, write))) {
-          throw new Error('settings rollback was not committed')
-        }
-      }
+      await rollbackCommittedSettings()
       throw error
     }
   }

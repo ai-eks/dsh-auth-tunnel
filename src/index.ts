@@ -524,6 +524,12 @@ function changesTunnelRoute(current: InternalConfig, target: InternalConfig): bo
     || current.publicHostname !== target.publicHostname
 }
 
+/** Settings that change the outcome or lifetime of one in-flight startup. */
+function changesTunnelStartup(current: InternalConfig, target: InternalConfig): boolean {
+  return changesTunnelRoute(current, target)
+    || current.startupTimeoutMs !== target.startupTimeoutMs
+}
+
 function writeJson(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
   res.end(JSON.stringify(value))
@@ -1343,6 +1349,7 @@ async function spawnTunnel(
     return { child, publicUrl }
   } catch (error) {
     await killTree(child)
+    if (cancelled()) throw TUNNEL_STARTUP_CANCELLED
     throw error
   } finally {
     signal?.removeEventListener('abort', cancel)
@@ -1518,7 +1525,7 @@ class AuthTunnelRuntime {
     if (!config.enabled || passwordRefChanged) this.passwordChecks.abort()
     if (config.enabled && this.passwordChecks.signal.aborted) this.passwordChecks = new AbortController()
     const staged = this.stagedStartup
-    if (staged !== undefined && (!config.enabled || changesTunnelRoute(staged.owner, config))) {
+    if (staged !== undefined && (!config.enabled || changesTunnelStartup(staged.owner, config))) {
       staged.controller.abort()
     }
     if (config.enabled && this.configured?.enabled === false) {
@@ -2010,7 +2017,7 @@ class AuthTunnelRuntime {
   private startupCancelled(owner: InternalConfig): boolean {
     const latest = this.configured
     return this.disposed || this.shutdown.signal.aborted
-      || (latest !== undefined && (!latest.enabled || changesTunnelRoute(owner, latest)))
+      || (latest !== undefined && (!latest.enabled || changesTunnelStartup(owner, latest)))
   }
 
   private waitForHandoff(): Promise<void> {

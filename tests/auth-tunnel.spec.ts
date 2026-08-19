@@ -3458,6 +3458,28 @@ describe('rc7 plugin settings', () => {
     }
   })
 
+  it('restarts a staged startup when its timeout changes', { timeout: 60_000 }, async () => {
+    const silentExecutable = await fixtureExecutable('fake-cloudflared-silent.sh')
+    const composition = await bootQuick({ startupTimeoutMs: 10_000 })
+    const before = await composition.runtimeStatus()
+
+    await composition.settings().update(namespace, { executable: silentExecutable })
+    const childDeadline = Date.now() + 5000
+    while ((await liveFixturePids()).length < 2) {
+      if (Date.now() >= childDeadline) throw new Error('staged cloudflared did not start')
+      await sleep(25)
+    }
+
+    await composition.settings().update(namespace, { startupTimeoutMs: 50 })
+    const failed = await waitForStatus(
+      composition,
+      status => status.revision > before.revision && status.phase === 'error' && status.running,
+      3000,
+    )
+    expect(failed.message).toContain('produced no public URL')
+    expect(await liveFixturePids()).toHaveLength(1)
+  })
+
   it('keeps the previous public path alive for the runtime-status handoff', { timeout: 60_000 }, async () => {
     const composition = await bootQuick()
     const previousGate = await composition.gateBase()

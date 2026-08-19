@@ -407,6 +407,62 @@ describe('auth-tunnel settings card contract', () => {
     expect(mutate).not.toHaveBeenCalled()
   })
 
+  it('rolls back a passwordless reference change when the selected credential disappears', async () => {
+    const describe = vi.fn()
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: {
+          ok: true as const,
+          value: { credentials: { NEXT_WEB_PASSWORD: { configured: true, writable: true } } },
+        },
+      })
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: {
+          ok: true as const,
+          value: { credentials: { NEXT_WEB_PASSWORD: { configured: false, writable: true } } },
+        },
+      })
+    const mutate = vi.fn()
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: {
+          ok: true as const,
+          value: {
+            ns: 'auth-tunnel', schema: {}, value: { ...quick, passwordRef: 'NEXT_WEB_PASSWORD' },
+            user: { passwordRef: 'NEXT_WEB_PASSWORD' }, applies: 'live' as const, secrets: [], revision: 8,
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        rpcId: 'test',
+        result: {
+          ok: true as const,
+          value: {
+            ns: 'auth-tunnel', schema: {}, value: quick,
+            user: {}, applies: 'live' as const, secrets: [], revision: 9,
+          },
+        },
+      })
+
+    await expect(commitCardChanges(
+      { settings: { mutate }, credentials: { describe, set: vi.fn() } } as never,
+      7,
+      [{ field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' }],
+      quick,
+      { ...quick, passwordRef: 'NEXT_WEB_PASSWORD' },
+      '',
+      {},
+    )).rejects.toThrow('not configured')
+
+    expect(describe).toHaveBeenCalledTimes(2)
+    expect(mutate).toHaveBeenNthCalledWith(2, {
+      ns: 'auth-tunnel',
+      expectedRevision: 8,
+      ops: [{ op: 'unset', path: ['passwordRef'] }],
+    })
+  })
+
   it('rejects replacing another configured credential while switching references', async () => {
     const order: string[] = []
     const { api, mutate, set } = successfulCardApi({}, order, ['OTHER_HOST_SECRET'])
