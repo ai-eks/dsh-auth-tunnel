@@ -518,12 +518,13 @@ function changesTunnelRoute(current: InternalConfig, target: InternalConfig): bo
 }
 
 /** A public client cannot discover a newly allocated Quick URL after its current route closes. */
-function replacesRemoteQuickUrl(current: InternalConfig, target: InternalConfig): boolean {
+function replacesRemoteQuickUrl(active: InternalConfig | undefined, target: InternalConfig): boolean {
   return target.enabled
     && target.mode === 'quick'
-    && (current.mode !== 'quick'
-      || current.gatePort !== target.gatePort
-      || current.executable !== target.executable)
+    && (active === undefined
+      || active.mode !== 'quick'
+      || active.gatePort !== target.gatePort
+      || active.executable !== target.executable)
 }
 
 /** Settings that change the outcome or lifetime of one in-flight startup. */
@@ -605,6 +606,7 @@ class PasswordGate {
     config: { passwordRef: string; sessionTtlHours: number; allowRemoteSettings: boolean },
     private readonly upstreamPort: number,
     private readonly remoteMutations: RemoteMutationLock,
+    private readonly activeConfig: () => InternalConfig | undefined,
   ) {
     this.auth = {
       passwordRef: config.passwordRef,
@@ -892,7 +894,7 @@ class PasswordGate {
       }
       if (!current.allowRemoteSettings) throw new Error('remote settings disabled')
       await this.requireRemoteMutationAuthorization(req)
-      if (replacesRemoteQuickUrl(current, target)) {
+      if (replacesRemoteQuickUrl(this.activeConfig(), target)) {
         throw new Error('Quick tunnel route changes must be saved from a local page')
       }
       if (target.passwordRef !== current.passwordRef) {
@@ -900,6 +902,9 @@ class PasswordGate {
         if (targetCredential === undefined || targetCredential.value === '') {
           throw new Error('access password credential is not configured')
         }
+      }
+      if (!this.remoteSettingsPolicyCurrent(current.passwordRef, true)) {
+        throw new Error('remote settings authorization changed')
       }
       if (request.writes.length !== 0) {
         const settings = this.ctx.get('settings')
@@ -1686,7 +1691,13 @@ class AuthTunnelRuntime {
       }
       gateConfig = latest
     }
-    const gate = new PasswordGate(this.ctx, gateConfig, this.ctx.webServer.port, this.remoteMutations)
+    const gate = new PasswordGate(
+      this.ctx,
+      gateConfig,
+      this.ctx.webServer.port,
+      this.remoteMutations,
+      () => this.active?.config,
+    )
     this.liveGates.add(gate)
     let server: Server | undefined
     try {

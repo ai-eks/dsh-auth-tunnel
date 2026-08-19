@@ -656,6 +656,88 @@ describe('password gate over the loopback webserver', () => {
     expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(200)
   })
 
+  it('fences remote Quick saves against the active route after a failed local replacement', { timeout: 60_000 }, async () => {
+    const activeExecutable = await fixtureExecutable('fake-cloudflared-quick.sh')
+    const replacementExecutable = await fixtureExecutable('fake-cloudflared-silent.sh')
+    const composition = await bootQuick({
+      allowRemoteSettings: true,
+      executable: activeExecutable,
+      startupTimeoutMs: 1_000,
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const before = await composition.runtimeStatus()
+
+    await composition.settings().update(settingsNamespace('auth-tunnel'), {
+      executable: replacementExecutable,
+    })
+    await waitForStatus(composition, status => status.phase === 'error' && status.running)
+    await writeFile(replacementExecutable, await readFile(join(FIXTURES, 'fake-cloudflared-quick.sh')))
+
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+        password: '',
+      }),
+    })
+
+    expect(response.status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel'))).toMatchObject({
+      executable: replacementExecutable,
+      sessionTtlHours: 720,
+    })
+    expect(await composition.runtimeStatus()).toMatchObject({
+      running: true,
+      publicUrl: before.publicUrl,
+    })
+  })
+
+  it('rejects an in-flight remote save after a local disable', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true }, {
+      seeds: { NEXT_WEB_PASSWORD: 'next-password' },
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+    let releaseResolve = (): void => {}
+    const resolveBarrier = new Promise<void>((resolve) => { releaseResolve = resolve })
+    let markResolveStarted = (): void => {}
+    const resolveStarted = new Promise<void>((resolve) => { markResolveStarted = resolve })
+    composition.credentials().resolveBarrierRef = 'NEXT_WEB_PASSWORD'
+    composition.credentials().resolveBarrier = resolveBarrier
+    composition.credentials().resolveStarted = (ref) => {
+      if (ref === 'NEXT_WEB_PASSWORD') markResolveStarted()
+    }
+
+    const pendingSave = fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'passwordRef', op: 'set', value: 'NEXT_WEB_PASSWORD' }],
+        password: '',
+      }),
+    })
+    await resolveStarted
+    await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
+    releaseResolve()
+
+    expect((await pendingSave).status).toBe(409)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel'))).toMatchObject({
+      enabled: false,
+      passwordRef: 'DSH_WEB_PASSWORD',
+    })
+    await waitForStatus(composition, status => status.phase === 'stopped')
+  })
+
   it('rejects a remote save that rotates the active password and tunnel route together', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     const base = await composition.gateBase()

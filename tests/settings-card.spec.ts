@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   apply, commitCardChanges, commitCredentialWrite, commitSettingsWrites,
-  installRemoteLocalePersistence, parseRemoteSettingsDocument, RemoteSettingsStore,
+  installRemoteLocalePersistence, parseDraft, parseRemoteSettingsDocument, RemoteSettingsStore,
   RuntimeStatusStore, runtimeStatusLocaleKey, validateSettingsValues,
   type AuthTunnelSettings, type RuntimeStatusSnapshot, type SettingsWrite,
 } from '../src/client/index.tsx'
@@ -86,6 +86,31 @@ describe('auth-tunnel settings card contract', () => {
     })).toEqual({})
     expect(validateSettingsValues({ ...quick, sessionTtlHours: 3_000_000_000 })).toEqual({
       sessionTtlHours: 'invalidNumber',
+    })
+  })
+
+  it('preserves nonempty Token fields when an edited draft switches to Quick', () => {
+    const target = parseDraft({
+      values: {
+        enabled: 'true',
+        allowRemoteSettings: 'false',
+        passwordRef: 'DSH_WEB_PASSWORD',
+        sessionTtlHours: '720',
+        mode: 'quick',
+        tokenRef: 'NEXT_TUNNEL_TOKEN',
+        publicHostname: 'next.example.com',
+        gatePort: '0',
+        executable: 'cloudflared',
+        startupTimeoutMs: '15000',
+      },
+      edits: { mode: 'set', tokenRef: 'set', publicHostname: 'set' },
+      password: '',
+    })
+
+    expect(target).toMatchObject({
+      mode: 'quick',
+      tokenRef: 'NEXT_TUNNEL_TOKEN',
+      publicHostname: 'next.example.com',
     })
   })
 

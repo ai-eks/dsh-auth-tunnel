@@ -434,7 +434,7 @@ function numberDraft(text: string): number {
   return text.trim() === '' ? Number.NaN : Number(text)
 }
 
-function parseDraft(draft: Draft): AuthTunnelSettings {
+export function parseDraft(draft: Draft): AuthTunnelSettings {
   const mode = draft.values.mode as TunnelMode
   const tokenRef = draft.values.tokenRef.trim()
   const publicHostname = draft.values.publicHostname.trim()
@@ -444,10 +444,8 @@ function parseDraft(draft: Draft): AuthTunnelSettings {
     passwordRef: draft.values.passwordRef.trim(),
     sessionTtlHours: numberDraft(draft.values.sessionTtlHours),
     mode,
-    ...(tokenRef === '' || (mode === 'quick' && draft.edits.tokenRef !== undefined) ? {} : { tokenRef }),
-    ...(publicHostname === '' || (mode === 'quick' && draft.edits.publicHostname !== undefined)
-      ? {}
-      : { publicHostname }),
+    ...(tokenRef === '' ? {} : { tokenRef }),
+    ...(publicHostname === '' ? {} : { publicHostname }),
     gatePort: numberDraft(draft.values.gatePort),
     executable: draft.values.executable.trim(),
     startupTimeoutMs: numberDraft(draft.values.startupTimeoutMs),
