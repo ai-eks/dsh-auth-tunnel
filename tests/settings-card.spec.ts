@@ -367,17 +367,29 @@ describe('auth-tunnel settings card contract', () => {
     })
   })
 
-  it('rejects a passwordless local passwordRef change targeting the tunnel token', async () => {
+  it('rejects a passwordless local passwordRef change targeting the token-mode tunnel credential', async () => {
     const order: string[] = []
     const { api, describe, mutate, set } = successfulCardApi({}, order)
     const current = { ...quick, tokenRef: 'DSH_TUNNEL_TOKEN' }
+    const target = {
+      ...current,
+      mode: 'token' as const,
+      passwordRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
+      gatePort: 32_309,
+    }
 
     await expect(commitCardChanges(
       api,
       7,
-      [{ field: 'passwordRef', op: 'set', value: 'DSH_TUNNEL_TOKEN' }],
+      [
+        { field: 'mode', op: 'set', value: 'token' },
+        { field: 'passwordRef', op: 'set', value: 'DSH_TUNNEL_TOKEN' },
+        { field: 'publicHostname', op: 'set', value: 'gui.example.com' },
+        { field: 'gatePort', op: 'set', value: 32_309 },
+      ],
       current,
-      { ...current, passwordRef: 'DSH_TUNNEL_TOKEN' },
+      target,
       '',
       {},
     )).rejects.toThrow('conflicts')
@@ -385,6 +397,25 @@ describe('auth-tunnel settings card contract', () => {
     expect(describe).not.toHaveBeenCalled()
     expect(set).not.toHaveBeenCalled()
     expect(mutate).not.toHaveBeenCalled()
+  })
+
+  it('ignores an inactive quick-mode tokenRef collision', async () => {
+    const order: string[] = []
+    const { api, mutate } = successfulCardApi({ sessionTtlHours: 24 }, order)
+    const current = { ...quick, tokenRef: 'DSH_WEB_PASSWORD' }
+
+    await commitCardChanges(
+      api,
+      7,
+      [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+      current,
+      { ...current, sessionTtlHours: 24 },
+      '',
+      {},
+    )
+
+    expect(order).toEqual(['settings'])
+    expect(mutate).toHaveBeenCalledOnce()
   })
 
   it('rejects a passwordless local passwordRef change targeting an unconfigured credential', async () => {

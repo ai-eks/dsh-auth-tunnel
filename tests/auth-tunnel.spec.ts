@@ -715,6 +715,31 @@ describe('password gate over the loopback webserver', () => {
     expect(await composition.credentials().resolve('NEW_REMOTE_PASSWORD')).toBeUndefined()
   })
 
+  it('ignores an inactive quick-mode tokenRef collision in remote saves', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({
+      allowRemoteSettings: true,
+      tokenRef: 'DSH_WEB_PASSWORD',
+    })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
+        password: '',
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(composition.settings().get(settingsNamespace('auth-tunnel')).sessionTtlHours).toBe(24)
+  })
+
   it('rolls back remote settings when the credential write fails', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: true })
     const base = await composition.gateBase()
@@ -905,7 +930,7 @@ describe('password gate over the loopback webserver', () => {
       .toMatchObject({ value: 's3kret-passw0rd' })
   })
 
-  it('rejects a passwordless remote passwordRef collision with the tunnel token', { timeout: 60_000 }, async () => {
+  it('rejects a passwordless remote passwordRef collision in token mode', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({
       allowRemoteSettings: true,
       tokenRef: 'DSH_TUNNEL_TOKEN',
@@ -921,7 +946,12 @@ describe('password gate over the loopback webserver', () => {
       headers: { cookie, 'content-type': 'application/json' },
       body: JSON.stringify({
         expectedRevision: opened.settings.revision,
-        writes: [{ field: 'passwordRef', op: 'set', value: 'DSH_TUNNEL_TOKEN' }],
+        writes: [
+          { field: 'mode', op: 'set', value: 'token' },
+          { field: 'passwordRef', op: 'set', value: 'DSH_TUNNEL_TOKEN' },
+          { field: 'publicHostname', op: 'set', value: 'gui.example.com' },
+          { field: 'gatePort', op: 'set', value: 32_309 },
+        ],
         password: '',
       }),
     })
@@ -1322,7 +1352,7 @@ describe('password gate over the loopback webserver', () => {
     releaseResponse()
     const response = await responseTask
 
-    expect(beforeRelease).toMatchObject({ phase: 'applying', running: true })
+    expect(beforeRelease).toMatchObject({ phase: 'applying', running: false })
     expect(response?.status).toBe(200)
     await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
     expect(composition.settings().get(settingsNamespace('locale'))).toEqual({ preference: 'en' })
@@ -1595,7 +1625,9 @@ describe('password gate over the loopback webserver', () => {
 
       const denied = await fetch(`${base}/api/disable-probe`, { headers: { cookie } })
       expect(denied.status).toBe(503)
-      expect(await composition.runtimeStatus()).toMatchObject({ phase: 'applying', running: true })
+      expect(await composition.runtimeStatus()).toMatchObject({ phase: 'applying', running: false })
+      expect(composition.shellEnv().contributors).toEqual([])
+      expect(composition.systemPrompt().sections).toEqual([])
       expect(await liveFixturePids()).toHaveLength(1)
 
       releaseSet()
@@ -3283,6 +3315,9 @@ describe('rc7 plugin settings', () => {
     const before = await composition.runtimeStatus()
 
     await composition.settings().update(namespace, { enabled: false })
+    expect(await composition.runtimeStatus()).toMatchObject({ phase: 'applying', running: false })
+    expect(composition.shellEnv().contributors).toEqual([])
+    expect(composition.systemPrompt().sections).toEqual([])
     await composition.settings().update(namespace, { enabled: true })
     await waitForStatus(
       composition,
@@ -3291,6 +3326,8 @@ describe('rc7 plugin settings', () => {
 
     expect((await fetch(`${base}/api/re-enabled`, { headers: { cookie } })).status).toBe(200)
     expect(await liveFixturePids()).toEqual(originalPids)
+    expect(composition.shellEnv().contributors).toHaveLength(1)
+    expect(composition.systemPrompt().sections).toHaveLength(1)
   })
 
   it('disables the active tunnel while password validation is stalled', { timeout: 60_000 }, async () => {

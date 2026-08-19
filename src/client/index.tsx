@@ -794,7 +794,8 @@ export async function commitCardChanges(
   if (password !== '' && current.enabled && tunnelRouteChanged(current, target)) {
     throw new Error('rotate the access password separately from tunnel route changes')
   }
-  if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
+  if ((current.mode === 'token' && target.passwordRef === current.tokenRef)
+    || (target.mode === 'token' && target.passwordRef === target.tokenRef)) {
     throw new Error('access password credential conflicts with the tunnel token credential')
   }
   const changesPasswordRef = target.passwordRef !== current.passwordRef

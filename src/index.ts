@@ -906,7 +906,8 @@ class PasswordGate {
           if (password !== '' && current.enabled && changesTunnelRoute(current, target)) {
             throw new Error('rotate the access password separately from tunnel route changes')
           }
-          if (target.passwordRef === current.tokenRef || target.passwordRef === target.tokenRef) {
+          if ((current.mode === 'token' && target.passwordRef === current.tokenRef)
+            || (target.mode === 'token' && target.passwordRef === target.tokenRef)) {
             throw new Error('access password credential conflicts with the tunnel token credential')
           }
           const authorizationCredentialGeneration = this.credentialGeneration(current.passwordRef)
@@ -1530,6 +1531,7 @@ class AuthTunnelRuntime {
     }
     if (config.enabled && this.configured?.enabled === false) {
       for (const gate of this.liveGates) gate.restorePublicAccess(config)
+      if (this.active?.alive === true) this.publish(this.active.publicUrl)
     }
     if (!config.enabled || !config.allowRemoteSettings || passwordRefChanged) {
       this.detachPreCommitRemoteMutations(true)
@@ -1549,6 +1551,7 @@ class AuthTunnelRuntime {
     }
     if (!config.enabled) {
       for (const gate of this.liveGates) gate.revokePublicAccess()
+      this.publish(undefined)
       const handoff = this.finishHandoff
       if (handoff !== undefined) {
         const finish = (): void => {
@@ -1566,7 +1569,8 @@ class AuthTunnelRuntime {
     this.configured = config
     this.desired = config
     const running = this.active?.alive === true
-    this.setStatus('applying', running, running ? this.active?.publicUrl : undefined)
+    if (!config.enabled) this.setStatus('applying', false)
+    else this.setStatus('applying', running, running ? this.active?.publicUrl : undefined)
     if (this.debounce !== undefined) clearTimeout(this.debounce)
     this.debounce = setTimeout(() => { this.beginDrain() }, 120)
   }
