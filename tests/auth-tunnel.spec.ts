@@ -445,16 +445,18 @@ async function waitForStatus(
 }
 
 describe('password gate over the loopback webserver', () => {
-  it('exposes only plugin-owned remote settings after the live switch is enabled', { timeout: 60_000 }, async () => {
+  it('proxies core configuration RPCs to the Host and gates only plugin-owned endpoints', { timeout: 60_000 }, async () => {
     const composition = await bootQuick()
-    let settingsRequests = 0
-    composition.loaded.webServer.register({
-      kind: 'exact', path: '/api/settings.describe', handler: (_req, res) => {
-        settingsRequests += 1
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end('{"ok":true}')
-      },
-    })
+    const apiHits: string[] = []
+    for (const path of ['/api/settings.describe', '/api/settings.mutate', '/api/credentials.describe']) {
+      composition.loaded.webServer.register({
+        kind: 'exact', path, handler: (_req, res) => {
+          apiHits.push(path)
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end('{"ok":true}')
+        },
+      })
+    }
     composition.settings().register(settingsNamespace('locale'), z.object({
       preference: z.union(['zh', 'en']).required(false),
     }))
@@ -466,27 +468,22 @@ describe('password gate over the loopback webserver', () => {
       body: JSON.stringify({ type: 'client-request', rpcId: `rpc-${method}`, method, payload }),
     })
 
-    const denied = await fetch(`${base}/api/settings.describe`, rpc('settings.describe'))
-    expect(denied.status).toBe(403)
-    expect(await denied.json()).toEqual({ error: 'remote settings disabled' })
-    expect(settingsRequests).toBe(0)
+    // The switch does not fence the core configuration plane: an authenticated
+    // public page reaches the Host settings and credentials RPCs directly,
+    // exactly like a local page.
+    for (const method of ['settings.describe', 'settings.mutate', 'credentials.describe']) {
+      const proxied = await fetch(`${base}/api/${method}`, rpc(method))
+      expect(proxied.status).toBe(200)
+      expect(await proxied.text()).toBe('{"ok":true}')
+    }
+    expect(apiHits).toEqual([
+      '/api/settings.describe', '/api/settings.mutate', '/api/credentials.describe',
+    ])
     expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
 
     const beforeEnable = await composition.runtimeStatus()
     await composition.settings().update(settingsNamespace('auth-tunnel'), { allowRemoteSettings: true })
     await waitForStatus(composition, status => status.revision > beforeEnable.revision && status.phase === 'running')
-
-    const allowed = await fetch(`${base}/api/settings.describe`, rpc('settings.describe'))
-    expect(allowed.status).toBe(200)
-    expect(settingsRequests).toBe(0)
-    expect(await allowed.json()).toMatchObject({
-      type: 'server-response',
-      rpcId: 'rpc-settings.describe',
-      result: { ok: true, value: { namespaces: [{ ns: 'auth-tunnel' }] } },
-    })
-    expect((await fetch(`${base}/api/settings.mutate`, rpc('settings.mutate', {
-      ns: 'auth-tunnel', ops: [],
-    }))).status).toBe(403)
 
     const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
       settings: { revision: number; value: { allowRemoteSettings: boolean; sessionTtlHours: number } }
@@ -531,8 +528,11 @@ describe('password gate over the loopback webserver', () => {
     expect(disabled.status).toBe(200)
     expect(await disabled.json()).toMatchObject({ settings: { value: { allowRemoteSettings: false } } })
     await waitForStatus(composition, status => status.revision > beforeDisable.revision && status.phase === 'running')
-    expect((await fetch(`${base}/api/settings.describe`, rpc('settings.describe'))).status).toBe(403)
     expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
+    // Closing the plugin endpoints does not close the proxied core plane.
+    const stillProxied = await fetch(`${base}/api/settings.describe`, rpc('settings.describe'))
+    expect(stillProxied.status).toBe(200)
+    expect(apiHits.at(-1)).toBe('/api/settings.describe')
   })
 
   it('rotates the long-lived access password verbatim through the plugin endpoint without echoing it', { timeout: 60_000 }, async () => {
