@@ -14,7 +14,13 @@ Expose the DeepSeek Harness Web GUI through a password-protected Cloudflare Tunn
 
 ### Install
 
-Install the bundle from Git:
+Install the prebuilt rc.8 bundle from npm:
+
+```sh
+dsh plugin --profile web add dsh-auth-tunnel@next
+```
+
+Or install the current sources from Git:
 
 ```sh
 dsh plugin --profile web add github:ai-eks/dsh-auth-tunnel

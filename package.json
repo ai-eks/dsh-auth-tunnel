@@ -1,8 +1,12 @@
 {
   "name": "dsh-auth-tunnel",
-  "private": true,
   "description": "Password-gated public access for the Web GUI via Cloudflare Tunnel: a loopback password gate (login page + HMAC cookie) in front of the webserver, published by spawning cloudflared in quick or named-tunnel mode - tells the shell and the model the public URL",
   "version": "0.1.0-rc.8",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "tag": "next"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ai-eks/dsh-auth-tunnel.git"
@@ -50,6 +54,7 @@
     "build": "tsc -p tsconfig.json && tsdown",
     "bundle": "tsdown",
     "prepare": "pnpm run build",
+    "release:npm": "npm publish --tag next --access public",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
@@ -59,21 +64,19 @@
     "@deepseek-ai/dsh-client-connection": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-client-locale": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-client-runtime": "^0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-ui-directory-picker-browse": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-client-ui-settings": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-client-ui-settings-plugins": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-client-ui-slots": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-credentials": "^0.1.0-rc.8",
+    "@deepseek-ai/dsh-host-directory-picker-browse": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-host-webserver": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-invariants": "^0.1.0-rc.8",
+    "@deepseek-ai/dsh-settings": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-shell-env": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.8",
+    "@deepseek-ai/schemastery": "^3.18.1",
     "react": "^18.2.0"
-  },
-  "dependencies": {
-    "@deepseek-ai/dsh-client-ui-directory-picker-browse": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-host-directory-picker-browse": "^0.1.0-rc.8",
-    "@deepseek-ai/dsh-settings": "^0.1.0-rc.8",
-    "@deepseek-ai/schemastery": "^3.18.1"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
@@ -84,14 +87,17 @@
     "@deepseek-ai/dsh-client-connection": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-client-locale": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-client-runtime": "^0.1.0-rc.8",
+    "@deepseek-ai/dsh-client-ui-directory-picker-browse": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-client-ui-settings": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-client-ui-settings-plugins": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-client-ui-slots": "^0.1.0-rc.8",
+    "@deepseek-ai/dsh-host-directory-picker-browse": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-host-webserver": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-invariants": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-shell-env": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-settings": "^0.1.0-rc.8",
+    "@deepseek-ai/schemastery": "^3.18.1",
     "@types/node": "^24",
     "@types/react": "~18.3.1",
     "react": "^18.2.0",

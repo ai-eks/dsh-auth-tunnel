@@ -14,7 +14,13 @@
 
 ### 安装
 
-从 Git 安装 bundle:
+从 npm 安装预构建的 rc.8 bundle:
+
+```sh
+dsh plugin --profile web add dsh-auth-tunnel@next
+```
+
+也可以从 Git 安装当前源码:
 
 ```sh
 dsh plugin --profile web add github:ai-eks/dsh-auth-tunnel
