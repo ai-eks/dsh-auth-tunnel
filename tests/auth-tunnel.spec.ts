@@ -449,7 +449,10 @@ describe('password gate over the loopback webserver', () => {
   it('proxies core configuration RPCs to the Host and gates only plugin-owned endpoints', { timeout: 60_000 }, async () => {
     const composition = await bootQuick()
     const apiHits: string[] = []
-    for (const path of ['/api/settings.describe', '/api/settings.mutate', '/api/credentials.describe']) {
+    for (const path of [
+      '/api/settings.describe', '/api/settings.update', '/api/settings.replace',
+      '/api/settings.mutate', '/api/credentials.describe',
+    ]) {
       composition.loaded.webServer.register({
         kind: 'exact', path, handler: (_req, res) => {
           apiHits.push(path)
@@ -472,14 +475,34 @@ describe('password gate over the loopback webserver', () => {
     // The switch does not fence the core configuration plane: an authenticated
     // public page reaches the Host settings and credentials RPCs directly,
     // exactly like a local page.
-    for (const method of ['settings.describe', 'settings.mutate', 'credentials.describe']) {
-      const proxied = await fetch(`${base}/api/${method}`, rpc(method))
+    const proxiedMethods: Array<[string, object]> = [
+      ['settings.describe', {}],
+      ['settings.update', { ns: 'locale', patch: {} }],
+      ['settings.replace', { ns: 'locale', section: {} }],
+      ['settings.mutate', { ns: 'locale', ops: [] }],
+      ['credentials.describe', {}],
+    ]
+    for (const [method, payload] of proxiedMethods) {
+      const proxied = await fetch(`${base}/api/${method}`, rpc(method, payload))
       expect(proxied.status).toBe(200)
       expect(await proxied.text()).toBe('{"ok":true}')
     }
     expect(apiHits).toEqual([
-      '/api/settings.describe', '/api/settings.mutate', '/api/credentials.describe',
+      '/api/settings.describe', '/api/settings.update', '/api/settings.replace',
+      '/api/settings.mutate', '/api/credentials.describe',
     ])
+
+    const hitsBeforeDeniedWrites = [...apiHits]
+    for (const [method, payload] of [
+      ['settings.update', { ns: 'auth-tunnel', patch: { enabled: false } }],
+      ['settings.replace', { ns: 'auth-tunnel', section: { enabled: false } }],
+      ['settings.mutate', { ns: 'auth-tunnel', ops: [{ op: 'set', path: ['enabled'], value: false }] }],
+    ] as const) {
+      const denied = await fetch(`${base}/api/${method}`, rpc(method, payload))
+      expect(denied.status).toBe(403)
+      expect(await denied.json()).toEqual({ error: 'auth-tunnel settings require the plugin endpoint' })
+    }
+    expect(apiHits).toEqual(hitsBeforeDeniedWrites)
     expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
 
     const beforeEnable = await composition.runtimeStatus()

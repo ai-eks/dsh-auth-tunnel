@@ -154,6 +154,7 @@ const AUTH_COOKIE = 'dsh_auth_tunnel'
 const SURFACE_COOKIE = 'dsh_auth_tunnel_surface'
 const MAX_LOGIN_BODY_BYTES = 16 * 1024
 const MAX_REMOTE_SETTINGS_BODY_BYTES = 64 * 1024
+const MAX_CORE_SETTINGS_WRITE_BODY_BYTES = 1024 * 1024
 const OUTPUT_TAIL_CHARS = 8192
 const KILL_GRACE_MS = 2000
 const TUNNEL_ADOPTION_CHECK_MS = 25
@@ -168,6 +169,11 @@ const HOP_BY_HOP_HEADERS = new Set([
   'trailer',
   'transfer-encoding',
   'upgrade',
+])
+const CORE_SETTINGS_WRITE_PATHS = new Set([
+  '/api/settings.update',
+  '/api/settings.replace',
+  '/api/settings.mutate',
 ])
 /** The model-facing prompt section text for one live public URL.
  * @param publicUrl - the discovered quick-tunnel URL or the configured hostname URL.
@@ -230,6 +236,19 @@ function isNavigation(req: IncomingMessage): boolean {
 /** Whether this read is browser metadata whose fetch mode omits credentials. */
 function isPublicManifestRequest(url: URL, req: IncomingMessage): boolean {
   return url.pathname === PUBLIC_MANIFEST_PATH && (req.method === 'GET' || req.method === 'HEAD')
+}
+
+/** Whether a core settings write is trying to bypass the plugin-owned fence. */
+function targetsAuthTunnelSettings(body: Buffer): boolean {
+  try {
+    const envelope = JSON.parse(body.toString('utf8')) as unknown
+    if (typeof envelope !== 'object' || envelope === null || Array.isArray(envelope)) return false
+    const payload = (envelope as { payload?: unknown }).payload
+    return typeof payload === 'object' && payload !== null && !Array.isArray(payload)
+      && (payload as { ns?: unknown }).ns === AUTH_TUNNEL_SETTINGS_NAMESPACE
+  } catch {
+    return false
+  }
 }
 
 /** Whether an HTTP(S) Origin names the incoming request authority. */
@@ -769,11 +788,23 @@ class PasswordGate {
       else await this.handleRemoteLocale(req, res)
       return
     }
-    // The core configuration plane (settings.*/credentials.*/llm.*) rides the
-    // same proxy as everything else: its responses are redacted or value-free
-    // and a secret crosses the wire only inside a write payload, so a page the
-    // password gate authenticated gets the Host's configuration surface
-    // exactly as a local page does.
+    if (req.method === 'POST' && CORE_SETTINGS_WRITE_PATHS.has(url.pathname)) {
+      const body = await readBody(req, res, 'application/json', MAX_CORE_SETTINGS_WRITE_BODY_BYTES)
+      if (body === undefined) return
+      if (authGeneration !== this.authGeneration) {
+        await this.challenge(req, res)
+        return
+      }
+      if (targetsAuthTunnelSettings(body)) {
+        writeJson(res, 403, { error: 'auth-tunnel settings require the plugin endpoint' })
+        return
+      }
+      this.proxy(req, res, true, body)
+      return
+    }
+    // The core configuration plane rides the same proxy as everything else,
+    // except auth-tunnel writes: only the plugin endpoint may apply those so
+    // its authorization, serialization, and Quick URL checks cannot be bypassed.
     this.proxy(req, res, true)
   }
 
@@ -943,7 +974,7 @@ class PasswordGate {
   }
 
   /** Forward one accepted HTTP request to the loopback webserver with the Host rewritten. */
-  private proxy(req: IncomingMessage, res: ServerResponse, authenticated: boolean): void {
+  private proxy(req: IncomingMessage, res: ServerResponse, authenticated: boolean, body?: Buffer): void {
     const headers = withoutHopByHopHeaders(upstreamHeaders(req, this.upstreamPort))
     /* v8 ignore next -- node:http always sets url on server requests */
     const outgoing = httpRequest({
@@ -996,7 +1027,8 @@ class PasswordGate {
       res.writeHead(502, { 'content-type': 'application/json' })
       res.end('{"error":"upstream unreachable"}')
     })
-    req.pipe(outgoing)
+    if (body === undefined) req.pipe(outgoing)
+    else outgoing.end(body)
   }
 
   /** Forward one accepted upgrade handshake by piping the raw connection to the upstream. */
