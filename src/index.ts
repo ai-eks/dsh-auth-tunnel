@@ -151,6 +151,7 @@ export const AUTH_TUNNEL_REMOTE_SETTINGS_PATH = `${AUTH_PREFIX}/settings`
 export const AUTH_TUNNEL_REMOTE_LOCALE_PATH = `${AUTH_PREFIX}/locale`
 const PUBLIC_MANIFEST_PATH = '/manifest.webmanifest'
 const AUTH_COOKIE = 'dsh_auth_tunnel'
+const SURFACE_COOKIE = 'dsh_auth_tunnel_surface'
 const MAX_LOGIN_BODY_BYTES = 16 * 1024
 const MAX_REMOTE_SETTINGS_BODY_BYTES = 64 * 1024
 const OUTPUT_TAIL_CHARS = 8192
@@ -278,6 +279,17 @@ function setSessionCookie(secure: boolean, value: string, ttlMs: number): string
   const base = `${AUTH_COOKIE}=${encodeURIComponent(value)}; HttpOnly; Path=/; SameSite=Strict; Max-Age=${String(Math.floor(ttlMs / 1000))}`
   // A Cloudflare edge always terminates TLS, so requests arriving through the
   // tunnel mark themselves; loopback never takes the public path.
+  return secure ? `${base}; Secure` : base
+}
+
+/**
+ * Mark pages that actually traversed the authenticated Gate. This readable
+ * marker makes no authorization decision — the HttpOnly session and Host
+ * fences still do that — and only lets the early client plugin distinguish a
+ * tunnel page from some unrelated non-loopback deployment of the same bundle.
+ */
+function setSurfaceCookie(secure: boolean, value: boolean, ttlMs: number): string {
+  const base = `${SURFACE_COOKIE}=${value ? '1' : ''}; Path=/; SameSite=Strict; Max-Age=${String(value ? Math.floor(ttlMs / 1000) : 0)}`
   return secure ? `${base}; Secure` : base
 }
 
@@ -908,7 +920,10 @@ class PasswordGate {
       res.writeHead(303, {
         location: '/',
         'cache-control': 'no-store',
-        'set-cookie': setSessionCookie(secure, mintCookie(key, auth.ttlMs), auth.ttlMs),
+        'set-cookie': [
+          setSessionCookie(secure, mintCookie(key, auth.ttlMs), auth.ttlMs),
+          setSurfaceCookie(secure, true, auth.ttlMs),
+        ],
       })
       res.end()
       return
@@ -918,7 +933,7 @@ class PasswordGate {
       res.writeHead(303, {
         location: LOGIN_PATH,
         'cache-control': 'no-store',
-        'set-cookie': setSessionCookie(secure, '', 0),
+        'set-cookie': [setSessionCookie(secure, '', 0), setSurfaceCookie(secure, false, 0)],
       })
       res.end()
       return
@@ -939,7 +954,19 @@ class PasswordGate {
       headers,
     }, (upstream) => {
       /* v8 ignore next -- node:http client always sets a status line */
-      res.writeHead(upstream.statusCode ?? 502, withoutHopByHopHeaders(upstream.headers))
+      const responseHeaders = withoutHopByHopHeaders(upstream.headers)
+      if (authenticated && isNavigation(req)) {
+        const marker = setSurfaceCookie(
+          req.headers['x-forwarded-proto'] === 'https',
+          true,
+          this.auth.ttlMs,
+        )
+        const existing = responseHeaders['set-cookie']
+        responseHeaders['set-cookie'] = existing === undefined
+          ? [marker]
+          : [...(Array.isArray(existing) ? existing : [existing]), marker]
+      }
+      res.writeHead(upstream.statusCode ?? 502, responseHeaders)
       upstream.pipe(res)
     })
     const cancelUpstream = (): void => {

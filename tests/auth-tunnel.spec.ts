@@ -379,6 +379,7 @@ async function login(base: string, extraHeaders?: Record<string, string>, passwo
   })
   expect(response.status).toBe(303)
   expect(response.headers.get('set-cookie')).toContain('dsh_auth_tunnel=v1.')
+  expect(response.headers.get('set-cookie')).toContain('dsh_auth_tunnel_surface=1')
   return response.headers
 }
 
@@ -1037,6 +1038,15 @@ describe('password gate over the loopback webserver', () => {
     expect(await proxied.text()).toBe('{"ok":true}')
     expect(observedHost).toMatch(/^127\.0\.0\.1:\d+$/)
 
+    // Every authenticated navigation refreshes the readable, non-authoritative
+    // surface marker so sessions minted by an older plugin build adopt the new
+    // rc.8 client classification after one page reload.
+    const markedNavigation = await fetch(`${base}/`, {
+      headers: { cookie, accept: 'text/html', 'x-forwarded-proto': 'https' },
+    })
+    expect(markedNavigation.headers.get('set-cookie')).toContain('dsh_auth_tunnel_surface=1')
+    expect(markedNavigation.headers.get('set-cookie')).toContain('Secure')
+
     const port = Number(new URL(base).port)
     const browserApi = await rawRequest(port, [
       'GET /api/probe HTTP/1.1',
@@ -1105,6 +1115,7 @@ describe('password gate over the loopback webserver', () => {
     expect(loggedOut.status).toBe(303)
     expect(loggedOut.headers.get('location')).toBe('/dsh-auth-tunnel/login')
     expect(loggedOut.headers.get('set-cookie')).toContain('Max-Age=0')
+    expect(loggedOut.headers.get('set-cookie')).toContain('dsh_auth_tunnel_surface=')
     expect(loggedOut.headers.get('set-cookie')).toContain('Secure')
     const loggedOutPost = await fetch(`${base}/dsh-auth-tunnel/logout`, { method: 'POST', redirect: 'manual' })
     expect(loggedOutPost.status).toBe(303)
