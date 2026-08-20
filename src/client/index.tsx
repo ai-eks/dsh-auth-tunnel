@@ -56,7 +56,7 @@ const zh: Record<LocaleKey, string> = {
   enabledOn: '开启',
   enabledOff: '关闭',
   allowRemoteSettings: '允许远程页面修改设置',
-  allowRemoteSettingsHint: '仅对通过访问密码登录的公网页面生效。开启后刷新公网页面，即可读取并保存 Auth Tunnel 配置和语言；其他 Host 配置仍保持关闭。默认关闭。',
+  allowRemoteSettingsHint: '仅控制已登录公网页面的 Auth Tunnel 配置和语言。模型、凭据等核心 Host 配置由登录 Gate 单独授权，不受此开关控制。默认关闭。',
   status: '运行状态',
   statusRunning: '运行中',
   statusStopped: '已停止',
@@ -125,7 +125,7 @@ const en: Record<LocaleKey, string> = {
   enabledOn: 'On',
   enabledOff: 'Off',
   allowRemoteSettings: 'Allow remote pages to change settings',
-  allowRemoteSettingsHint: 'Applies only to public pages signed in with the access password. After enabling it, refresh the public page to read and save Auth Tunnel configuration and language; other Host configuration remains blocked. Disabled by default.',
+  allowRemoteSettingsHint: 'Controls Auth Tunnel configuration and language only for signed-in public pages. Core Host models, credentials, and settings are authorized separately by the login Gate and do not depend on this switch. Disabled by default.',
   status: 'Runtime status',
   statusRunning: 'Running',
   statusStopped: 'Stopped',
@@ -268,6 +268,7 @@ function record(value: unknown): Record<string, unknown> {
 const RUNTIME_STATUS_PATH = '/dsh-auth-tunnel/status'
 const REMOTE_SETTINGS_PATH = '/dsh-auth-tunnel/settings'
 const REMOTE_LOCALE_PATH = '/dsh-auth-tunnel/locale'
+const TUNNEL_SURFACE_COOKIE = 'dsh_auth_tunnel_surface'
 const RUNTIME_STATUS_FAILURE_TOLERANCE = 1
 const MAX_LOGIN_BODY_BYTES = 16 * 1024
 const INITIAL_RUNTIME_STATUS: RuntimeStatusSnapshot = {
@@ -1239,8 +1240,33 @@ function AuthTunnelCard(props: CardProps & {
   )
 }
 
-/** Required browser services for the keyed settings-card contribution. */
-export const inject = ['slots', 'locale', 'connection', 'remote', 'settingsScope']
+/**
+ * Promote the password-gated public surface before rc.8 settings consumers
+ * classify the connection. The Gate already authenticates every page request
+ * and rewrites the proxied Host/Origin onto the loopback trust boundary; this
+ * client-side flag only lets the stock UI use that authenticated route.
+ * @param connection - the shared browser connection handle.
+ * @param cookie - the current document cookie string (overridable by tests).
+ * @returns whether this page arrived through the non-loopback tunnel surface.
+ */
+export function promoteTunnelConnection(
+  connection: ConnectionHandle,
+  cookie = typeof document === 'undefined' ? '' : document.cookie,
+): boolean {
+  const tunneled = cookie.split(';').some((segment) => {
+    const [name, value] = segment.trim().split('=', 2)
+    return name === TUNNEL_SURFACE_COOKIE && value === '1'
+  })
+  if (connection.isLoopback || !tunneled) return false
+  // rc.8 stores the classification on the stable shared handle. The tunnel
+  // owns the stronger transport boundary and must publish that fact
+  // before settings scopes snapshot it during their own plugin activation.
+  ;(connection as { isLoopback: boolean }).isLoopback = true
+  return true
+}
+
+/** Start as soon as the connection exists; the settings UI mounts in a child fiber later. */
+export const inject = ['connection']
 
 /** Adopt the persisted language and attempt each later change once. */
 export function installRemoteLocalePersistence(ctx: ClientContext, store: RemoteSettingsStore): () => void {
@@ -1293,9 +1319,17 @@ export function installRemoteLocalePersistence(ctx: ClientContext, store: Remote
 /** Register the browser half under the Host namespace's key. */
 export function apply(ctx: ClientContext): void {
   const connection = ctx.get('connection') as ConnectionHandle
+  const remoteTunnel = promoteTunnelConnection(connection)
+  ctx.inject(['slots', 'locale', 'remote', 'settingsScope'], (uiCtx: ClientContext) => {
+    mountSettingsCard(uiCtx, connection, remoteTunnel)
+  })
+}
+
+/** Mount the keyed card after its presentation and settings services activate. */
+function mountSettingsCard(ctx: ClientContext, connection: ConnectionHandle, remoteTunnel: boolean): void {
   let scope: Pick<SettingsScope<AuthTunnelSettings>, 'getSnapshot' | 'subscribe'>
   let commit: CardCommit
-  if (connection.isLoopback) {
+  if (!remoteTunnel) {
     const source = ctx.settingsScope.bind<AuthTunnelSettings>({ namespace: SETTINGS_NAMESPACE })
     // Methods on the scope controller use `this`; stable wrappers are also the
     // stable subscribe/getSnapshot pair required by useSyncExternalStore.

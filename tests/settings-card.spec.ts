@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   apply, commitCardChanges, commitCredentialWrite, commitSettingsWrites,
   installRemoteLocalePersistence, parseDraft, parseRemoteSettingsDocument, RemoteSettingsStore,
-  RuntimeStatusStore, runtimeStatusLocaleKey, validateSettingsValues,
+  promoteTunnelConnection, RuntimeStatusStore, runtimeStatusLocaleKey, validateSettingsValues,
   type AuthTunnelSettings, type RuntimeStatusSnapshot, type SettingsWrite,
 } from '../src/client/index.tsx'
 
@@ -397,6 +397,7 @@ describe('auth-tunnel settings card contract', () => {
         ? { api: { settings: {}, credentials: {} }, isLoopback: true }
         : undefined,
       settingsScope: { bind: () => scope },
+      inject: (_services: string[], install: (child: unknown) => unknown) => install(ctx),
       effect: (install: () => unknown) => install(),
       locale: {
         register: (namespace: string) => {
@@ -418,5 +419,52 @@ describe('auth-tunnel settings card contract', () => {
     expect(registeredNamespace).toBe('auth-tunnel')
     expect(registeredLocale).toBe('settings.auth-tunnel')
     expect(dictionaryNamespace).toBe('settings.auth-tunnel')
+  })
+
+  it('promotes only a non-loopback tunnel connection before rc.8 settings scopes bind', () => {
+    const remote = { isLoopback: false } as never
+    const unrelatedRemote = { isLoopback: false } as never
+    const local = { isLoopback: true } as never
+
+    expect(promoteTunnelConnection(remote, 'other=1; dsh_auth_tunnel_surface=1')).toBe(true)
+    expect(remote).toMatchObject({ isLoopback: true })
+    expect(promoteTunnelConnection(unrelatedRemote, 'other=1')).toBe(false)
+    expect(unrelatedRemote).toMatchObject({ isLoopback: false })
+    expect(promoteTunnelConnection(local, 'dsh_auth_tunnel_surface=1')).toBe(false)
+    expect(local).toMatchObject({ isLoopback: true })
+  })
+
+  it('keeps the Auth Tunnel card on its fenced remote store after promoting the shared connection', () => {
+    const bind = vi.fn()
+    const connection = { api: { settings: {}, credentials: {} }, isLoopback: false }
+    const child = {
+      settingsScope: { bind },
+      effect: vi.fn(),
+      locale: { register: vi.fn() },
+      slots: {
+        inject: (_name: string, install: () => unknown) => install(),
+        register: vi.fn(() => () => {}),
+      },
+    }
+    const ctx = {
+      get: () => connection,
+      inject: (_services: string[], install: (scope: unknown) => unknown) => {
+        expect(connection.isLoopback).toBe(true)
+        return install(child)
+      },
+    }
+
+    vi.stubGlobal('document', { cookie: 'dsh_auth_tunnel_surface=1' })
+    try {
+      apply(ctx as never)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+
+    expect(bind).not.toHaveBeenCalled()
+    expect(child.slots.register).toHaveBeenCalledWith(
+      expect.objectContaining({ key: 'auth-tunnel' }),
+      expect.any(Function),
+    )
   })
 })

@@ -379,6 +379,7 @@ async function login(base: string, extraHeaders?: Record<string, string>, passwo
   })
   expect(response.status).toBe(303)
   expect(response.headers.get('set-cookie')).toContain('dsh_auth_tunnel=v1.')
+  expect(response.headers.get('set-cookie')).toContain('dsh_auth_tunnel_surface=1')
   return response.headers
 }
 
@@ -445,16 +446,21 @@ async function waitForStatus(
 }
 
 describe('password gate over the loopback webserver', () => {
-  it('exposes only plugin-owned remote settings after the live switch is enabled', { timeout: 60_000 }, async () => {
+  it('proxies core configuration RPCs to the Host and gates only plugin-owned endpoints', { timeout: 60_000 }, async () => {
     const composition = await bootQuick()
-    let settingsRequests = 0
-    composition.loaded.webServer.register({
-      kind: 'exact', path: '/api/settings.describe', handler: (_req, res) => {
-        settingsRequests += 1
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end('{"ok":true}')
-      },
-    })
+    const apiHits: string[] = []
+    for (const path of [
+      '/api/settings.describe', '/api/settings.update', '/api/settings.replace',
+      '/api/settings.mutate', '/api/credentials.describe',
+    ]) {
+      composition.loaded.webServer.register({
+        kind: 'exact', path, handler: (_req, res) => {
+          apiHits.push(path)
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end('{"ok":true}')
+        },
+      })
+    }
     composition.settings().register(settingsNamespace('locale'), z.object({
       preference: z.union(['zh', 'en']).required(false),
     }))
@@ -466,27 +472,42 @@ describe('password gate over the loopback webserver', () => {
       body: JSON.stringify({ type: 'client-request', rpcId: `rpc-${method}`, method, payload }),
     })
 
-    const denied = await fetch(`${base}/api/settings.describe`, rpc('settings.describe'))
-    expect(denied.status).toBe(403)
-    expect(await denied.json()).toEqual({ error: 'remote settings disabled' })
-    expect(settingsRequests).toBe(0)
+    // The switch does not fence the core configuration plane: an authenticated
+    // public page reaches the Host settings and credentials RPCs directly,
+    // exactly like a local page.
+    const proxiedMethods: Array<[string, object]> = [
+      ['settings.describe', {}],
+      ['settings.update', { ns: 'locale', patch: {} }],
+      ['settings.replace', { ns: 'locale', section: {} }],
+      ['settings.mutate', { ns: 'locale', ops: [] }],
+      ['credentials.describe', {}],
+    ]
+    for (const [method, payload] of proxiedMethods) {
+      const proxied = await fetch(`${base}/api/${method}`, rpc(method, payload))
+      expect(proxied.status).toBe(200)
+      expect(await proxied.text()).toBe('{"ok":true}')
+    }
+    expect(apiHits).toEqual([
+      '/api/settings.describe', '/api/settings.update', '/api/settings.replace',
+      '/api/settings.mutate', '/api/credentials.describe',
+    ])
+
+    const hitsBeforeDeniedWrites = [...apiHits]
+    for (const [method, payload] of [
+      ['settings.update', { ns: 'auth-tunnel', patch: { enabled: false } }],
+      ['settings.replace', { ns: 'auth-tunnel', section: { enabled: false } }],
+      ['settings.mutate', { ns: 'auth-tunnel', ops: [{ op: 'set', path: ['enabled'], value: false }] }],
+    ] as const) {
+      const denied = await fetch(`${base}/api/${method}`, rpc(method, payload))
+      expect(denied.status).toBe(403)
+      expect(await denied.json()).toEqual({ error: 'auth-tunnel settings require the plugin endpoint' })
+    }
+    expect(apiHits).toEqual(hitsBeforeDeniedWrites)
     expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
 
     const beforeEnable = await composition.runtimeStatus()
     await composition.settings().update(settingsNamespace('auth-tunnel'), { allowRemoteSettings: true })
     await waitForStatus(composition, status => status.revision > beforeEnable.revision && status.phase === 'running')
-
-    const allowed = await fetch(`${base}/api/settings.describe`, rpc('settings.describe'))
-    expect(allowed.status).toBe(200)
-    expect(settingsRequests).toBe(0)
-    expect(await allowed.json()).toMatchObject({
-      type: 'server-response',
-      rpcId: 'rpc-settings.describe',
-      result: { ok: true, value: { namespaces: [{ ns: 'auth-tunnel' }] } },
-    })
-    expect((await fetch(`${base}/api/settings.mutate`, rpc('settings.mutate', {
-      ns: 'auth-tunnel', ops: [],
-    }))).status).toBe(403)
 
     const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
       settings: { revision: number; value: { allowRemoteSettings: boolean; sessionTtlHours: number } }
@@ -531,8 +552,11 @@ describe('password gate over the loopback webserver', () => {
     expect(disabled.status).toBe(200)
     expect(await disabled.json()).toMatchObject({ settings: { value: { allowRemoteSettings: false } } })
     await waitForStatus(composition, status => status.revision > beforeDisable.revision && status.phase === 'running')
-    expect((await fetch(`${base}/api/settings.describe`, rpc('settings.describe'))).status).toBe(403)
     expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
+    // Closing the plugin endpoints does not close the proxied core plane.
+    const stillProxied = await fetch(`${base}/api/settings.describe`, rpc('settings.describe'))
+    expect(stillProxied.status).toBe(200)
+    expect(apiHits.at(-1)).toBe('/api/settings.describe')
   })
 
   it('rotates the long-lived access password verbatim through the plugin endpoint without echoing it', { timeout: 60_000 }, async () => {
@@ -1037,6 +1061,15 @@ describe('password gate over the loopback webserver', () => {
     expect(await proxied.text()).toBe('{"ok":true}')
     expect(observedHost).toMatch(/^127\.0\.0\.1:\d+$/)
 
+    // Every authenticated navigation refreshes the readable, non-authoritative
+    // surface marker so sessions minted by an older plugin build adopt the new
+    // rc.8 client classification after one page reload.
+    const markedNavigation = await fetch(`${base}/`, {
+      headers: { cookie, accept: 'text/html', 'x-forwarded-proto': 'https' },
+    })
+    expect(markedNavigation.headers.get('set-cookie')).toContain('dsh_auth_tunnel_surface=1')
+    expect(markedNavigation.headers.get('set-cookie')).toContain('Secure')
+
     const port = Number(new URL(base).port)
     const browserApi = await rawRequest(port, [
       'GET /api/probe HTTP/1.1',
@@ -1105,6 +1138,7 @@ describe('password gate over the loopback webserver', () => {
     expect(loggedOut.status).toBe(303)
     expect(loggedOut.headers.get('location')).toBe('/dsh-auth-tunnel/login')
     expect(loggedOut.headers.get('set-cookie')).toContain('Max-Age=0')
+    expect(loggedOut.headers.get('set-cookie')).toContain('dsh_auth_tunnel_surface=')
     expect(loggedOut.headers.get('set-cookie')).toContain('Secure')
     const loggedOutPost = await fetch(`${base}/dsh-auth-tunnel/logout`, { method: 'POST', redirect: 'manual' })
     expect(loggedOutPost.status).toBe(303)

@@ -151,8 +151,10 @@ export const AUTH_TUNNEL_REMOTE_SETTINGS_PATH = `${AUTH_PREFIX}/settings`
 export const AUTH_TUNNEL_REMOTE_LOCALE_PATH = `${AUTH_PREFIX}/locale`
 const PUBLIC_MANIFEST_PATH = '/manifest.webmanifest'
 const AUTH_COOKIE = 'dsh_auth_tunnel'
+const SURFACE_COOKIE = 'dsh_auth_tunnel_surface'
 const MAX_LOGIN_BODY_BYTES = 16 * 1024
 const MAX_REMOTE_SETTINGS_BODY_BYTES = 64 * 1024
+const MAX_CORE_SETTINGS_WRITE_BODY_BYTES = 1024 * 1024
 const OUTPUT_TAIL_CHARS = 8192
 const KILL_GRACE_MS = 2000
 const TUNNEL_ADOPTION_CHECK_MS = 25
@@ -168,23 +170,11 @@ const HOP_BY_HOP_HEADERS = new Set([
   'transfer-encoding',
   'upgrade',
 ])
-const BLOCKED_REMOTE_CONFIGURATION_METHODS = new Set([
-  'settings.openDocument',
-  'settings.update',
-  'settings.replace',
-  'settings.mutate',
-  'credentials.describe',
-  'credentials.set',
-  'credentials.unset',
-  'llm.discoverModels',
+const CORE_SETTINGS_WRITE_PATHS = new Set([
+  '/api/settings.update',
+  '/api/settings.replace',
+  '/api/settings.mutate',
 ])
-
-/** Configuration-plane method named by one browser API request, when any. */
-function remoteConfigurationMethod(url: URL): string | undefined {
-  if (!url.pathname.startsWith('/api/')) return undefined
-  return url.pathname.slice('/api/'.length)
-}
-
 /** The model-facing prompt section text for one live public URL.
  * @param publicUrl - the discovered quick-tunnel URL or the configured hostname URL.
  * @returns the `app:public-access` section body.
@@ -248,6 +238,19 @@ function isPublicManifestRequest(url: URL, req: IncomingMessage): boolean {
   return url.pathname === PUBLIC_MANIFEST_PATH && (req.method === 'GET' || req.method === 'HEAD')
 }
 
+/** Whether a core settings write is trying to bypass the plugin-owned fence. */
+function targetsAuthTunnelSettings(body: Buffer): boolean {
+  try {
+    const envelope = JSON.parse(body.toString('utf8')) as unknown
+    if (typeof envelope !== 'object' || envelope === null || Array.isArray(envelope)) return false
+    const payload = (envelope as { payload?: unknown }).payload
+    return typeof payload === 'object' && payload !== null && !Array.isArray(payload)
+      && (payload as { ns?: unknown }).ns === AUTH_TUNNEL_SETTINGS_NAMESPACE
+  } catch {
+    return false
+  }
+}
+
 /** Whether an HTTP(S) Origin names the incoming request authority. */
 function originMatchesHost(origin: string, host: string): boolean {
   try {
@@ -295,6 +298,17 @@ function setSessionCookie(secure: boolean, value: string, ttlMs: number): string
   const base = `${AUTH_COOKIE}=${encodeURIComponent(value)}; HttpOnly; Path=/; SameSite=Strict; Max-Age=${String(Math.floor(ttlMs / 1000))}`
   // A Cloudflare edge always terminates TLS, so requests arriving through the
   // tunnel mark themselves; loopback never takes the public path.
+  return secure ? `${base}; Secure` : base
+}
+
+/**
+ * Mark pages that actually traversed the authenticated Gate. This readable
+ * marker makes no authorization decision — the HttpOnly session and Host
+ * fences still do that — and only lets the early client plugin distinguish a
+ * tunnel page from some unrelated non-loopback deployment of the same bundle.
+ */
+function setSurfaceCookie(secure: boolean, value: boolean, ttlMs: number): string {
+  const base = `${SURFACE_COOKIE}=${value ? '1' : ''}; Path=/; SameSite=Strict; Max-Age=${String(value ? Math.floor(ttlMs / 1000) : 0)}`
   return secure ? `${base}; Secure` : base
 }
 
@@ -476,19 +490,6 @@ function remoteSettingsDocument(ctx: Context): Record<string, unknown> {
       writable,
     },
     ...(preference === 'zh' || preference === 'en' ? { locale: preference } : {}),
-  }
-}
-
-function settingsNamespaceView(descriptor: SettingsDescriptor): Record<string, unknown> {
-  return {
-    ns: String(descriptor.ns),
-    schema: descriptor.schema,
-    value: descriptor.value,
-    ...(descriptor.base === undefined ? {} : { base: descriptor.base }),
-    ...(descriptor.user === undefined ? {} : { user: descriptor.user }),
-    applies: descriptor.applies,
-    secrets: (descriptor.secrets ?? []).map(secret => ({ path: [...secret.path], set: secret.set })),
-    revision: descriptor.revision,
   }
 }
 
@@ -787,68 +788,24 @@ class PasswordGate {
       else await this.handleRemoteLocale(req, res)
       return
     }
-    const configurationMethod = remoteConfigurationMethod(url)
-    if (configurationMethod === 'settings.describe' || (configurationMethod !== undefined && BLOCKED_REMOTE_CONFIGURATION_METHODS.has(configurationMethod))) {
-      if (!this.auth.allowRemoteSettings) {
-        writeJson(res, 403, { error: 'remote settings disabled' })
+    if (req.method === 'POST' && CORE_SETTINGS_WRITE_PATHS.has(url.pathname)) {
+      const body = await readBody(req, res, 'application/json', MAX_CORE_SETTINGS_WRITE_BODY_BYTES)
+      if (body === undefined) return
+      if (authGeneration !== this.authGeneration) {
+        await this.challenge(req, res)
         return
       }
-      if (configurationMethod === 'settings.describe') {
-        await this.handleSettingsDescribe(req, res)
+      if (targetsAuthTunnelSettings(body)) {
+        writeJson(res, 403, { error: 'auth-tunnel settings require the plugin endpoint' })
         return
       }
-      writeJson(res, 403, { error: 'remote configuration method unavailable' })
+      this.proxy(req, res, true, body)
       return
     }
+    // The core configuration plane rides the same proxy as everything else,
+    // except auth-tunnel writes: only the plugin endpoint may apply those so
+    // its authorization, serialization, and Quick URL checks cannot be bypassed.
     this.proxy(req, res, true)
-  }
-
-  /** Serve the core plugin-directory read with only this plugin's namespace. */
-  private async handleSettingsDescribe(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (req.method !== 'POST') {
-      res.writeHead(405, { allow: 'POST', 'cache-control': 'no-store' })
-      res.end()
-      return
-    }
-    const body = await readJson(req, res)
-    if (body === undefined) return
-    try {
-      const message = objectRecord(body)
-      objectRecord(message.payload)
-      if (message.type !== 'client-request' || message.method !== 'settings.describe' || typeof message.rpcId !== 'string') {
-        throw new TypeError('invalid settings describe envelope')
-      }
-      if (!await this.remoteSettingsAuthorized(req)) {
-        writeJson(res, 403, { error: 'remote settings authorization changed' })
-        return
-      }
-      const settings = this.ctx.get('settings')
-      if (settings === undefined) {
-        writeJson(res, 200, {
-          type: 'server-response',
-          rpcId: message.rpcId,
-          result: { ok: false, error: { code: 'internal', message: 'settings service unavailable', details: {} } },
-        })
-        return
-      }
-      const namespaces = settings.describe({ redactSecrets: true })
-        .filter(entry => entry.ns === AUTH_TUNNEL_SETTINGS_NAMESPACE)
-        .map(settingsNamespaceView)
-      writeJson(res, 200, {
-        type: 'server-response',
-        rpcId: message.rpcId,
-        result: {
-          ok: true,
-          value: {
-            writable: settings.writable,
-            hasDocument: settings.documentPath !== undefined,
-            namespaces,
-          },
-        },
-      })
-    } catch {
-      writeJson(res, 400, { error: 'invalid settings describe request' })
-    }
   }
 
   /** Read or commit the authenticated plugin settings card. */
@@ -994,7 +951,10 @@ class PasswordGate {
       res.writeHead(303, {
         location: '/',
         'cache-control': 'no-store',
-        'set-cookie': setSessionCookie(secure, mintCookie(key, auth.ttlMs), auth.ttlMs),
+        'set-cookie': [
+          setSessionCookie(secure, mintCookie(key, auth.ttlMs), auth.ttlMs),
+          setSurfaceCookie(secure, true, auth.ttlMs),
+        ],
       })
       res.end()
       return
@@ -1004,7 +964,7 @@ class PasswordGate {
       res.writeHead(303, {
         location: LOGIN_PATH,
         'cache-control': 'no-store',
-        'set-cookie': setSessionCookie(secure, '', 0),
+        'set-cookie': [setSessionCookie(secure, '', 0), setSurfaceCookie(secure, false, 0)],
       })
       res.end()
       return
@@ -1014,7 +974,7 @@ class PasswordGate {
   }
 
   /** Forward one accepted HTTP request to the loopback webserver with the Host rewritten. */
-  private proxy(req: IncomingMessage, res: ServerResponse, authenticated: boolean): void {
+  private proxy(req: IncomingMessage, res: ServerResponse, authenticated: boolean, body?: Buffer): void {
     const headers = withoutHopByHopHeaders(upstreamHeaders(req, this.upstreamPort))
     /* v8 ignore next -- node:http always sets url on server requests */
     const outgoing = httpRequest({
@@ -1025,7 +985,19 @@ class PasswordGate {
       headers,
     }, (upstream) => {
       /* v8 ignore next -- node:http client always sets a status line */
-      res.writeHead(upstream.statusCode ?? 502, withoutHopByHopHeaders(upstream.headers))
+      const responseHeaders = withoutHopByHopHeaders(upstream.headers)
+      if (authenticated && isNavigation(req)) {
+        const marker = setSurfaceCookie(
+          req.headers['x-forwarded-proto'] === 'https',
+          true,
+          this.auth.ttlMs,
+        )
+        const existing = responseHeaders['set-cookie']
+        responseHeaders['set-cookie'] = existing === undefined
+          ? [marker]
+          : [...(Array.isArray(existing) ? existing : [existing]), marker]
+      }
+      res.writeHead(upstream.statusCode ?? 502, responseHeaders)
       upstream.pipe(res)
     })
     const cancelUpstream = (): void => {
@@ -1055,7 +1027,8 @@ class PasswordGate {
       res.writeHead(502, { 'content-type': 'application/json' })
       res.end('{"error":"upstream unreachable"}')
     })
-    req.pipe(outgoing)
+    if (body === undefined) req.pipe(outgoing)
+    else outgoing.end(body)
   }
 
   /** Forward one accepted upgrade handshake by piping the raw connection to the upstream. */
