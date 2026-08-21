@@ -421,7 +421,7 @@ describe('auth-tunnel settings card contract', () => {
     expect(dictionaryNamespace).toBe('settings.auth-tunnel')
   })
 
-  it('promotes only a non-loopback tunnel connection before rc.8 settings scopes bind', () => {
+  it('promotes only a non-loopback tunnel connection before settings scopes bind', () => {
     const remote = { isLoopback: false } as never
     const unrelatedRemote = { isLoopback: false } as never
     const local = { isLoopback: true } as never

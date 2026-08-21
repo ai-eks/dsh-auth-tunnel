@@ -91,7 +91,7 @@ class StubCredentials extends Service {
     } else {
       this.values.set(ref, value)
     }
-    this.ctx.emit('credentials/updated', credentialRef(ref))
+    this.ctx.emit('credentials/reference-updated', credentialRef(ref))
   }
 
   private readonly values = new Map<string, string>()
@@ -129,7 +129,7 @@ class StubSystemPrompt extends Service {
   }
 }
 
-/** Writable in-memory settings provider exercising the real rc7 service definition. */
+/** Writable in-memory settings provider exercising the real service definition. */
 class StubSettings extends SettingsProvider {
   writable = true
   failNextPersist = false
@@ -1063,7 +1063,7 @@ describe('password gate over the loopback webserver', () => {
 
     // Every authenticated navigation refreshes the readable, non-authoritative
     // surface marker so sessions minted by an older plugin build adopt the new
-    // rc.8 client classification after one page reload.
+    // client classification after one page reload.
     const markedNavigation = await fetch(`${base}/`, {
       headers: { cookie, accept: 'text/html', 'x-forwarded-proto': 'https' },
     })
@@ -1909,7 +1909,7 @@ describe('activation dependencies and boot failures', () => {
   })
 })
 
-describe('rc7 plugin settings', () => {
+describe('plugin settings', () => {
   const namespace = settingsNamespace('auth-tunnel')
 
   it('keeps settings available without starting public access while disabled', { timeout: 60_000 }, async () => {

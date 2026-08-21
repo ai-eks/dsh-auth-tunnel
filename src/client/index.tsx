@@ -1241,7 +1241,7 @@ function AuthTunnelCard(props: CardProps & {
 }
 
 /**
- * Promote the password-gated public surface before rc.8 settings consumers
+ * Promote the password-gated public surface before settings consumers
  * classify the connection. The Gate already authenticates every page request
  * and rewrites the proxied Host/Origin onto the loopback trust boundary; this
  * client-side flag only lets the stock UI use that authenticated route.
@@ -1258,8 +1258,8 @@ export function promoteTunnelConnection(
     return name === TUNNEL_SURFACE_COOKIE && value === '1'
   })
   if (connection.isLoopback || !tunneled) return false
-  // rc.8 stores the classification on the stable shared handle. The tunnel
-  // owns the stronger transport boundary and must publish that fact
+  // The shared handle owns connection classification. The tunnel publishes
+  // its stronger transport boundary there
   // before settings scopes snapshot it during their own plugin activation.
   ;(connection as { isLoopback: boolean }).isLoopback = true
   return true
