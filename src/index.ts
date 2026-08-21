@@ -128,7 +128,7 @@ export function validateConfig(config: Config): void {
   }
 }
 
-/** Register the rc7 settings section and forward every live value. */
+/** Register the settings section and forward every live value. */
 function settingsConfig(
   ctx: Context,
   entry: Config,
@@ -1850,7 +1850,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   ctx.inject(['systemPrompt'], (injected) => {
     injected.effect(() => runtime.attachSystemPrompt(injected.systemPrompt), 'auth-tunnel: prompt publication')
   })
-  ctx.on('credentials/updated', ref => { runtime.credentialUpdated(ref) })
+  ctx.on('credentials/reference-updated', ref => { runtime.credentialUpdated(ref) })
   const active = settingsConfig(ctx, config, next => { runtime.request(next) })
   await runtime.start(active)
 }

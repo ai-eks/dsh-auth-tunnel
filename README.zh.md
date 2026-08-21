@@ -14,7 +14,7 @@
 
 ### 安装
 
-从 npm 安装预构建的 rc.8 bundle:
+从 npm 安装最新发布的预览版 bundle:
 
 ```sh
 dsh plugin --profile web add dsh-auth-tunnel@next
@@ -26,11 +26,12 @@ dsh plugin --profile web add dsh-auth-tunnel@next
 dsh plugin --profile web add github:ai-eks/dsh-auth-tunnel
 ```
 
-当前分支适配 DeepSeek Harness `0.1.0-rc.8` 及以上版本。Harness `0.1.0-rc.7` 必须固定安装兼容的不可变 revision，`0.1.0-rc.6` 则必须固定到对应 tag:
+当前分支适配 DeepSeek Harness `0.1.1-rc.2`。Harness `0.1.0-rc.8` 及更早版本必须固定安装兼容的不可变 tag 或 revision:
 
 ```sh
+dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#v0.1.0-rc.8' # Harness rc.8
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#b4baea7c47f5c245da789d3553d41938df89b311' # Harness rc.7
-dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#v0.1.0-rc.6'
+dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#v0.1.0-rc.6' # Harness rc.6
 ```
 
 Git 安装通过 `prepare` 构建检出的源码。pnpm 10 及以上版本可能先要求允许该构建;按照 `dsh` 打印的 profile `pnpm-workspace.yaml` 路径和准确包名配置后,重新执行命令。
@@ -73,7 +74,7 @@ cloudflare tunnel: https://<random>.trycloudflare.com
 
 ![Auth Tunnel 插件配置](docs/images/auth-tunnel-settings.zh.png)
 
-**允许远程页面修改设置** 默认关闭。先在本机开启并刷新公网页面后,已通过访问密码登录的页面即可读取和保存 Auth Tunnel 卡片及语言偏好。这些写入走插件自有的鉴权接口,因此兼容未修改的 DeepSeek Harness `0.1.0-rc.8`。该开关与核心 Host 配置面是两道独立的围栏:gate 把 `settings.*`、`credentials.*` 与 `llm.*` 对每个已认证公网页面直接代理到 Host,但会拒绝核心 settings API 对 `auth-tunnel` namespace 的写入,这类写入必须经过有围栏的插件接口;bundle 的立即启动客户端会在 rc.8 的设置 scope 判断浏览器类型前发布这条已认证路径。公网 GUI 因此与本机 GUI 保持完整的配置面一致性——响应只返回脱敏值,密钥只随写入载荷单向流出。同一时刻只接受一个远程写入;前一项配置仍在应用时,新的写入会返回冲突,页面重新读取后即可重试。远程页面不能保存会分配全新随机 Quick URL 的变更(切换到 Quick,或修改 Quick 的 Gate 端口或可执行文件);请在本机页面完成这类修改,以便获取新地址。从远程页面关闭该开关时,本次保存会完整返回后再关闭访问;重新开启必须使用本机页面或设置文件。
+**允许远程页面修改设置** 默认关闭。先在本机开启并刷新公网页面后,已通过访问密码登录的页面即可读取和保存 Auth Tunnel 卡片及语言偏好。这些写入走插件自有的鉴权接口,因此兼容未修改的 DeepSeek Harness `0.1.1-rc.2`。该开关与核心 Host 配置面是两道独立的围栏:gate 把 `settings.*`、`credentials.*` 与 `llm.*` 对每个已认证公网页面直接代理到 Host,但会拒绝核心 settings API 对 `auth-tunnel` namespace 的写入,这类写入必须经过有围栏的插件接口;bundle 的立即启动客户端会在设置 scope 判断浏览器类型前发布这条已认证路径。公网 GUI 因此与本机 GUI 保持完整的配置面一致性——响应只返回脱敏值,密钥只随写入载荷单向流出。同一时刻只接受一个远程写入;前一项配置仍在应用时,新的写入会返回冲突,页面重新读取后即可重试。远程页面不能保存会分配全新随机 Quick URL 的变更(切换到 Quick,或修改 Quick 的 Gate 端口或可执行文件);请在本机页面完成这类修改,以便获取新地址。从远程页面关闭该开关时,本次保存会完整返回后再关闭访问;重新开启必须使用本机页面或设置文件。
 
 页面通过独立的 **更新密码** 按钮写入当前已保存的 `passwordRef` 凭据,密码与配置不会放在同一次事务里提交。更新成功后输入框立即清空,Host 和页面都不会回传或展示明文;密码本身仍可重复登录,直到再次替换,不是登录一次即作废的 OTP。若要更换 `passwordRef`,请先创建目标凭据并保存引用,再单独更新密码。Tunnel Token 仍应先写入凭据服务,页面的 `tokenRef` 只填写对应引用名。
 
@@ -151,7 +152,7 @@ public client
 
 插件依赖 `webServer` 和 `credentials` 服务。它启动一个自己的 loopback `node:http` 密码门,解析配置的密码引用,再让 `cloudflared` 指向这道门。原始 WebServer 以及其他插件贡献的所有路由都原样保留在门后。
 
-未认证的浏览器导航会重定向到 `/dsh-auth-tunnel/login`;其他未认证请求返回精简的 401。登录成功后签发 `HttpOnly; SameSite=Strict` 的 `dsh_auth_tunnel` Cookie,使用从密码派生的 HMAC 密钥签名。已认证导航还会刷新可读的 `dsh_auth_tunnel_surface=1` 标记,它只负责让 rc.8 客户端在设置插件启动前识别 tunnel 路径,不授予任何访问权限;Gate 仍会在每个请求上校验 HttpOnly Cookie。每次请求都会重新解析凭据,因此轮换密码会立即使已有会话失效。`GET` 或 `POST /dsh-auth-tunnel/logout` 会清除两个 Cookie。
+未认证的浏览器导航会重定向到 `/dsh-auth-tunnel/login`;其他未认证请求返回精简的 401。登录成功后签发 `HttpOnly; SameSite=Strict` 的 `dsh_auth_tunnel` Cookie,使用从密码派生的 HMAC 密钥签名。已认证导航还会刷新可读的 `dsh_auth_tunnel_surface=1` 标记,它只负责让客户端在设置插件启动前识别 tunnel 路径,不授予任何访问权限;Gate 仍会在每个请求上校验 HttpOnly Cookie。每次请求都会重新解析凭据,因此轮换密码会立即使已有会话失效。`GET` 或 `POST /dsh-auth-tunnel/logout` 会清除两个 Cookie。
 
 密码门把登录请求体限制为 16 KiB,并代理已认证的 HTTP 与 WebSocket 流量。它把 `Host` 和匹配当前主机的浏览器 `Origin` 改写为 loopback 上游地址,让 WebServer 的 DNS-rebinding 与同源检查继续看到可信地址;外来或不透明 Origin 保持不变。HTTP 两段代理都会删除逐跳头并按连接重新生成,升级握手则保留协议需要的字段。客户端断开时,对应的上游请求也会取消。
 
