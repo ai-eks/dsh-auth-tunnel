@@ -447,7 +447,7 @@ async function waitForStatus(
 
 describe('password gate over the loopback webserver', () => {
   it('proxies core configuration RPCs to the Host and gates only plugin-owned endpoints', { timeout: 60_000 }, async () => {
-    const composition = await bootQuick()
+    const composition = await bootQuick({ allowRemoteSettings: false })
     const apiHits: string[] = []
     for (const path of [
       '/api/settings.describe', '/api/settings.update', '/api/settings.replace',
@@ -1695,6 +1695,12 @@ describe('tunnel lifecycle', () => {
   })
 })
 
+describe('configuration defaults', () => {
+  it('allows authenticated public settings management by default', () => {
+    expect(Config({}).allowRemoteSettings).toBe(true)
+  })
+})
+
 describe('activation dependencies and boot failures', () => {
   type BootFailureOptions = { withPassword?: boolean; seeds?: Record<string, string> }
   const expectBootFailure = async (config: Record<string, unknown>, pattern: RegExp, options?: BootFailureOptions): Promise<void> => {
@@ -1936,7 +1942,7 @@ describe('plugin settings', () => {
     expect(descriptor).toMatchObject({
       ns: namespace,
       applies: 'live',
-      value: { enabled: false, allowRemoteSettings: false, mode: 'token' },
+      value: { enabled: false, allowRemoteSettings: true, mode: 'token' },
     })
     expect(await composition.runtimeStatus()).toMatchObject({ phase: 'stopped', running: false })
     expect(consoleSpy).not.toHaveBeenCalled()
@@ -2197,6 +2203,7 @@ describe('bundle patch', () => {
       "      name: 'dsh-auth-tunnel'",
       '      config:',
       '        enabled: true',
+      '        allowRemoteSettings: true',
     ].join('\n'))
     expect(patch).not.toMatch(/^- id: auth-tunnel$/m)
   })

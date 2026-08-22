@@ -56,7 +56,7 @@ const zh: Record<LocaleKey, string> = {
   enabledOn: '开启',
   enabledOff: '关闭',
   allowRemoteSettings: '允许远程页面修改设置',
-  allowRemoteSettingsHint: '仅控制已登录公网页面的 Auth Tunnel 配置和语言。模型、凭据等核心 Host 配置由登录 Gate 单独授权，不受此开关控制。默认关闭。',
+  allowRemoteSettingsHint: '仅控制已登录公网页面的 Auth Tunnel 配置和语言。共享访问密码是管理员凭据，因此默认开启。模型、凭据等核心 Host 配置由登录 Gate 单独授权，不受此开关控制。',
   status: '运行状态',
   statusRunning: '运行中',
   statusStopped: '已停止',
@@ -125,7 +125,7 @@ const en: Record<LocaleKey, string> = {
   enabledOn: 'On',
   enabledOff: 'Off',
   allowRemoteSettings: 'Allow remote pages to change settings',
-  allowRemoteSettingsHint: 'Controls Auth Tunnel configuration and language only for signed-in public pages. Core Host models, credentials, and settings are authorized separately by the login Gate and do not depend on this switch. Disabled by default.',
+  allowRemoteSettingsHint: 'Controls Auth Tunnel configuration and language only for signed-in public pages. The shared access password is an administrator credential, so this is enabled by default. Core Host models, credentials, and settings are authorized separately by the login Gate and do not depend on this switch.',
   status: 'Runtime status',
   statusRunning: 'Running',
   statusStopped: 'Stopped',
@@ -244,7 +244,7 @@ const FIELD_KEYS: readonly FieldKey[] = [
 
 const DEFAULT_VALUES: Record<FieldKey, string | number | boolean | undefined> = {
   enabled: true,
-  allowRemoteSettings: false,
+  allowRemoteSettings: true,
   passwordRef: 'DSH_WEB_PASSWORD',
   sessionTtlHours: 720,
   mode: 'quick',

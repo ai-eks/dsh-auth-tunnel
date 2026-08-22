@@ -16,6 +16,6 @@
       name: 'dsh-auth-tunnel'
       config:
         enabled: true
-        allowRemoteSettings: false
+        allowRemoteSettings: true
         passwordRef: DSH_WEB_PASSWORD
         mode: quick

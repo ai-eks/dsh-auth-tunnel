@@ -8,7 +8,7 @@ import {
 
 const quick: AuthTunnelSettings = {
   enabled: true,
-  allowRemoteSettings: false,
+  allowRemoteSettings: true,
   passwordRef: 'DSH_WEB_PASSWORD',
   sessionTtlHours: 720,
   mode: 'quick',

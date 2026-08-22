@@ -95,7 +95,7 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647
 
 export const Config: z<InternalConfig> = z.object({
   enabled: z.boolean().default(true),
-  allowRemoteSettings: z.boolean().default(false),
+  allowRemoteSettings: z.boolean().default(true),
   passwordRef: z.string().min(1).role('credential-ref').default('DSH_WEB_PASSWORD'),
   sessionTtlHours: z.number().min(0.01).max(MAX_SESSION_TTL_HOURS).default(720),
   mode: z.union(['quick', 'token']).default('quick'),
