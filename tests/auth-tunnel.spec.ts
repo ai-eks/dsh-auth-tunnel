@@ -299,8 +299,8 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
   context.loader.builtins.include = Include
   const shellEnvPlugin = (ctx2: Context): void => { void ctx2.plugin(StubShellEnv) }
   const systemPromptPlugin = (ctx2: Context): void => { void ctx2.plugin(StubSystemPrompt) }
-  // Seeds must land in the service BEFORE the tunnel row evaluates its row:
-  // activation reads the password reference at load, never afterwards.
+  // Seeds normally land before the tunnel row evaluates. A missing initial
+  // password remains recoverable through the reference-updated event.
   const credentialsPlugin = (ctx2: Context, config?: { seeds?: Record<string, string> }): void => {
     const service = new StubCredentials(ctx2)
     service.resolveDelayMs = options?.credentialResolveDelayMs ?? 0
@@ -1722,13 +1722,25 @@ describe('activation dependencies and boot failures', () => {
     expect(await liveFixturePids()).toEqual([])
   })
 
-  it('refuses to gate a public URL when the access password is unconfigured', { timeout: 60_000 }, async () => {
-    await expectBootFailure({
+  it('stays mounted and starts after an initially missing access password is configured', { timeout: 60_000 }, async () => {
+    const composition = await loadComposition({
       mode: 'quick',
       executable: await fixtureExecutable('fake-cloudflared-quick.sh'),
       startupTimeoutMs: 15_000,
-    }, /credential reference "DSH_WEB_PASSWORD" is not configured/, { withPassword: false })
+    }, { withPassword: false })
+
+    expect(await composition.runtimeStatus()).toMatchObject({
+      phase: 'error',
+      running: false,
+      message: 'auth-tunnel: credential reference "DSH_WEB_PASSWORD" is not configured',
+    })
+    expect(composition.settings().describe().map(entry => entry.ns)).toContain('auth-tunnel')
     expect(await liveFixturePids()).toEqual([]) // the child never spawned
+
+    await composition.credentials().set('DSH_WEB_PASSWORD', 's3kret-passw0rd')
+    const recovered = await waitForStatus(composition, status => status.phase === 'running')
+    expect(recovered).toMatchObject({ running: true, publicUrl: QUICK_URL })
+    expect((await fetch(`${await composition.gateBase()}/dsh-auth-tunnel/login`)).status).toBe(200)
   })
 
   it('quick mode ignores preserved token-mode settings so the card can switch modes', { timeout: 60_000 }, async () => {

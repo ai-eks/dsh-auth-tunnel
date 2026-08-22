@@ -60,6 +60,8 @@ Start the Web profile:
 dsh web
 ```
 
+Starting before `DSH_WEB_PASSWORD` is configured no longer fails the Web profile. The plugin stays mounted with an error status and starts the tunnel automatically after that credential is added.
+
 After the tunnel is ready, the terminal prints:
 
 ```text
@@ -119,7 +121,7 @@ Override the bundle row in `$DSH_HOME/profiles/web/cordis.patch.yml`:
 |---|---|---|---|
 | `enabled` | boolean | `true` | Whether the password gate and `cloudflared` run; saving `false` immediately stops public access while keeping settings available. |
 | `allowRemoteSettings` | boolean | `false` | Whether authenticated public pages may update Auth Tunnel settings, its write-only access password, and the Language preference. |
-| `passwordRef` | string (credential-ref) | `DSH_WEB_PASSWORD` | Credential reference resolving to the shared access password; unconfigured fails the boot. |
+| `passwordRef` | string (credential-ref) | `DSH_WEB_PASSWORD` | Credential reference resolving to the shared access password; when unconfigured, the plugin stays mounted and starts automatically after the credential is added. |
 | `sessionTtlHours` | number ≥ 0.01 | `720` | Cookie lifetime in hours (30 days). |
 | `mode` | `quick` \| `token` | `quick` | Ephemeral quick tunnel or named token tunnel. |
 | `tokenRef` | string (credential-ref) | — | Tunnel Token reference; `token` mode only. |

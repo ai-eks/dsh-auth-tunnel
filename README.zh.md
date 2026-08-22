@@ -60,6 +60,8 @@ DSH_WEB_PASSWORD: 'replace-with-a-long-random-password'
 dsh web
 ```
 
+在配置 `DSH_WEB_PASSWORD` 前启动不再导致 Web profile 失败。插件会保持挂载并显示错误状态;添加该凭据后,隧道会自动启动。
+
 隧道就绪后,终端会打印:
 
 ```text
@@ -119,7 +121,7 @@ DSH_TUNNEL_TOKEN: 'eyJhIjo...'
 |---|---|---|---|
 | `enabled` | boolean | `true` | 是否运行密码门和 `cloudflared`;页面保存 `false` 后立即停止公网访问但保留设置页面。 |
 | `allowRemoteSettings` | boolean | `false` | 是否允许已认证公网页面更新 Auth Tunnel 配置、只写访问密码和语言偏好。 |
-| `passwordRef` | string(credential-ref) | `DSH_WEB_PASSWORD` | 解析共享访问密码的凭据引用;未配置会导致启动失败。 |
+| `passwordRef` | string(credential-ref) | `DSH_WEB_PASSWORD` | 解析共享访问密码的凭据引用;未配置时插件保持挂载,添加凭据后自动启动。 |
 | `sessionTtlHours` | number ≥ 0.01 | `720` | Cookie 有效期,单位为小时,默认 30 天。 |
 | `mode` | `quick` \| `token` | `quick` | 临时 quick 隧道或命名 token 隧道。 |
 | `tokenRef` | string(credential-ref) | — | Tunnel Token 凭据引用;仅 token 模式。 |
