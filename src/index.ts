@@ -95,7 +95,7 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647
 
 export const Config: z<InternalConfig> = z.object({
   enabled: z.boolean().default(true),
-  allowRemoteSettings: z.boolean().default(false),
+  allowRemoteSettings: z.boolean().default(true),
   passwordRef: z.string().min(1).role('credential-ref').default('DSH_WEB_PASSWORD'),
   sessionTtlHours: z.number().min(0.01).max(MAX_SESSION_TTL_HOURS).default(720),
   mode: z.union(['quick', 'token']).default('quick'),
@@ -1333,7 +1333,7 @@ class AuthTunnelRuntime {
     }
   }
 
-  /** Apply the boot snapshot synchronously so startup still reports hard failures. */
+  /** Apply the boot snapshot synchronously while keeping a missing access password recoverable. */
   async start(config: InternalConfig): Promise<void> {
     this.configured = config
     this.drainTask = this.startInitial(config).finally(() => { this.finishDrain() })
@@ -1361,6 +1361,7 @@ class AuthTunnelRuntime {
       if (this.disposed) return
       if (this.desired !== undefined) return
       this.setStatus('error', false, undefined, errorMessage(error))
+      if (error instanceof AccessPasswordUnavailableError) return
       throw error
     }
   }
@@ -1823,7 +1824,8 @@ class AuthTunnelRuntime {
 
 /**
  * Install the runtime controller, settings watcher, status route, and optional
- * model-facing publications. Boot still waits for an initially enabled tunnel.
+ * model-facing publications. Boot waits for an initially enabled tunnel unless
+ * its access-password credential has not been configured yet.
  * @param ctx - plugin context.
  * @param config - validated {@link Config}.
  */
