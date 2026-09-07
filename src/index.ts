@@ -6,8 +6,8 @@
  * enforces the shared-access-password handshake, and accepted requests reach
  * the loopback webserver with their Host and matching browser Origin rewritten
  * to the loopback authority (which keeps the upstream trust fence satisfied).
- * Only the public path is password-protected; direct loopback use of the Web
- * GUI stays open.
+ * The gate supplies a private DSH browser session upstream after checking
+ * the password. Direct loopback access retains DSH's own authentication.
  * @module dsh-auth-tunnel
  */
 
@@ -20,9 +20,8 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import {
-  settingsNamespace, type SettingsDescriptor, type SettingsPathOp,
-} from '@deepseek-ai/dsh-settings'
+import type { SettingsDescriptor, SettingsPathOp } from '@deepseek-ai/dsh-settings'
+import type { HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 // Pulls the Context augmentation typing `ctx.webServer`; no runtime import.
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { ShellEnvRegistry } from '@deepseek-ai/dsh-shell-env'
@@ -82,16 +81,16 @@ interface InternalConfig {
 export const name = 'dsh-auth-tunnel'
 
 /** Host/browser pairing key for the plugin settings card. */
-export const AUTH_TUNNEL_SETTINGS_NAMESPACE = settingsNamespace('auth-tunnel')
+export const AUTH_TUNNEL_SETTINGS_NAMESPACE = 'auth-tunnel'
 
-// Public access cannot open until the persisted settings snapshot and both
-// runtime dependencies are available.
-export const inject = ['webServer', 'credentials', 'settings']
+// Public access requires the persisted settings and DSH browser authentication.
+export const inject = ['webServer', 'credentials', 'settings', 'connection']
 
 const PUBLIC_HOSTNAME_PATTERN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i
 const SESSION_TTL_MS_PER_HOUR = 3_600_000
 const MAX_SESSION_TTL_HOURS = Math.floor((Number.MAX_SAFE_INTEGER - Date.now()) / SESSION_TTL_MS_PER_HOUR)
 const MAX_TIMER_DELAY_MS = 2_147_483_647
+const DEFAULT_TOKEN_REF = 'DSH_TUNNEL_TOKEN'
 
 export const Config: z<InternalConfig> = z.object({
   enabled: z.boolean().default(true),
@@ -99,7 +98,7 @@ export const Config: z<InternalConfig> = z.object({
   passwordRef: z.string().min(1).role('credential-ref').default('DSH_WEB_PASSWORD'),
   sessionTtlHours: z.number().min(0.01).max(MAX_SESSION_TTL_HOURS).default(720),
   mode: z.union(['quick', 'token']).default('quick'),
-  tokenRef: z.string().min(1).role('credential-ref'),
+  tokenRef: z.string().min(1).role('credential-ref').default(DEFAULT_TOKEN_REF),
   publicHostname: z.string().min(1).pattern(PUBLIC_HOSTNAME_PATTERN),
   gatePort: z.number().step(1).min(0).max(65535).default(0),
   executable: z.string().min(1).default('cloudflared'),
@@ -171,9 +170,9 @@ const HOP_BY_HOP_HEADERS = new Set([
   'upgrade',
 ])
 const CORE_SETTINGS_WRITE_PATHS = new Set([
-  '/api/settings.update',
-  '/api/settings.replace',
-  '/api/settings.mutate',
+  '/api/settings/update',
+  '/api/settings/replace',
+  '/api/settings/mutate',
 ])
 /** The model-facing prompt section text for one live public URL.
  * @param publicUrl - the discovered quick-tunnel URL or the configured hostname URL.
@@ -241,11 +240,13 @@ function isPublicManifestRequest(url: URL, req: IncomingMessage): boolean {
 /** Whether a core settings write is trying to bypass the plugin-owned fence. */
 function targetsAuthTunnelSettings(body: Buffer): boolean {
   try {
-    const envelope = JSON.parse(body.toString('utf8')) as unknown
+    const envelope = JSON.parse(new TextDecoder().decode(body)) as unknown
     if (typeof envelope !== 'object' || envelope === null || Array.isArray(envelope)) return false
     const payload = (envelope as { payload?: unknown }).payload
-    return typeof payload === 'object' && payload !== null && !Array.isArray(payload)
-      && (payload as { ns?: unknown }).ns === AUTH_TUNNEL_SETTINGS_NAMESPACE
+    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return false
+    const args = (payload as { args?: unknown }).args
+    return typeof args === 'object' && args !== null && !Array.isArray(args)
+      && (args as { ns?: unknown }).ns === AUTH_TUNNEL_SETTINGS_NAMESPACE
   } catch {
     return false
   }
@@ -411,13 +412,14 @@ interface RemoteSettingsWriteRequest {
   expectedRevision: number
   writes: RemoteSettingsWrite[]
   password: string
+  token: string
 }
 
 const REMOTE_SETTINGS_FIELDS = new Set<string>([
   'enabled', 'allowRemoteSettings', 'passwordRef', 'sessionTtlHours', 'mode', 'tokenRef', 'publicHostname',
   'gatePort', 'executable', 'startupTimeoutMs',
 ])
-const LOCALE_SETTINGS_NAMESPACE = settingsNamespace('locale')
+const LOCALE_SETTINGS_NAMESPACE = 'locale'
 
 function objectRecord(value: unknown): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -452,10 +454,14 @@ function parseRemoteSettingsWriteRequest(value: unknown): RemoteSettingsWriteReq
   if (typeof request.password === 'string' && request.password !== '' && !fitsLoginForm(request.password)) {
     throw new RangeError('password exceeds the login form limit')
   }
+  if (request.token !== undefined && typeof request.token !== 'string') {
+    throw new TypeError('token must be a string')
+  }
   return {
     expectedRevision,
     writes,
     password: typeof request.password === 'string' ? request.password : '',
+    token: typeof request.token === 'string' ? request.token : '',
   }
 }
 
@@ -598,6 +604,7 @@ class PasswordGate {
   private auth: { passwordRef: string; ttlMs: number; allowRemoteSettings: boolean }
   private publicAccessEnabled = true
   private authGeneration = 0
+  private upstreamCookie: string | undefined
   private readonly proxyDrops = new Set<() => void>()
   private readonly upgradeDrops = new Set<() => void>()
   private readonly upgradeSockets = new Set<Duplex>()
@@ -836,8 +843,8 @@ class PasswordGate {
     }
     try {
       const request = parseRemoteSettingsWriteRequest(body)
-      if (request.password !== '' && request.writes.length !== 0) {
-        throw new Error('access password and plugin settings must be saved separately')
+      if (request.password !== '' && (request.writes.length !== 0 || request.token !== '')) {
+        throw new Error('access password must be saved separately from plugin settings and the tunnel token')
       }
       const openedSettings = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
       if (!openedSettings.writable) throw new Error('settings provider is read-only')
@@ -848,6 +855,9 @@ class PasswordGate {
       if ((current.mode === 'token' && target.passwordRef === current.tokenRef)
         || (target.mode === 'token' && target.passwordRef === target.tokenRef)) {
         throw new Error('access password credential conflicts with the tunnel token credential')
+      }
+      if (request.token !== '' && (target.mode !== 'token' || target.tokenRef === undefined)) {
+        throw new Error('a tunnel token requires Token mode and a credential reference')
       }
       if (!current.allowRemoteSettings) throw new Error('remote settings disabled')
       await this.requireRemoteMutationAuthorization(req)
@@ -862,6 +872,9 @@ class PasswordGate {
       }
       if (!this.remoteSettingsPolicyCurrent(current.passwordRef, true)) {
         throw new Error('remote settings authorization changed')
+      }
+      if (request.token !== '' && target.tokenRef !== undefined) {
+        await this.ctx.credentials.set(credentialRef(target.tokenRef), request.token)
       }
       if (request.writes.length !== 0) {
         const settings = this.ctx.get('settings')
@@ -973,9 +986,46 @@ class PasswordGate {
     res.end()
   }
 
-  /** Forward one accepted HTTP request to the loopback webserver with the Host rewritten. */
+  /** Obtain a DSH browser cookie without exposing its launch token or cookie to the public client. */
+  private upstreamSessionCookie(): string {
+    const connection = this.ctx.get('connection') as HostConnectionHandle
+    const host = `127.0.0.1:${String(this.upstreamPort)}`
+    if (this.upstreamCookie !== undefined
+      && connection.requestRejection({ headers: { host, cookie: this.upstreamCookie } }) === undefined) {
+      return this.upstreamCookie
+    }
+    const url = new URL(connection.authenticatedUrl(`http://${host}`))
+    let cookie: string | undefined
+    connection.authorizeIndex({
+      method: 'GET', url: `${url.pathname}${url.search}`, headers: { host },
+    }, {
+      writeHead(status, headers) {
+        if (status === 303) cookie = headers?.['set-cookie']?.split(';', 1)[0]
+      },
+      end() {},
+    })
+    if (cookie === undefined
+      || connection.requestRejection({ headers: { host, cookie } }) !== undefined) {
+      throw new Error('auth-tunnel: could not establish the upstream browser session')
+    }
+    this.upstreamCookie = cookie
+    return cookie
+  }
+
+  /** Replace any client-supplied copy of the private upstream authentication cookie. */
+  private authenticatedCookie(req: IncomingMessage, cookie: string): string {
+    const name = cookie.slice(0, cookie.indexOf('='))
+    const forwarded = req.headers.cookie?.split(';')
+      .filter(segment => segment.trim().split('=', 1)[0] !== name) ?? []
+    return [cookie, ...forwarded].join('; ')
+  }
+
+  /** Forward one accepted HTTP request using the private upstream browser session. */
   private proxy(req: IncomingMessage, res: ServerResponse, authenticated: boolean, body?: Buffer): void {
+    const cookie = authenticated ? this.upstreamSessionCookie() : undefined
+    const cookieName = cookie?.slice(0, cookie.indexOf('='))
     const headers = withoutHopByHopHeaders(upstreamHeaders(req, this.upstreamPort))
+    if (cookie !== undefined) headers.cookie = this.authenticatedCookie(req, cookie)
     /* v8 ignore next -- node:http always sets url on server requests */
     const outgoing = httpRequest({
       host: '127.0.0.1',
@@ -986,6 +1036,10 @@ class PasswordGate {
     }, (upstream) => {
       /* v8 ignore next -- node:http client always sets a status line */
       const responseHeaders = withoutHopByHopHeaders(upstream.headers)
+      if (cookieName !== undefined && responseHeaders['set-cookie'] !== undefined) {
+        responseHeaders['set-cookie'] = responseHeaders['set-cookie']
+          .filter(value => value.split('=', 1)[0]?.trim() !== cookieName)
+      }
       if (authenticated && isNavigation(req)) {
         const marker = setSurfaceCookie(
           req.headers['x-forwarded-proto'] === 'https',
@@ -1048,6 +1102,8 @@ class PasswordGate {
       socket.destroy()
       return
     }
+    const headers = upstreamHeaders(req, this.upstreamPort)
+    headers.cookie = this.authenticatedCookie(req, this.upstreamSessionCookie())
     const upstream = netConnect(this.upstreamPort, '127.0.0.1')
     let dropped = false
     const drop = (): void => {
@@ -1065,7 +1121,6 @@ class PasswordGate {
     upstream.once('error', drop)
     socket.once('error', drop)
     await once(upstream, 'connect')
-    const headers = upstreamHeaders(req, this.upstreamPort)
     /* v8 ignore next 2 -- IncomingMessage surface entries carry no undefined values; node joins repeats */
     const lines = Object.entries(headers).flatMap(([entry, value]) =>
       value === undefined ? [] : [`${entry}: ${Array.isArray(value) ? value.join(', ') : value}`])

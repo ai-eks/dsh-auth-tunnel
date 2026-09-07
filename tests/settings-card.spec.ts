@@ -1,6 +1,9 @@
+import { readFileSync } from 'node:fs'
+import * as cordis from '@deepseek-ai/cordis'
+import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
 import { describe, expect, it, vi } from 'vitest'
 import {
-  apply, commitCardChanges, commitCredentialWrite, commitSettingsWrites,
+  apply, changeDraftField, commitCardChanges, commitCredentialWrite, commitSettingsWrites,
   installRemoteLocalePersistence, parseDraft, parseRemoteSettingsDocument, RemoteSettingsStore,
   promoteTunnelConnection, RuntimeStatusStore, runtimeStatusLocaleKey, validateSettingsValues,
   type AuthTunnelSettings, type RuntimeStatusSnapshot, type SettingsWrite,
@@ -33,32 +36,23 @@ function remoteDocument(revision: number, overrides: Partial<AuthTunnelSettings>
 
 function cardApi(options: { configured?: readonly string[]; credentialError?: string } = {}) {
   const mutate = vi.fn(() => Promise.resolve({
-    rpcId: 'test',
-    result: {
-      ok: true as const,
-      value: {
-        ns: 'auth-tunnel', schema: {}, value: quick, user: {}, applies: 'live' as const,
-        secrets: [], revision: 8,
-      },
+    ok: true as const,
+    value: {
+      ns: 'auth-tunnel', schema: {}, value: quick, user: {}, applies: 'live' as const,
+      secrets: [], revision: 8,
     },
   }))
-  const describe = vi.fn(({ refs }: { refs: string[] }) => Promise.resolve({
-    rpcId: 'test',
-    result: {
-      ok: true as const,
-      value: {
-        credentials: Object.fromEntries(refs.map(ref => [ref, {
-          configured: options.configured?.includes(ref) === true,
-          writable: true,
-        }])),
-      },
-    },
+  const describe = vi.fn((refs: string[]) => Promise.resolve({
+    ok: true as const,
+    value: Object.fromEntries(refs.map(ref => [ref, {
+      configured: options.configured?.includes(ref) === true,
+      writable: true,
+    }])),
   }))
   const set = vi.fn(() => Promise.resolve(options.credentialError === undefined
-    ? { rpcId: 'test', result: { ok: true as const, value: {} } }
+    ? { ok: true as const, value: undefined }
     : {
-        rpcId: 'test',
-        result: { ok: false as const, error: { code: 'credential-rejected', message: options.credentialError } },
+        ok: false as const, error: { code: 'credential-rejected', message: options.credentialError },
       }))
   return {
     api: { settings: { mutate }, credentials: { describe, set } } as never,
@@ -90,13 +84,13 @@ describe('auth-tunnel settings card contract', () => {
   })
 
   it('preserves nonempty Token fields when an edited draft switches to Quick', () => {
-    const target = parseDraft({
+    const switched = changeDraftField({
       values: {
         enabled: 'true',
         allowRemoteSettings: 'false',
         passwordRef: 'DSH_WEB_PASSWORD',
         sessionTtlHours: '720',
-        mode: 'quick',
+        mode: 'token',
         tokenRef: 'NEXT_TUNNEL_TOKEN',
         publicHostname: 'next.example.com',
         gatePort: '0',
@@ -105,13 +99,43 @@ describe('auth-tunnel settings card contract', () => {
       },
       edits: { mode: 'set', tokenRef: 'set', publicHostname: 'set' },
       password: '',
-    })
+      token: 'unsaved-token',
+    }, 'mode', 'quick', 'set')
+    const target = parseDraft(switched)
 
     expect(target).toMatchObject({
       mode: 'quick',
       tokenRef: 'NEXT_TUNNEL_TOKEN',
       publicHostname: 'next.example.com',
     })
+    expect(validateSettingsValues(target)).toEqual({})
+    expect(switched.token).toBe('')
+  })
+
+  it.each([
+    { operation: 'selecting Quick', action: 'set' as const },
+    { operation: 'resetting a saved Token override', action: 'unset' as const },
+    { operation: 'resetting an unsaved Token selection', action: undefined },
+  ])('keeps an invalid hostname correctable when $operation', ({ action }) => {
+    const switched = changeDraftField({
+      values: {
+        enabled: 'true', allowRemoteSettings: 'true', passwordRef: 'DSH_WEB_PASSWORD',
+        sessionTtlHours: '720', mode: 'token', tokenRef: 'DSH_TUNNEL_TOKEN',
+        publicHostname: 'not a hostname', gatePort: '0', executable: 'cloudflared',
+        startupTimeoutMs: '15000',
+      },
+      edits: { mode: 'set', publicHostname: 'set' },
+      password: '', token: 'unsaved-token',
+    }, 'mode', 'quick', action)
+
+    expect(switched.values.publicHostname).toBe('not a hostname')
+    expect(switched.edits.publicHostname).toBe('set')
+    expect(switched.edits.mode).toBe(action)
+    expect(switched.token).toBe('')
+    expect(validateSettingsValues(parseDraft(switched))).toEqual({ publicHostname: 'invalidHostname' })
+
+    const corrected = changeDraftField(switched, 'publicHostname', 'next.example.com', 'set')
+    expect(validateSettingsValues(parseDraft(corrected))).toEqual({})
   })
 
   it('commits configuration as one revision-fenced settings mutation', async () => {
@@ -127,15 +151,15 @@ describe('auth-tunnel settings card contract', () => {
     }, '')
 
     expect(mutate).toHaveBeenCalledOnce()
-    expect(mutate).toHaveBeenCalledWith({
-      ns: 'auth-tunnel',
-      expectedRevision: 7,
-      ops: [
+    expect(mutate).toHaveBeenCalledWith(
+      'auth-tunnel',
+      [
         { op: 'set', path: ['enabled'], value: false },
         { op: 'set', path: ['mode'], value: 'token' },
         { op: 'set', path: ['tokenRef'], value: 'DSH_TUNNEL_TOKEN' },
       ],
-    })
+      7,
+    )
   })
 
   it('writes a password only to the current credential', async () => {
@@ -143,12 +167,53 @@ describe('auth-tunnel settings card contract', () => {
 
     await commitCardChanges(api, 7, [], quick, quick, '  replacement password  ')
 
-    expect(set).toHaveBeenCalledWith({
-      ref: 'DSH_WEB_PASSWORD',
-      value: '  replacement password  ',
-    })
+    expect(set).toHaveBeenCalledWith('DSH_WEB_PASSWORD', '  replacement password  ')
     expect(mutate).not.toHaveBeenCalled()
     expect(describe).not.toHaveBeenCalled()
+  })
+
+  it('writes a directly entered Tunnel Token to credentials before saving its settings', async () => {
+    const { api, mutate, set } = cardApi()
+    const target = {
+      ...quick,
+      mode: 'token' as const,
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
+      gatePort: 7677,
+    }
+    const writes: SettingsWrite[] = [
+      { field: 'mode', op: 'set', value: 'token' },
+      { field: 'publicHostname', op: 'set', value: 'gui.example.com' },
+      { field: 'gatePort', op: 'set', value: 7677 },
+    ]
+
+    await commitCardChanges(api, 7, writes, quick, target, '', 'direct-tunnel-token')
+
+    expect(set).toHaveBeenCalledWith('DSH_TUNNEL_TOKEN', 'direct-tunnel-token')
+    expect(set.mock.invocationCallOrder[0]).toBeLessThan(mutate.mock.invocationCallOrder[0]!)
+    expect(mutate).toHaveBeenCalledWith(
+      'auth-tunnel',
+      expect.not.arrayContaining([
+        expect.objectContaining({ value: 'direct-tunnel-token' }),
+      ]),
+      7,
+    )
+  })
+
+  it('allows rotating only the directly entered Tunnel Token', async () => {
+    const { api, mutate, set } = cardApi()
+    const token = {
+      ...quick,
+      mode: 'token' as const,
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
+      gatePort: 7677,
+    }
+
+    await commitCardChanges(api, 7, [], token, token, '', 'replacement-token')
+
+    expect(set).toHaveBeenCalledWith('DSH_TUNNEL_TOKEN', 'replacement-token')
+    expect(mutate).not.toHaveBeenCalled()
   })
 
   it('rejects combined password and configuration changes before either write', async () => {
@@ -179,7 +244,7 @@ describe('auth-tunnel settings card contract', () => {
       '',
     )
 
-    expect(describe).toHaveBeenCalledWith({ refs: ['NEXT_PASSWORD'] })
+    expect(describe).toHaveBeenCalledWith(['NEXT_PASSWORD'])
     expect(mutate).toHaveBeenCalledOnce()
   })
 
@@ -223,8 +288,7 @@ describe('auth-tunnel settings card contract', () => {
     )).rejects.toThrow('read only')
 
     const mutate = vi.fn(() => Promise.resolve({
-      rpcId: 'test',
-      result: { ok: false as const, error: { code: 'revision-conflict', message: 'settings revision changed' } },
+      ok: false as const, error: { code: 'revision-conflict', message: 'settings revision changed' },
     }))
     await expect(commitSettingsWrites(
       { settings: { mutate } } as never,
@@ -255,6 +319,7 @@ describe('auth-tunnel settings card contract', () => {
       expectedRevision: 3,
       writes: [{ field: 'sessionTtlHours', op: 'set', value: 24 }],
       password: '',
+      token: '',
     })
 
     expect(read).toHaveBeenCalledOnce()
@@ -274,7 +339,7 @@ describe('auth-tunnel settings card contract', () => {
     })
 
     const readTask = store.refresh()
-    await store.commit({ expectedRevision: 3, writes: [], password: 'replacement' })
+    await store.commit({ expectedRevision: 3, writes: [], password: 'replacement', token: '' })
     resolveRead(remoteDocument(3))
     await readTask
 
@@ -312,7 +377,7 @@ describe('auth-tunnel settings card contract', () => {
       commit: vi.fn(() => Promise.reject(new Error('settings revision changed'))),
     })
 
-    await expect(store.commit({ expectedRevision: 3, writes: [], password: '' }))
+    await expect(store.commit({ expectedRevision: 3, writes: [], password: '', token: '' }))
       .rejects.toThrow('settings revision changed')
     expect(read).toHaveBeenCalledOnce()
     expect(store.getSnapshot()).toMatchObject({ revision: 4, value: { sessionTtlHours: 24 } })
@@ -320,7 +385,7 @@ describe('auth-tunnel settings card contract', () => {
   })
 
   it('adopts a remote locale and attempts later changes only once', async () => {
-    let localeChanged = (_snapshot: { active: 'zh' | 'en' }): void => {}
+    let localeChanged = (_snapshot: { active: string }): void => {}
     const stopLocale = vi.fn()
     const stopStore = vi.fn()
     const setLocale = vi.fn()
@@ -341,6 +406,8 @@ describe('auth-tunnel settings card contract', () => {
 
     const dispose = installRemoteLocalePersistence(ctx as never, store as never)
     expect(setLocale).toHaveBeenCalledWith('en')
+    localeChanged({ active: 'fr' })
+    expect(fetch).not.toHaveBeenCalled()
     localeChanged({ active: 'zh' })
     await vi.waitFor(() => { expect(fetch).toHaveBeenCalledOnce() })
     expect(fetch).toHaveBeenCalledWith('/dsh-auth-tunnel/locale', expect.objectContaining({
@@ -394,8 +461,9 @@ describe('auth-tunnel settings card contract', () => {
     }
     const ctx = {
       get: (name: string) => name === 'connection'
-        ? { api: { settings: {}, credentials: {} }, isLoopback: true }
+        ? { isLoopback: true }
         : undefined,
+      remote: { settings: {}, credentials: {} },
       settingsScope: { bind: () => scope },
       inject: (_services: string[], install: (child: unknown) => unknown) => install(ctx),
       effect: (install: () => unknown) => install(),
@@ -436,7 +504,7 @@ describe('auth-tunnel settings card contract', () => {
 
   it('keeps the Auth Tunnel card on its fenced remote store after promoting the shared connection', () => {
     const bind = vi.fn()
-    const connection = { api: { settings: {}, credentials: {} }, isLoopback: false }
+    const connection = { isLoopback: false }
     const child = {
       settingsScope: { bind },
       effect: vi.fn(),
@@ -447,7 +515,7 @@ describe('auth-tunnel settings card contract', () => {
       },
     }
     const ctx = {
-      get: () => connection,
+      get: (name: string) => name === 'connection' ? connection : undefined,
       inject: (_services: string[], install: (scope: unknown) => unknown) => {
         expect(connection.isLoopback).toBe(true)
         return install(child)
@@ -466,5 +534,43 @@ describe('auth-tunnel settings card contract', () => {
       expect.objectContaining({ key: 'auth-tunnel' }),
       expect.any(Function),
     )
+  })
+
+  it('updates Host facts already cached by the current Gateway before settings services activate', async () => {
+    let gateway: typeof import('@deepseek-ai/dsh-api-gateway/client') | undefined
+    const load = ({ factory }: { factory: (require: (name: string) => unknown) => typeof gateway }): void => {
+      gateway = factory((name) => {
+        if (name !== '@deepseek-ai/cordis') throw new Error(`unexpected Gateway external: ${name}`)
+        return cordis
+      })
+    }
+    const source = readFileSync(new URL(import.meta.resolve('@deepseek-ai/dsh-api-gateway/client')), 'utf8')
+    new Function('window', source)({ __ModuleLoader__: { load } })
+    if (gateway === undefined) throw new Error('Gateway client bundle was not loaded')
+
+    const ctx = new cordis.Context()
+    const connection = {
+      isLoopback: false,
+      generation: { getSnapshot: () => undefined, subscribe: () => () => {} },
+      rpc: { call: vi.fn(), open: vi.fn() },
+      registerGenerationSource: () => () => {},
+      start: () => ({ stop: () => {} }),
+    } as unknown as ConnectionHandle
+    ctx.provide('connection', connection)
+    vi.stubGlobal('document', { cookie: 'dsh_auth_tunnel_surface=1' })
+    try {
+      await ctx.plugin({ inject: ['connection'], apply: gateway.apply })
+      const host = ctx.remote.$host
+      expect(host.isLoopback).toBe(false)
+
+      await ctx.plugin({ inject: ['connection'], apply })
+
+      expect(connection.isLoopback).toBe(true)
+      expect(ctx.remote.$host).toBe(host)
+      expect(ctx.remote.$host.isLoopback).toBe(true)
+    } finally {
+      await ctx.fiber.dispose()
+      vi.unstubAllGlobals()
+    }
   })
 })
