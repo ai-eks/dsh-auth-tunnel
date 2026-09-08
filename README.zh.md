@@ -26,9 +26,10 @@ dsh plugin --profile web add dsh-auth-tunnel@next
 dsh plugin --profile web add github:ai-eks/dsh-auth-tunnel
 ```
 
-当前分支适配 DeepSeek Harness `0.1.1-rc.2`。Harness `0.1.0-rc.8` 及更早版本必须固定安装兼容的不可变 tag 或 revision:
+当前源码分支适配 DeepSeek Harness `0.1.2-rc.1`,并支持 `0.1.3-alpha.2`。Harness `0.1.1-rc.2` 及更早版本必须固定安装兼容的包版本、不可变 tag 或 revision:
 
 ```sh
+dsh plugin --profile web add dsh-auth-tunnel@0.1.1-rc.2.1 # Harness 0.1.1-rc.2
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#v0.1.0-rc.8' # Harness rc.8
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#b4baea7c47f5c245da789d3553d41938df89b311' # Harness rc.7
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#v0.1.0-rc.6' # Harness rc.6
@@ -74,14 +75,14 @@ cloudflare tunnel: https://<random>.trycloudflare.com
 
 保持 Loader 的 `auth-tunnel` 行启用后,打开 **Settings → Plugins → 插件配置 → Auth Tunnel** 即可编辑全部配置。页面中的 **启用公网隧道** 开关保存后会立即启动或停止密码门和 `cloudflared`,并保留这张设置卡片。页面同时显示应用中、运行中、已停止或失败状态以及当前公网 URL。
 
-**允许远程页面修改设置** 默认开启。共享访问密码是管理员凭据:通过密码登录的公网页面无需本地设置,即可读取和保存 Auth Tunnel 卡片及语言偏好。如果不希望已认证公网页面管理隧道本身,可关闭该开关;之后重新开启必须使用本机页面或设置文件。这些写入走插件自有的鉴权接口,因此兼容未修改的 DeepSeek Harness `0.1.1-rc.2`。该开关与核心 Host 配置面是两道独立的围栏:gate 把 `settings.*`、`credentials.*` 与 `llm.*` 对每个已认证公网页面直接代理到 Host,但会拒绝核心 settings API 对 `auth-tunnel` namespace 的写入,这类写入必须经过有围栏的插件接口;bundle 的立即启动客户端会在设置 scope 判断浏览器类型前发布这条已认证路径。公网 GUI 因此与本机 GUI 保持完整的配置面一致性——响应只返回脱敏值,密钥只随写入载荷单向流出。同一时刻只接受一个远程写入;前一项配置仍在应用时,新的写入会返回冲突,页面重新读取后即可重试。远程页面不能保存会分配全新随机 Quick URL 的变更(切换到 Quick,或修改 Quick 的 Gate 端口或可执行文件);请在本机页面完成这类修改,以便获取新地址。从远程页面关闭该开关时,本次保存会完整返回后再关闭访问。
+**允许远程页面修改设置** 默认开启。共享访问密码是管理员凭据:通过密码登录的公网页面无需本地设置,即可读取和保存 Auth Tunnel 卡片及语言偏好。如果不希望已认证公网页面管理隧道本身,可关闭该开关;之后重新开启必须使用本机页面或设置文件。这些写入走插件自有的鉴权接口,因此兼容未修改的 DeepSeek Harness `0.1.2-rc.1`。该开关与核心 Host 配置面是两道独立的围栏:gate 把 `settings.*`、`credentials.*` 与 `llm.*` 对每个已认证公网页面直接代理到 Host,但会拒绝核心 settings API 对 `auth-tunnel` namespace 的写入,这类写入必须经过有围栏的插件接口;bundle 的立即启动客户端会在设置 scope 判断浏览器类型前发布这条已认证路径。公网 GUI 因此与本机 GUI 保持完整的配置面一致性——响应只返回脱敏值,密钥只随写入载荷单向流出。同一时刻只接受一个远程写入;前一项配置仍在应用时,新的写入会返回冲突,页面重新读取后即可重试。远程页面不能保存会分配全新随机 Quick URL 的变更(切换到 Quick,或修改 Quick 的 Gate 端口或可执行文件);请在本机页面完成这类修改,以便获取新地址。从远程页面关闭该开关时,本次保存会完整返回后再关闭访问。
 
-页面通过独立的 **更新密码** 按钮写入当前已保存的 `passwordRef` 凭据,密码与配置不会放在同一次事务里提交。更新成功后输入框立即清空,Host 和页面都不会回传或展示明文;密码本身仍可重复登录,直到再次替换,不是登录一次即作废的 OTP。若要更换 `passwordRef`,请先创建目标凭据并保存引用,再单独更新密码。Tunnel Token 仍应先写入凭据服务,页面的 `tokenRef` 只填写对应引用名。
+页面通过独立的 **更新密码** 按钮写入当前已保存的 `passwordRef` 凭据,访问密码与配置不会放在同一次提交里。Token 模式可直接粘贴 Tunnel Token,它会随 **保存配置** 单向写入 `tokenRef` 指向的凭据;默认引用为 `DSH_TUNNEL_TOKEN`。两种密钥输入成功后都会立即清空,Host 和页面都不会回传或展示明文。若要更换 `passwordRef`,请先创建目标凭据并保存引用,再单独更新密码。
 
 | 关联配置 | Quick | Token |
 |---|---|---|
 | 访问密码 | 必需;两种模式共用,通过只写按钮单独更新 | 必需;两种模式共用,通过只写按钮单独更新 |
-| Tunnel Token | 不需要 | 必需;`tokenRef` 指向已保存的 Token |
+| Tunnel Token | 不需要 | 必需;可在页面直接粘贴,保存到 `tokenRef` 指向的凭据 |
 | 公网主机名 | 不需要;自动获得临时 `trycloudflare.com` 地址 | 必需;填写 Cloudflare 已绑定域名 |
 | Gate 端口 | 建议 `0`,自动分配 | 必须固定为 `1–65535`,并与 ingress 一致 |
 
@@ -91,7 +92,7 @@ cloudflare tunnel: https://<random>.trycloudflare.com
 
 公网域名需要保持稳定时使用 token 模式。在 Cloudflare 创建命名隧道,绑定 `gui.example.com` 之类的域名,并让 dashboard ingress 指向固定 loopback 密码门,例如 `http://127.0.0.1:7677`。
 
-把两个凭据写入 `$DSH_HOME/.credentials.yaml`:
+可以在 Web 设置卡片直接粘贴 Tunnel Token。也可以预先把两个凭据写入 `$DSH_HOME/.credentials.yaml`:
 
 ```yaml
 DSH_WEB_PASSWORD: 'replace-with-a-long-random-password'
@@ -111,7 +112,7 @@ DSH_TUNNEL_TOKEN: 'eyJhIjo...'
     gatePort: 7677
 ```
 
-`publicHostname` 只能填写 DNS 主机名,不能带 `https://`、端口或路径。除 Tunnel Token 明文本身外,其余配置都可以在上述 Web 设置卡片中完成并立即应用;修改 `gatePort` 后,仍需确保 Cloudflare Dashboard ingress 指向相同端口。
+`publicHostname` 只能填写 DNS 主机名,不能带 `https://`、端口或路径。配置和 Tunnel Token 都可以在上述 Web 设置卡片中完成并立即应用;Token 只进入凭据服务,不会写入 settings 或回显。修改 `gatePort` 后,仍需确保 Cloudflare Dashboard ingress 指向相同端口。
 
 ### 配置参考
 
@@ -122,7 +123,7 @@ DSH_TUNNEL_TOKEN: 'eyJhIjo...'
 | `passwordRef` | string(credential-ref) | `DSH_WEB_PASSWORD` | 解析共享访问密码的凭据引用;未配置时插件保持挂载,添加凭据后自动启动。 |
 | `sessionTtlHours` | number ≥ 0.01 | `720` | Cookie 有效期,单位为小时,默认 30 天。 |
 | `mode` | `quick` \| `token` | `quick` | 临时 quick 隧道或命名 token 隧道。 |
-| `tokenRef` | string(credential-ref) | — | Tunnel Token 凭据引用;仅 token 模式。 |
+| `tokenRef` | string(credential-ref) | `DSH_TUNNEL_TOKEN` | Tunnel Token 凭据引用;仅 token 模式。 |
 | `publicHostname` | DNS hostname | — | 不带 scheme、端口或路径的命名隧道主机名;仅 token 模式。 |
 | `gatePort` | integer 0…65535 | `0` | loopback 密码门端口;token 模式要求固定的非零值。 |
 | `executable` | string | `cloudflared` | `cloudflared` 的 PATH 名称或绝对路径。 |
@@ -133,7 +134,7 @@ DSH_TUNNEL_TOKEN: 'eyJhIjo...'
 - **共享密码、单管理员信任**:每个密码持有者都被视为管理员,默认可访问完整 Web GUI、Auth Tunnel 卡片、只写密码输入和语言偏好。关闭 `allowRemoteSettings` 会移除这些插件自有控件,但不会限制核心 Host 配置面(settings、credentials、LLM 目录),该配置面仍对每个已认证公网页面直接代理到 Host。响应已脱敏,密钥只随写入载荷单向传输。当前没有速率限制、锁定、按用户会话或服务端吊销表。请勿将该密码分享给低信任访客;更严肃的部署应使用 Cloudflare Access 或其他身份感知代理。轮换密码会使所有会话失效。
 - **单隧道、无自动重启**:`cloudflared` 意外退出时会记录并显示错误,但不会自动重启;在页面关闭再开启隧道即可恢复。
 - **Quick URL 每次启动都会变化**:需要固定 URL 时应使用 token 模式和自有域名。
-- **Loopback 保持未认证**:密码只保护隧道路径;本机浏览器和进程仍可直接访问原始 Web GUI。
+- **保留本机 DSH 认证**:共享密码保护隧道路径;直接访问原始 Web GUI 时,使用 `dsh web` 输出的带 Token 地址及 DSH 浏览器会话。
 - **子进程环境最小化**:只继承 `PATH`、`HOME` 和 `TMPDIR`;公司代理应在插件之外为 `cloudflared` 配置。
 - **Loopback HTTP 是明文**:密码门和上游 WebServer 通过同主机 loopback HTTP 通信;TLS 在 Cloudflare 终结。
 - **每次启动只有一种目录选择器交互**:启用 bundle 后,本机客户端也使用应用内浏览器选择器,因为 Web 应用不能按连接分别选择原生和浏览器选择器。
@@ -150,13 +151,17 @@ public client
 
 ### 密码门与代理
 
-插件依赖 `webServer` 和 `credentials` 服务。它启动一个自己的 loopback `node:http` 密码门,解析配置的密码引用,再让 `cloudflared` 指向这道门。原始 WebServer 以及其他插件贡献的所有路由都原样保留在门后。
+插件依赖 `webServer`、`credentials`、`settings` 及 Host `connection` 服务。它启动一个自己的 loopback `node:http` 密码门,解析配置的密码引用,再让 `cloudflared` 指向这道门。原始 WebServer 以及其他插件贡献的所有路由都原样保留在门后。
 
 未认证的浏览器导航会重定向到 `/dsh-auth-tunnel/login`;其他未认证请求返回精简的 401。登录成功后签发 `HttpOnly; SameSite=Strict` 的 `dsh_auth_tunnel` Cookie,使用从密码派生的 HMAC 密钥签名。已认证导航还会刷新可读的 `dsh_auth_tunnel_surface=1` 标记,它只负责让客户端在设置插件启动前识别 tunnel 路径,不授予任何访问权限;Gate 仍会在每个请求上校验 HttpOnly Cookie。每次请求都会重新解析凭据,因此轮换密码会立即使已有会话失效。`GET` 或 `POST /dsh-auth-tunnel/logout` 会清除两个 Cookie。
 
 密码门把登录请求体限制为 16 KiB,并代理已认证的 HTTP 与 WebSocket 流量。它把 `Host` 和匹配当前主机的浏览器 `Origin` 改写为 loopback 上游地址,让 WebServer 的 DNS-rebinding 与同源检查继续看到可信地址;外来或不透明 Origin 保持不变。HTTP 两段代理都会删除逐跳头并按连接重新生成,升级握手则保留协议需要的字段。客户端断开时,对应的上游请求也会取消。
 
+校验公网密码 Cookie 后,Gate 通过 Host connection 的 Token 兑换接口取得私有 DSH 浏览器 Cookie,并在上游 HTTP 和 WebSocket 请求中使用。DSH 启动 Token 和浏览器 Cookie 仅保留在服务端;公网响应会过滤同名的上游 `Set-Cookie`。DSH Cookie 过期时独立续期,不要求仍有效的公网会话重新登录。
+
 唯一不需要认证的上游应用路由是只读的 `GET`/`HEAD /manifest.webmanifest`。除非页面明确要求带凭据获取 manifest,否则浏览器不会为这类请求携带凭据;该文件只包含公开的应用元数据。
+
+安装或升级客户端插件后需要刷新页面,以便在设置 scope 初始化前识别隧道。重新加载 Host connection 服务也会重启依赖它的隧道插件;Quick 模式可能获得新地址。
 
 ### 目录选择器
 

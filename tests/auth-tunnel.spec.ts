@@ -18,15 +18,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Context, Service } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
-import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { SettingsProvider, settingsNamespace, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
+import { credentialRef, type CredentialRecord } from '@deepseek-ai/dsh-credentials'
+import * as Connection from '@deepseek-ai/dsh-client-connection'
+import { SettingsProvider, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import z from '@deepseek-ai/schemastery'
 import { Config } from '../src/index.ts'
 
 /** Minimal in-memory credentials service for the composition (rotate via set). */
 class StubCredentials extends Service {
+  private readonly records = new Map<string, CredentialRecord>()
+
   constructor(ctx: Context) {
     super(ctx, 'credentials')
+  }
+
+  async modifyRecord(key: string, mutate: (current: CredentialRecord | undefined) => Promise<CredentialRecord | undefined>): Promise<CredentialRecord | undefined> {
+    const next = await mutate(this.records.get(key))
+    if (next !== undefined) this.records.set(key, next)
+    return this.records.get(key)
   }
 
   async resolve(request: string): Promise<{ value: string; source: string } | undefined> {
@@ -159,6 +168,7 @@ class StubSettings extends SettingsProvider {
 
 interface StubbedContext {
   loaded: Context
+  connection: () => Connection.HostConnectionHandle
   credentials: () => StubCredentials
   settings: () => StubSettings
   shellEnv: () => StubShellEnv
@@ -282,6 +292,7 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
     '    port: 0',
     ...(options?.settingsAfterTunnel === true ? [] : settingsRows),
     ...(options?.credentialsAfterWebServer === true ? [] : credentialRows),
+    "- name: '@deepseek-ai/dsh-client-connection'",
     ...(options?.withShell === false ? [] : [
       "- name: '@deepseek-ai/dsh-shell-env'",
       "- name: '@deepseek-ai/dsh-system-prompt'",
@@ -311,6 +322,7 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
   const tunnel = await import('../src/index.ts')
   const modules = new Map<string, unknown>([
     ['@deepseek-ai/dsh-host-webserver', webserver],
+    ['@deepseek-ai/dsh-client-connection', Connection],
     ['@deepseek-ai/dsh-credentials', credentialsPlugin],
     ['@deepseek-ai/dsh-shell-env', shellEnvPlugin],
     ['@deepseek-ai/dsh-system-prompt', systemPromptPlugin],
@@ -332,6 +344,7 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
   const loaded = context
   return {
     loaded,
+    connection: () => loaded.get('connection') as Connection.HostConnectionHandle,
     credentials: () => loaded.get('credentials')! as unknown as StubCredentials,
     settings: () => loaded.get('settings')! as unknown as StubSettings,
     shellEnv: () => loaded.get('shellEnv')! as unknown as StubShellEnv,
@@ -446,12 +459,87 @@ async function waitForStatus(
 }
 
 describe('password gate over the loopback webserver', () => {
+  it('authenticates the DSH index, RPC and WebSocket without exposing its browser session', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ sessionTtlHours: 60 * 24 })
+    const connection = composition.connection()
+    const upstreamCookies: string[] = []
+    composition.loaded.webServer.register({
+      kind: 'exact', path: '/', handler: (req, res) => {
+        if (!connection.authorizeIndex(req, res)) return
+        upstreamCookies.push(req.headers.cookie!)
+        res.writeHead(200, { 'content-type': 'text/html' })
+        res.end('<main>Authenticated DSH</main>')
+      },
+    })
+    connection.rpc.intercept('/api', endpoint => endpoint === 'probe', async (endpoint, payload) => ({
+      ok: true, value: { endpoint, payload },
+    }))
+    composition.loaded.webServer.registerUpgrade({
+      path: '/api/probe-upgrade', handler: (req, socket) => {
+        const rejected = connection.requestRejection(req)
+        if (rejected !== undefined) {
+          socket.end(`HTTP/1.1 ${String(rejected)} Unauthorized\r\nContent-Length: 0\r\n\r\n`)
+          return
+        }
+        socket.end('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: dsh-test\r\n\r\n')
+      },
+    })
+    const base = await composition.gateBase()
+    const upstream = `http://127.0.0.1:${String(composition.loaded.webServer.port)}`
+    expect((await fetch(upstream)).status).toBe(401)
+    expect((await fetch(`${base}/api/probe`)).status).toBe(401)
+    const loggedIn = await login(base)
+    expect(loggedIn.getSetCookie().some(value => value.startsWith('dsh-auth-'))).toBe(false)
+    const cookie = loggedIn.get('set-cookie')!.split(';', 1)[0]!
+    const index = await fetch(base, { headers: { cookie, accept: 'text/html' } })
+    expect(index.status).toBe(200)
+    expect(await index.text()).toBe('<main>Authenticated DSH</main>')
+    expect(index.headers.getSetCookie().some(value => value.startsWith('dsh-auth-'))).toBe(false)
+    const firstHostCookie = upstreamCookies[0]!.split(';', 1)[0]!
+    expect(firstHostCookie).toMatch(/^dsh-auth-/)
+    const hostCookieName = firstHostCookie.split('=', 1)[0]!
+    expect((await fetch(base, { headers: { cookie: `${hostCookieName}=forged; ${cookie}` } })).status).toBe(200)
+
+    const rpc = await fetch(`${base}/api/probe`, {
+      method: 'POST', headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'client-request', rpcId: 'probe', method: 'probe', payload: { args: {} } }),
+    })
+    expect(rpc.status).toBe(200)
+    expect(await rpc.json()).toMatchObject({ result: { ok: true, value: { endpoint: 'probe' } } })
+    const upgrade = await rawRequest(Number(new URL(base).port), [
+      'GET /api/probe-upgrade HTTP/1.1', `Host: ${new URL(base).host}`,
+      `Cookie: ${cookie}`, 'Connection: Upgrade', 'Upgrade: dsh-test', '', '',
+    ])
+    expect(upgrade).toContain('101 Switching Protocols')
+
+    // Even an explicit Host token exchange through the gate keeps its cookie private.
+    const launch = new URL(connection.authenticatedUrl(upstream))
+    const exchanged = await fetch(`${base}/${launch.search}`, { redirect: 'manual', headers: { cookie } })
+    expect(exchanged.status).toBe(303)
+    expect(exchanged.headers.getSetCookie().some(value => value.startsWith('dsh-auth-'))).toBe(false)
+
+    // DSH's 30-day session expires before the configured public session does.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(Date.now() + 31 * 24 * 3600 * 1000)
+    expect((await fetch(base, { headers: { cookie } })).status).toBe(200)
+    expect(upstreamCookies.at(-1)!.split(';', 1)[0]).not.toBe(firstHostCookie)
+    vi.useRealTimers()
+
+    const logout = await fetch(`${base}/dsh-auth-tunnel/logout`, { redirect: 'manual', headers: { cookie } })
+    expect(logout.status).toBe(303)
+    expect((await fetch(base)).status).toBe(401)
+    await composition.credentials().set('DSH_WEB_PASSWORD', 'rotated-password')
+    expect((await fetch(base, { headers: { cookie } })).status).toBe(401)
+    const renewed = (await login(base, undefined, 'rotated-password')).get('set-cookie')!.split(';', 1)[0]!
+    expect((await fetch(base, { headers: { cookie: renewed } })).status).toBe(200)
+  })
+
   it('proxies core configuration RPCs to the Host and gates only plugin-owned endpoints', { timeout: 60_000 }, async () => {
     const composition = await bootQuick({ allowRemoteSettings: false })
     const apiHits: string[] = []
     for (const path of [
-      '/api/settings.describe', '/api/settings.update', '/api/settings.replace',
-      '/api/settings.mutate', '/api/credentials.describe',
+      '/api/settings/describe', '/api/settings/update', '/api/settings/replace',
+      '/api/settings/mutate', '/api/credentials/describe',
     ]) {
       composition.loaded.webServer.register({
         kind: 'exact', path, handler: (_req, res) => {
@@ -461,7 +549,7 @@ describe('password gate over the loopback webserver', () => {
         },
       })
     }
-    composition.settings().register(settingsNamespace('locale'), z.object({
+    composition.settings().register('locale', z.object({
       preference: z.union(['zh', 'en']).required(false),
     }))
     const base = await composition.gateBase()
@@ -469,18 +557,18 @@ describe('password gate over the loopback webserver', () => {
     const rpc = (method: string, payload: object = {}): RequestInit => ({
       method: 'POST',
       headers: { cookie, 'content-type': 'application/json' },
-      body: JSON.stringify({ type: 'client-request', rpcId: `rpc-${method}`, method, payload }),
+      body: JSON.stringify({ type: 'client-request', rpcId: `rpc-${method}`, method, payload: { args: payload } }),
     })
 
     // The switch does not fence the core configuration plane: an authenticated
     // public page reaches the Host settings and credentials RPCs directly,
     // exactly like a local page.
     const proxiedMethods: Array<[string, object]> = [
-      ['settings.describe', {}],
-      ['settings.update', { ns: 'locale', patch: {} }],
-      ['settings.replace', { ns: 'locale', section: {} }],
-      ['settings.mutate', { ns: 'locale', ops: [] }],
-      ['credentials.describe', {}],
+      ['settings/describe', {}],
+      ['settings/update', { ns: 'locale', patch: {} }],
+      ['settings/replace', { ns: 'locale', section: {} }],
+      ['settings/mutate', { ns: 'locale', ops: [] }],
+      ['credentials/describe', {}],
     ]
     for (const [method, payload] of proxiedMethods) {
       const proxied = await fetch(`${base}/api/${method}`, rpc(method, payload))
@@ -488,25 +576,28 @@ describe('password gate over the loopback webserver', () => {
       expect(await proxied.text()).toBe('{"ok":true}')
     }
     expect(apiHits).toEqual([
-      '/api/settings.describe', '/api/settings.update', '/api/settings.replace',
-      '/api/settings.mutate', '/api/credentials.describe',
+      '/api/settings/describe', '/api/settings/update', '/api/settings/replace',
+      '/api/settings/mutate', '/api/credentials/describe',
     ])
 
     const hitsBeforeDeniedWrites = [...apiHits]
     for (const [method, payload] of [
-      ['settings.update', { ns: 'auth-tunnel', patch: { enabled: false } }],
-      ['settings.replace', { ns: 'auth-tunnel', section: { enabled: false } }],
-      ['settings.mutate', { ns: 'auth-tunnel', ops: [{ op: 'set', path: ['enabled'], value: false }] }],
+      ['settings/update', { ns: 'auth-tunnel', patch: { enabled: false } }],
+      ['settings/replace', { ns: 'auth-tunnel', section: { enabled: false } }],
+      ['settings/mutate', { ns: 'auth-tunnel', ops: [{ op: 'set', path: ['enabled'], value: false }] }],
     ] as const) {
-      const denied = await fetch(`${base}/api/${method}`, rpc(method, payload))
-      expect(denied.status).toBe(403)
-      expect(await denied.json()).toEqual({ error: 'auth-tunnel settings require the plugin endpoint' })
+      for (const prefix of ['', '\ufeff']) {
+        const request = rpc(method, payload)
+        const denied = await fetch(`${base}/api/${method}`, { ...request, body: prefix + String(request.body) })
+        expect(denied.status).toBe(403)
+        expect(await denied.json()).toEqual({ error: 'auth-tunnel settings require the plugin endpoint' })
+      }
     }
     expect(apiHits).toEqual(hitsBeforeDeniedWrites)
     expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
 
     const beforeEnable = await composition.runtimeStatus()
-    await composition.settings().update(settingsNamespace('auth-tunnel'), { allowRemoteSettings: true })
+    await composition.settings().update('auth-tunnel', { allowRemoteSettings: true })
     await waitForStatus(composition, status => status.revision > beforeEnable.revision && status.phase === 'running')
 
     const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
@@ -527,7 +618,7 @@ describe('password gate over the loopback webserver', () => {
       settings: { revision: number; value: { sessionTtlHours: number } }
     }
     expect(committed.settings.value.sessionTtlHours).toBe(24)
-    expect(composition.settings().get(settingsNamespace('auth-tunnel'))).toMatchObject({ sessionTtlHours: 24 })
+    expect(composition.settings().get('auth-tunnel')).toMatchObject({ sessionTtlHours: 24 })
 
     await waitForStatus(composition, status => status.phase === 'running')
 
@@ -537,7 +628,7 @@ describe('password gate over the loopback webserver', () => {
       body: JSON.stringify({ locale: 'en' }),
     })
     expect(locale.status).toBe(200)
-    expect(composition.settings().get(settingsNamespace('locale'))).toEqual({ preference: 'en' })
+    expect(composition.settings().get('locale')).toEqual({ preference: 'en' })
 
     const beforeDisable = await composition.runtimeStatus()
     const disabled = await fetch(`${base}/dsh-auth-tunnel/settings`, {
@@ -554,9 +645,9 @@ describe('password gate over the loopback webserver', () => {
     await waitForStatus(composition, status => status.revision > beforeDisable.revision && status.phase === 'running')
     expect((await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).status).toBe(403)
     // Closing the plugin endpoints does not close the proxied core plane.
-    const stillProxied = await fetch(`${base}/api/settings.describe`, rpc('settings.describe'))
+    const stillProxied = await fetch(`${base}/api/settings/describe`, rpc('settings/describe'))
     expect(stillProxied.status).toBe(200)
-    expect(apiHits.at(-1)).toBe('/api/settings.describe')
+    expect(apiHits.at(-1)).toBe('/api/settings/describe')
   })
 
   it('rotates the long-lived access password verbatim through the plugin endpoint without echoing it', { timeout: 60_000 }, async () => {
@@ -576,6 +667,43 @@ describe('password gate over the loopback webserver', () => {
     expect(await response.text()).not.toContain('replacement-password')
     expect(await composition.credentials().resolve('DSH_WEB_PASSWORD')).toMatchObject({ value: '  replacement-password  ' })
     expect((await login(base, undefined, '  replacement-password  ')).get('set-cookie')).toContain('dsh_auth_tunnel=')
+  })
+
+  it('stores a directly entered Tunnel Token outside settings without echoing it', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick({ allowRemoteSettings: true })
+    const base = await composition.gateBase()
+    const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
+    const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
+      settings: { revision: number }
+    }
+
+    const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: opened.settings.revision,
+        writes: [
+          { field: 'enabled', op: 'set', value: false },
+          { field: 'mode', op: 'set', value: 'token' },
+          { field: 'publicHostname', op: 'set', value: 'gui.example.com' },
+          { field: 'gatePort', op: 'set', value: 7677 },
+        ],
+        password: '',
+        token: 'direct-tunnel-token',
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.text()).not.toContain('direct-tunnel-token')
+    expect(await composition.credentials().resolve('DSH_TUNNEL_TOKEN'))
+      .toMatchObject({ value: 'direct-tunnel-token' })
+    expect(composition.settings().get('auth-tunnel')).toMatchObject({
+      enabled: false,
+      mode: 'token',
+      tokenRef: 'DSH_TUNNEL_TOKEN',
+      publicHostname: 'gui.example.com',
+      gatePort: 7677,
+    })
   })
 
   it('rejects a concurrent password rotation while one write is active', { timeout: 60_000 }, async () => {
@@ -611,7 +739,7 @@ describe('password gate over the loopback webserver', () => {
       settings: { revision: number }
     }
 
-    await composition.settings().update(settingsNamespace('auth-tunnel'), { passwordRef: 'ALT_WEB_PASSWORD' })
+    await composition.settings().update('auth-tunnel', { passwordRef: 'ALT_WEB_PASSWORD' })
     const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
       method: 'POST',
       headers: { cookie, 'content-type': 'application/json' },
@@ -649,7 +777,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(200)
-    expect(composition.settings().get(settingsNamespace('auth-tunnel')).sessionTtlHours).toBe(24)
+    expect(composition.settings().get('auth-tunnel').sessionTtlHours).toBe(24)
   })
 
   it('rejects a remote Quick route change before replacing its discoverable URL', { timeout: 60_000 }, async () => {
@@ -672,7 +800,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
-    expect(composition.settings().get(settingsNamespace('auth-tunnel')).gatePort).toBe(0)
+    expect(composition.settings().get('auth-tunnel').gatePort).toBe(0)
     expect(await composition.runtimeStatus()).toMatchObject({
       phase: 'running',
       publicUrl: before.publicUrl,
@@ -692,7 +820,7 @@ describe('password gate over the loopback webserver', () => {
     const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
     const before = await composition.runtimeStatus()
 
-    await composition.settings().update(settingsNamespace('auth-tunnel'), {
+    await composition.settings().update('auth-tunnel', {
       executable: replacementExecutable,
     })
     await waitForStatus(composition, status => status.phase === 'error' && status.running)
@@ -712,7 +840,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
-    expect(composition.settings().get(settingsNamespace('auth-tunnel'))).toMatchObject({
+    expect(composition.settings().get('auth-tunnel')).toMatchObject({
       executable: replacementExecutable,
       sessionTtlHours: 720,
     })
@@ -751,11 +879,11 @@ describe('password gate over the loopback webserver', () => {
       }),
     })
     await resolveStarted
-    await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
+    await composition.settings().update('auth-tunnel', { enabled: false })
     releaseResolve()
 
     expect((await pendingSave).status).toBe(409)
-    expect(composition.settings().get(settingsNamespace('auth-tunnel'))).toMatchObject({
+    expect(composition.settings().get('auth-tunnel')).toMatchObject({
       enabled: false,
       passwordRef: 'DSH_WEB_PASSWORD',
     })
@@ -781,7 +909,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
-    expect(composition.settings().get(settingsNamespace('auth-tunnel')).gatePort).toBe(0)
+    expect(composition.settings().get('auth-tunnel').gatePort).toBe(0)
     expect(await composition.credentials().resolve('DSH_WEB_PASSWORD'))
       .toMatchObject({ value: 's3kret-passw0rd' })
   })
@@ -813,7 +941,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
-    expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
+    expect(composition.settings().get('auth-tunnel').passwordRef).toBe('DSH_WEB_PASSWORD')
   })
 
   it('rejects a passwordless switch to an unconfigured access credential', { timeout: 60_000 }, async () => {
@@ -835,7 +963,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
-    expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
+    expect(composition.settings().get('auth-tunnel').passwordRef).toBe('DSH_WEB_PASSWORD')
   })
 
   it('rejects a passwordless switch to an empty resolved access credential', { timeout: 60_000 }, async () => {
@@ -859,7 +987,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
-    expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
+    expect(composition.settings().get('auth-tunnel').passwordRef).toBe('DSH_WEB_PASSWORD')
   })
 
   it('rejects a remote password that cannot fit through the login endpoint', { timeout: 60_000 }, async () => {
@@ -907,7 +1035,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
-    expect(composition.settings().get(settingsNamespace('auth-tunnel')).sessionTtlHours).toBe(720)
+    expect(composition.settings().get('auth-tunnel').sessionTtlHours).toBe(720)
   })
 
   it('rejects password-only remote saves while Host settings are read-only', { timeout: 60_000 }, async () => {
@@ -966,7 +1094,7 @@ describe('password gate over the loopback webserver', () => {
       expect(response.status).toBe(409)
       expect(await composition.credentials().resolve('DSH_TUNNEL_TOKEN')).toMatchObject({ value: 'tunnel-token' })
       expect(await composition.credentials().resolve('OTHER_HOST_SECRET')).toMatchObject({ value: 'other-secret' })
-      expect(composition.settings().get(settingsNamespace('auth-tunnel')).passwordRef).toBe('DSH_WEB_PASSWORD')
+      expect(composition.settings().get('auth-tunnel').passwordRef).toBe('DSH_WEB_PASSWORD')
     },
   )
 
@@ -1015,7 +1143,7 @@ describe('password gate over the loopback webserver', () => {
     let observedHost = ''
     let observedOrigin = ''
     loaded.webServer.register({
-      kind: 'prefix', path: '/api', handler: (req, res) => {
+      kind: 'exact', path: '/api/probe', handler: (req, res) => {
         observedHost = String(req.headers.host)
         observedOrigin = String(req.headers.origin)
         res.writeHead(200, { 'content-type': 'application/json', 'x-mark': 'gate' })
@@ -1476,7 +1604,7 @@ describe('upgrade pass-through', () => {
     expect(String(head)).toContain('101 Switching Protocols')
     const closed = once(socket, 'close').then(() => 'closed')
 
-    await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
+    await composition.settings().update('auth-tunnel', { enabled: false })
 
     expect(await Promise.race([closed, sleep(3000).then(() => 'timeout')])).toBe('closed')
     await waitForStatus(composition, status => status.phase === 'stopped' && !status.running)
@@ -1636,7 +1764,7 @@ describe('tunnel lifecycle', () => {
     const composition = await bootQuick({ executable: quickExecutable, startupTimeoutMs: 10_000 })
     const base = await composition.gateBase()
 
-    await composition.settings().update(settingsNamespace('auth-tunnel'), { executable: silentExecutable })
+    await composition.settings().update('auth-tunnel', { executable: silentExecutable })
     const deadline = Date.now() + 5000
     while ((await liveFixturePids()).length < 2) {
       if (Date.now() >= deadline) throw new Error('staged cloudflared did not start')
@@ -1658,7 +1786,7 @@ describe('tunnel lifecycle', () => {
     const silentExecutable = await fixtureExecutable('fake-cloudflared-silent.sh')
     const composition = await bootQuick({ executable: quickExecutable, startupTimeoutMs: 10_000 })
 
-    await composition.settings().update(settingsNamespace('auth-tunnel'), { executable: silentExecutable })
+    await composition.settings().update('auth-tunnel', { executable: silentExecutable })
     const deadline = Date.now() + 5000
     while ((await liveFixturePids()).length < 2) {
       if (Date.now() >= deadline) throw new Error('staged cloudflared did not start')
@@ -1666,7 +1794,7 @@ describe('tunnel lifecycle', () => {
     }
 
     const startedAt = Date.now()
-    await composition.settings().update(settingsNamespace('auth-tunnel'), { enabled: false })
+    await composition.settings().update('auth-tunnel', { enabled: false })
     await waitForStatus(composition, status => status.phase === 'stopped', 4000)
 
     expect(Date.now() - startedAt).toBeLessThan(4000)
@@ -1698,6 +1826,10 @@ describe('tunnel lifecycle', () => {
 describe('configuration defaults', () => {
   it('allows authenticated public settings management by default', () => {
     expect(Config({}).allowRemoteSettings).toBe(true)
+  })
+
+  it('uses the conventional Tunnel Token credential by default', () => {
+    expect(Config({}).tokenRef).toBe('DSH_TUNNEL_TOKEN')
   })
 })
 
@@ -1928,7 +2060,7 @@ describe('activation dependencies and boot failures', () => {
 })
 
 describe('plugin settings', () => {
-  const namespace = settingsNamespace('auth-tunnel')
+  const namespace = 'auth-tunnel'
 
   it('keeps settings available without starting public access while disabled', { timeout: 60_000 }, async () => {
     const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
@@ -1942,7 +2074,7 @@ describe('plugin settings', () => {
     expect(descriptor).toMatchObject({
       ns: namespace,
       applies: 'live',
-      value: { enabled: false, allowRemoteSettings: true, mode: 'token' },
+      value: { enabled: false, allowRemoteSettings: true, mode: 'token', tokenRef: 'DSH_TUNNEL_TOKEN' },
     })
     expect(await composition.runtimeStatus()).toMatchObject({ phase: 'stopped', running: false })
     expect(consoleSpy).not.toHaveBeenCalled()
@@ -1950,7 +2082,7 @@ describe('plugin settings', () => {
     expect(composition.systemPrompt().sections).toEqual([])
     expect(await liveFixturePids()).toEqual([])
     await expect(composition.settings().update(namespace, { enabled: true }))
-      .rejects.toThrow(/token mode requires tokenRef/)
+      .rejects.toThrow(/token mode requires publicHostname/)
   })
 
   it('withholds remote settings when a password reference cannot be applied', { timeout: 60_000 }, async () => {

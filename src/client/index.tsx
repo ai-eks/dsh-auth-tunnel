@@ -1,17 +1,18 @@
 /** Browser settings card for the Host-side auth-tunnel namespace. */
 
 import { useState, useSyncExternalStore, type CSSProperties } from 'react'
+import type { Context } from '@deepseek-ai/cordis'
 import type {
-  ClientContext, SettingsScope, SettingsScopeSnapshot,
-} from '@deepseek-ai/dsh-client-runtime/client'
+  SettingsScope, SettingsScopeSnapshot,
+} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {
-  ConnectionHandle, IApiClient, SettingsNamespaceView, SettingsPathOpView,
+  ClientRemote, ConnectionHandle, SettingsNamespaceView, SettingsPathOpView,
 } from '@deepseek-ai/dsh-api-remotes/client'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only service and slot declarations. Cross-plugin behavior stays on
 // Cordis services, so the lazy client bundle imports no plugin implementation.
 import type {} from '@deepseek-ai/dsh-client-locale/client'
-import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
 
 const SETTINGS_NAMESPACE = 'auth-tunnel'
@@ -29,8 +30,8 @@ type LocaleKey =
   | 'password' | 'passwordHint' | 'passwordPlaceholder' | 'passwordUpdate' | 'passwordUpdating'
   | 'passwordSaveFailed' | 'separateSaveHint'
   | 'sessionTtlHours' | 'sessionTtlHoursHint'
-  | 'tokenRef' | 'tokenRefHint'
-  | 'publicHostname' | 'publicHostnameHint'
+  | 'tokenRef' | 'tokenRefHint' | 'tokenValue' | 'tokenValueHint' | 'tokenValuePlaceholder'
+  | 'publicHostname' | 'publicHostnameHint' | 'inactiveHostnameError'
   | 'quickGatePort' | 'quickGatePortHint' | 'tokenGatePort' | 'tokenGatePortHint'
   | 'executable' | 'executableHint'
   | 'startupTimeoutMs' | 'startupTimeoutMsHint'
@@ -75,7 +76,7 @@ const zh: Record<LocaleKey, string> = {
   quick: 'Quick（临时隧道）',
   token: 'Token（命名隧道）',
   quickRequirements: 'Quick 只需要上方的访问密码；无需 Cloudflare Token 或自有域名，Gate 端口保持 0 即可自动分配。',
-  tokenRequirements: 'Token 启用前必须准备 Tunnel Token、已绑定的公网域名和固定 Gate 端口；Cloudflare ingress 必须指向该端口。',
+  tokenRequirements: 'Token 启用前必须准备 Tunnel Token、已绑定的公网域名和固定 Gate 端口；可在下方直接粘贴 Token，Cloudflare ingress 必须指向该端口。',
   passwordRef: '密码凭据引用',
   passwordRefHint: '一般保持 DSH_WEB_PASSWORD。若要切换引用，请先在 Host Credentials 中创建目标凭据，再将下方密码留空后保存。',
   password: '设置或替换访问密码',
@@ -87,10 +88,14 @@ const zh: Record<LocaleKey, string> = {
   separateSaveHint: '密码和配置需要分别保存；请先清空密码输入或放弃配置修改。',
   sessionTtlHours: '会话时长（小时）',
   sessionTtlHoursHint: '登录 Cookie 的绝对有效期。',
-  tokenRef: 'Tunnel Token 凭据引用（必填）',
-  tokenRefHint: '填写已存入凭据服务的名称，例如 DSH_TUNNEL_TOKEN；不是 Token 明文。',
+  tokenRef: 'Tunnel Token 凭据引用',
+  tokenRefHint: 'Token 保存到这个凭据名称；一般保持 DSH_TUNNEL_TOKEN。',
+  tokenValue: '设置或替换 Tunnel Token',
+  tokenValueHint: '随“保存配置”写入上方凭据，成功后清空且永不回显；留空表示沿用已保存的 Token。',
+  tokenValuePlaceholder: '直接粘贴 Cloudflare Tunnel Token',
   publicHostname: '公网主机名（必填）',
   publicHostnameHint: 'Cloudflare 控制台中绑定到命名隧道的域名。',
+  inactiveHostnameError: 'Token 配置中仍有无效的公网主机名。请切回 Token 模式修正，或放弃修改。',
   quickGatePort: 'Gate 端口（自动）',
   quickGatePortHint: '建议保持 0，由插件自动选择可用端口。',
   tokenGatePort: 'Gate 端口（必填）',
@@ -144,7 +149,7 @@ const en: Record<LocaleKey, string> = {
   quick: 'Quick (temporary tunnel)',
   token: 'Token (named tunnel)',
   quickRequirements: 'Quick only needs the access password above. It needs no Cloudflare Token or custom domain, and gate port 0 selects a port automatically.',
-  tokenRequirements: 'Before enabling Token mode, provide a Tunnel Token, bound public hostname, and fixed gate port. Cloudflare ingress must target that port.',
+  tokenRequirements: 'Before enabling Token mode, provide a Tunnel Token, bound public hostname, and fixed gate port. You can paste the Token below; Cloudflare ingress must target that port.',
   passwordRef: 'Password credential reference',
   passwordRefHint: 'Normally keep DSH_WEB_PASSWORD. To switch references, create the target in Host Credentials first, then save here with the password below left blank.',
   password: 'Set or replace access password',
@@ -156,10 +161,14 @@ const en: Record<LocaleKey, string> = {
   separateSaveHint: 'Password and configuration are saved separately. Clear the password input or discard configuration edits first.',
   sessionTtlHours: 'Session lifetime (hours)',
   sessionTtlHoursHint: 'Absolute lifetime of the login cookie.',
-  tokenRef: 'Tunnel Token credential reference (required)',
-  tokenRefHint: 'Name already stored in the credential service, such as DSH_TUNNEL_TOKEN; not the Token literal.',
+  tokenRef: 'Tunnel Token credential reference',
+  tokenRefHint: 'Credential name that stores the Token; normally keep DSH_TUNNEL_TOKEN.',
+  tokenValue: 'Set or replace Tunnel Token',
+  tokenValueHint: 'Saved to the credential above with “Save configuration”, then cleared and never echoed. Leave blank to keep the stored Token.',
+  tokenValuePlaceholder: 'Paste the Cloudflare Tunnel Token directly',
   publicHostname: 'Public hostname (required)',
   publicHostnameHint: 'Hostname bound to the named tunnel in Cloudflare.',
+  inactiveHostnameError: 'The Token configuration still has an invalid public hostname. Switch back to Token mode to correct it, or discard your changes.',
   quickGatePort: 'Gate port (automatic)',
   quickGatePortHint: 'Keep 0 to let the plugin select an available port.',
   tokenGatePort: 'Gate port (required)',
@@ -220,6 +229,7 @@ interface Draft {
   values: Record<FieldKey, string>
   edits: Partial<Record<FieldKey, DraftAction>>
   password: string
+  token: string
 }
 
 export type SettingsWrite =
@@ -230,6 +240,7 @@ export interface RemoteSettingsCommitRequest {
   expectedRevision: number
   writes: readonly SettingsWrite[]
   password: string
+  token: string
 }
 
 interface RemoteSettingsDocument {
@@ -242,13 +253,15 @@ const FIELD_KEYS: readonly FieldKey[] = [
   'gatePort', 'executable', 'startupTimeoutMs',
 ]
 
+const DEFAULT_TOKEN_REF = 'DSH_TUNNEL_TOKEN'
+
 const DEFAULT_VALUES: Record<FieldKey, string | number | boolean | undefined> = {
   enabled: true,
   allowRemoteSettings: true,
   passwordRef: 'DSH_WEB_PASSWORD',
   sessionTtlHours: 720,
   mode: 'quick',
-  tokenRef: undefined,
+  tokenRef: DEFAULT_TOKEN_REF,
   publicHostname: undefined,
   gatePort: 0,
   executable: 'cloudflared',
@@ -424,11 +437,24 @@ function initialDraft(snapshot: SettingsScopeSnapshot<AuthTunnelSettings>): Draf
   for (const field of FIELD_KEYS) {
     values[field] = display(Object.hasOwn(resolved, field) ? resolved[field] : DEFAULT_VALUES[field])
   }
-  return { values, edits: {}, password: '' }
+  return { values, edits: {}, password: '', token: '' }
+}
+
+/** Apply either a field edit or reset, clearing unsaved Token secrets when leaving Token mode. */
+export function changeDraftField(draft: Draft, field: FieldKey, text: string, action: DraftAction | undefined): Draft {
+  const edits = { ...draft.edits }
+  if (action === undefined) delete edits[field]
+  else edits[field] = action
+  return {
+    ...draft,
+    values: { ...draft.values, [field]: text },
+    edits,
+    ...(field === 'mode' && text === 'quick' ? { token: '' } : {}),
+  }
 }
 
 function draftDirty(draft: Draft): boolean {
-  return Object.keys(draft.edits).length !== 0 || draft.password !== ''
+  return Object.keys(draft.edits).length !== 0 || draft.password !== '' || draft.token !== ''
 }
 
 function numberDraft(text: string): number {
@@ -463,8 +489,7 @@ export function validateSettingsValues(value: AuthTunnelSettings): Partial<Recor
     errors.sessionTtlHours = 'invalidNumber'
   }
   if (value.mode !== 'quick' && value.mode !== 'token') errors.mode = 'required'
-  if (value.mode === 'token'
-    && value.publicHostname !== undefined
+  if (value.publicHostname !== undefined
     && !PUBLIC_HOSTNAME_PATTERN.test(value.publicHostname)) {
     errors.publicHostname = 'invalidHostname'
   }
@@ -700,44 +725,41 @@ function savePlan(draft: Draft, target: AuthTunnelSettings): SettingsWrite[] {
   return writes
 }
 
-type CardApi = Pick<IApiClient, 'settings' | 'credentials'>
+type CardApi = Pick<ClientRemote, 'settings' | 'credentials'>
 type CardCommit = (
   revision: number | undefined,
   writes: readonly SettingsWrite[],
   current: AuthTunnelSettings,
   target: AuthTunnelSettings,
   password: string,
+  token: string,
 ) => Promise<void>
 
 /** Write a secret in the credential plane; it never enters settings YAML or a response payload. */
 export async function commitCredentialWrite(
-  api: Pick<IApiClient, 'credentials'>,
+  api: Pick<ClientRemote, 'credentials'>,
   ref: string,
   value: string,
 ): Promise<void> {
-  const response = await api.credentials.set({ ref, value })
-  if (!response.result.ok) throw new Error(response.result.error.message)
+  const response = await api.credentials.set(ref, value)
+  if (!response.ok) throw new Error(response.error.message)
 }
 
 /** Commit the whole edited form in one revision-fenced Host mutation. */
 export async function commitSettingsWrites(
-  api: Pick<IApiClient, 'settings'>,
+  api: Pick<ClientRemote, 'settings'>,
   revision: number | undefined,
   writes: readonly SettingsWrite[],
 ): Promise<SettingsNamespaceView> {
   const ops: SettingsPathOpView[] = writes.map(write => write.op === 'set'
     ? { op: 'set', path: [write.field], value: write.value }
     : { op: 'unset', path: [write.field] })
-  const response = await api.settings.mutate({
-    ns: SETTINGS_NAMESPACE,
-    ops,
-    ...(revision === undefined ? {} : { expectedRevision: revision }),
-  })
-  if (!response.result.ok) throw new Error(response.result.error.message)
-  return response.result.value
+  const response = await api.settings.mutate(SETTINGS_NAMESPACE, ops, revision)
+  if (!response.ok) throw new Error(response.error.message)
+  return response.value
 }
 
-/** Commit either card settings or one password update; the two domains never share a transaction. */
+/** Commit card settings with an optional Tunnel Token, or one isolated access-password update. */
 export async function commitCardChanges(
   api: CardApi,
   revision: number | undefined,
@@ -745,9 +767,10 @@ export async function commitCardChanges(
   current: AuthTunnelSettings,
   target: AuthTunnelSettings,
   password: string,
+  token = '',
 ): Promise<void> {
-  if (password !== '' && writes.length !== 0) {
-    throw new Error('access password and plugin settings must be saved separately')
+  if (password !== '' && (writes.length !== 0 || token !== '')) {
+    throw new Error('access password must be saved separately from plugin settings and the tunnel token')
   }
   if (password !== '' && !fitsLoginForm(password)) {
     throw new RangeError('access password is too long for the login endpoint')
@@ -756,6 +779,9 @@ export async function commitCardChanges(
     || (target.mode === 'token' && target.passwordRef === target.tokenRef)) {
     throw new Error('access password credential conflicts with the tunnel token credential')
   }
+  if (token !== '' && (target.mode !== 'token' || target.tokenRef === undefined)) {
+    throw new Error('a tunnel token requires Token mode and a credential reference')
+  }
   const changesPasswordRef = target.passwordRef !== current.passwordRef
   if (password !== '') {
     if (changesPasswordRef) throw new Error('save the password credential reference before updating its password')
@@ -763,10 +789,13 @@ export async function commitCardChanges(
     return
   }
   if (changesPasswordRef) {
-    const response = await api.credentials.describe({ refs: [target.passwordRef] })
-    if (!response.result.ok) throw new Error(response.result.error.message)
-    const configured = response.result.value.credentials[target.passwordRef]?.configured
+    const response = await api.credentials.describe([target.passwordRef])
+    if (!response.ok) throw new Error(response.error.message)
+    const configured = response.value[target.passwordRef]?.configured
     if (configured !== true) throw new Error('access password credential is not configured')
+  }
+  if (token !== '' && target.tokenRef !== undefined) {
+    await commitCredentialWrite(api, target.tokenRef, token)
   }
   if (writes.length !== 0) await commitSettingsWrites(api, revision, writes)
 }
@@ -909,13 +938,11 @@ function SettingsForm(props: FormProps) {
   const invalid = Object.keys(errors).length !== 0
   const settingsDirty = Object.keys(draft.edits).length !== 0
   const passwordDirty = draft.password !== ''
-  const mixedChanges = settingsDirty && passwordDirty
+  const tokenDirty = draft.token !== ''
+  const mixedChanges = passwordDirty && (settingsDirty || tokenDirty)
 
   const edit = (field: FieldKey, text: string): void => {
-    const edits = { ...draft.edits }
-    if (text === initial.values[field]) delete edits[field]
-    else edits[field] = 'set'
-    const next = { ...draft, values: { ...draft.values, [field]: text }, edits }
+    const next = changeDraftField(draft, field, text, text === initial.values[field] ? undefined : 'set')
     setDraft(next)
     props.onDirty(draftDirty(next))
   }
@@ -926,15 +953,17 @@ function SettingsForm(props: FormProps) {
     props.onDirty(draftDirty(next))
   }
 
+  const editToken = (token: string): void => {
+    const next = { ...draft, token }
+    setDraft(next)
+    props.onDirty(draftDirty(next))
+  }
+
   const reset = (field: FieldKey): void => {
-    const edits = { ...draft.edits }
-    if (owns(props.snapshot.user, field)) edits[field] = 'unset'
-    else delete edits[field]
-    const next = {
-      ...draft,
-      values: { ...draft.values, [field]: display(inherited(props.snapshot, field)) },
-      edits,
-    }
+    const next = changeDraftField(
+      draft, field, display(inherited(props.snapshot, field)),
+      owns(props.snapshot.user, field) ? 'unset' : undefined,
+    )
     setDraft(next)
     props.onDirty(draftDirty(next))
   }
@@ -1037,8 +1066,8 @@ function SettingsForm(props: FormProps) {
             />
             <button
               type="button"
-              style={{ ...styles.save, ...((!passwordDirty || settingsDirty || disabled) ? { opacity: 0.4, cursor: 'default' } : {}) }}
-              disabled={!passwordDirty || settingsDirty || disabled}
+              style={{ ...styles.save, ...((!passwordDirty || settingsDirty || tokenDirty || disabled) ? { opacity: 0.4, cursor: 'default' } : {}) }}
+              disabled={!passwordDirty || settingsDirty || tokenDirty || disabled}
               onClick={() => { props.onSavePassword(draft) }}
             >
               {props.t(props.saving === 'password' ? 'passwordUpdating' : 'passwordUpdate')}
@@ -1076,8 +1105,27 @@ function SettingsForm(props: FormProps) {
           <p role="note" style={styles.requirements}>
             {props.t(target.mode === 'token' ? 'tokenRequirements' : 'quickRequirements')}
           </p>
+          {target.mode === 'quick' && errors.publicHostname !== undefined
+            ? <p role="alert" style={styles.error}>{props.t('inactiveHostnameError')}</p>
+            : null}
         </div>
         {target.mode === 'token' ? field('tokenRef', 'tokenRef', 'tokenRefHint') : null}
+        {target.mode === 'token' ? (
+          <div style={styles.field}>
+            <label style={styles.label} htmlFor="auth-tunnel-token-value">{props.t('tokenValue')}</label>
+            <input
+              id="auth-tunnel-token-value"
+              type="password"
+              autoComplete="new-password"
+              style={styles.input}
+              value={draft.token}
+              placeholder={props.t('tokenValuePlaceholder')}
+              disabled={disabled}
+              onChange={(event) => { editToken(event.target.value) }}
+            />
+            <p style={styles.hint}>{props.t('tokenValueHint')}</p>
+          </div>
+        ) : null}
         {target.mode === 'token' ? field('publicHostname', 'publicHostname', 'publicHostnameHint') : null}
         {field(
           'gatePort',
@@ -1110,8 +1158,8 @@ function SettingsForm(props: FormProps) {
         </button>
         <button
           type="button"
-          style={{ ...styles.save, ...((!settingsDirty || passwordDirty || invalid || disabled) ? { opacity: 0.4, cursor: 'default' } : {}) }}
-          disabled={!settingsDirty || passwordDirty || invalid || disabled}
+          style={{ ...styles.save, ...(((!settingsDirty && !tokenDirty) || passwordDirty || invalid || disabled) ? { opacity: 0.4, cursor: 'default' } : {}) }}
+          disabled={(!settingsDirty && !tokenDirty) || passwordDirty || invalid || disabled}
           onClick={() => { props.onSaveSettings(draft) }}
         >
           {props.t(props.saving === 'settings' ? 'saving' : 'save')}
@@ -1161,6 +1209,7 @@ function AuthTunnelCard(props: CardProps & {
     const target = parseDraft(draft)
     const writes = kind === 'settings' ? savePlan(draft, target) : []
     const password = kind === 'password' ? draft.password : ''
+    const token = kind === 'settings' && target.mode === 'token' ? draft.token : ''
     const current = snapshotValue
     const startingRevision = snapshot.revision
     setShell(current => ({ ...current, saving: kind, failed: undefined }))
@@ -1172,6 +1221,7 @@ function AuthTunnelCard(props: CardProps & {
         current,
         kind === 'settings' ? target : current,
         password,
+        token,
       )
       succeeded = true
     } catch {
@@ -1269,7 +1319,7 @@ export function promoteTunnelConnection(
 export const inject = ['connection']
 
 /** Adopt the persisted language and attempt each later change once. */
-export function installRemoteLocalePersistence(ctx: ClientContext, store: RemoteSettingsStore): () => void {
+export function installRemoteLocalePersistence(ctx: Context, store: RemoteSettingsStore): () => void {
   let disposed = false
   let loaded = false
   let adopting = false
@@ -1282,6 +1332,9 @@ export function installRemoteLocalePersistence(ctx: ClientContext, store: Remote
   }
   const stop = ctx.on('locale/change', (snapshot) => {
     if (adopting) return
+    // Language packs can publish other locale ids; this endpoint stores the
+    // two languages for which the tunnel provides its own login-page copy.
+    if (snapshot.active !== 'zh' && snapshot.active !== 'en') return
     if (!loaded) {
       pending = snapshot.active
       return
@@ -1317,16 +1370,24 @@ export function installRemoteLocalePersistence(ctx: ClientContext, store: Remote
 }
 
 /** Register the browser half under the Host namespace's key. */
-export function apply(ctx: ClientContext): void {
-  const connection = ctx.get('connection') as ConnectionHandle
+export function apply(ctx: Context): void {
+  const connection = ctx.get('connection') as unknown as ConnectionHandle
   const remoteTunnel = promoteTunnelConnection(connection)
-  ctx.inject(['slots', 'locale', 'remote', 'settingsScope'], (uiCtx: ClientContext) => {
-    mountSettingsCard(uiCtx, connection, remoteTunnel)
+  if (remoteTunnel) {
+    // Gateway may already have cached the carrier's initial classification.
+    // Keep that published fact aligned before settings scopes choose storage.
+    const remote = ctx.get('remote')
+    if (remote !== undefined) {
+      ;(remote.$host as { isLoopback: boolean }).isLoopback = true
+    }
+  }
+  ctx.inject(['slots', 'locale', 'remote', 'remote.settings', 'remote.credentials', 'settingsScope'], (uiCtx: Context) => {
+    mountSettingsCard(uiCtx, remoteTunnel)
   })
 }
 
 /** Mount the keyed card after its presentation and settings services activate. */
-function mountSettingsCard(ctx: ClientContext, connection: ConnectionHandle, remoteTunnel: boolean): void {
+function mountSettingsCard(ctx: Context, remoteTunnel: boolean): void {
   let scope: Pick<SettingsScope<AuthTunnelSettings>, 'getSnapshot' | 'subscribe'>
   let commit: CardCommit
   if (!remoteTunnel) {
@@ -1337,13 +1398,13 @@ function mountSettingsCard(ctx: ClientContext, connection: ConnectionHandle, rem
       getSnapshot: () => source.getSnapshot(),
       subscribe: listener => source.subscribe(listener),
     }
-    commit = (...args) => commitCardChanges(connection.api, ...args)
+    commit = (...args) => commitCardChanges(ctx.remote, ...args)
   } else {
     const remoteStore = new RemoteSettingsStore()
     scope = remoteStore
-    commit = (revision, writes, _current, _target, password) => revision === undefined
+    commit = (revision, writes, _current, _target, password, token) => revision === undefined
       ? Promise.reject(new Error('settings revision is unavailable'))
-      : remoteStore.commit({ expectedRevision: revision, writes, password })
+      : remoteStore.commit({ expectedRevision: revision, writes, password, token })
     ctx.effect(() => installRemoteLocalePersistence(ctx, remoteStore), 'auth-tunnel: remote locale persistence')
     ctx.effect(() => () => { remoteStore.dispose() }, 'auth-tunnel: remote settings')
   }

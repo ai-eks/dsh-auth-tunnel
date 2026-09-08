@@ -26,9 +26,10 @@ Or install the current sources from Git:
 dsh plugin --profile web add github:ai-eks/dsh-auth-tunnel
 ```
 
-This branch targets DeepSeek Harness `0.1.1-rc.2`. Harness `0.1.0-rc.8` and earlier must pin a compatible immutable tag or revision:
+This source branch targets DeepSeek Harness `0.1.2-rc.1` and supports `0.1.3-alpha.2`. Harness `0.1.1-rc.2` and earlier must pin a compatible package version, immutable tag, or revision:
 
 ```sh
+dsh plugin --profile web add dsh-auth-tunnel@0.1.1-rc.2.1 # Harness 0.1.1-rc.2
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#v0.1.0-rc.8' # Harness rc.8
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#b4baea7c47f5c245da789d3553d41938df89b311' # Harness rc.7
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#v0.1.0-rc.6' # Harness rc.6
@@ -74,14 +75,14 @@ Open that URL and enter `DSH_WEB_PASSWORD` on the login page. Share the URL, not
 
 With the Loader `auth-tunnel` row enabled, open **Settings → Plugins → Plugin configuration → Auth Tunnel** to edit every option. Saving the **Enable public tunnel** switch immediately starts or stops the gate and `cloudflared` while keeping this card available. The card also shows applying, running, stopped, or failed state and the current public URL.
 
-**Allow remote pages to change settings** is enabled by default. The shared access password is an administrator credential: a signed-in public page can read and save the Auth Tunnel card and Language preference without local setup. Disable this switch if authenticated public pages should not manage the tunnel itself; enabling it again then requires a local page or the settings document. These writes use authenticated endpoints owned by this plugin, so they work with the unmodified DeepSeek Harness `0.1.1-rc.2`. The switch is a separate fence from the core Host configuration plane: the gate proxies `settings.*`, `credentials.*`, and `llm.*` straight to the Host for every authenticated public page, except that core settings writes targeting the `auth-tunnel` namespace are rejected and must use the fenced plugin endpoint. The bundle's immediate client entry publishes that authenticated route before settings scopes classify the browser. The public GUI therefore keeps full configuration parity with the local one — responses come back redacted, and a secret crosses the wire only inside a write payload. Only one remote write is accepted at a time, and writes attempted while a previous change is applying return a conflict so the page can reload and retry. A remote page cannot save a change that would allocate a new random Quick URL (switching to Quick, or changing the Quick gate port or executable); make that change locally so the new URL remains discoverable. Turning the switch off remotely completes that save before access closes.
+**Allow remote pages to change settings** is enabled by default. The shared access password is an administrator credential: a signed-in public page can read and save the Auth Tunnel card and Language preference without local setup. Disable this switch if authenticated public pages should not manage the tunnel itself; enabling it again then requires a local page or the settings document. These writes use authenticated endpoints owned by this plugin, so they work with the unmodified DeepSeek Harness `0.1.2-rc.1`. The switch is a separate fence from the core Host configuration plane: the gate proxies `settings.*`, `credentials.*`, and `llm.*` straight to the Host for every authenticated public page, except that core settings writes targeting the `auth-tunnel` namespace are rejected and must use the fenced plugin endpoint. The bundle's immediate client entry publishes that authenticated route before settings scopes classify the browser. The public GUI therefore keeps full configuration parity with the local one — responses come back redacted, and a secret crosses the wire only inside a write payload. Only one remote write is accepted at a time, and writes attempted while a previous change is applying return a conflict so the page can reload and retry. A remote page cannot save a change that would allocate a new random Quick URL (switching to Quick, or changing the Quick gate port or executable); make that change locally so the new URL remains discoverable. Turning the switch off remotely completes that save before access closes.
 
-The card updates the credential named by the currently saved `passwordRef` through a separate **Update password** button. Password and configuration changes are never submitted as one transaction. The input clears after a successful update, and neither the Host nor the page returns or displays the literal. The password remains reusable until replaced and is not a login-once OTP. To change `passwordRef`, create that credential first and save the reference before updating its password. Store the Tunnel Token in the credential service first; `tokenRef` names that stored credential.
+The card updates the credential named by the currently saved `passwordRef` through a separate **Update password** button. Access-password and configuration changes are never submitted together. In Token mode, paste a Tunnel Token directly and **Save configuration** writes it one-way to the credential named by `tokenRef`, which defaults to `DSH_TUNNEL_TOKEN`. Both secret inputs clear after a successful write, and neither the Host nor the page returns or displays the literal. To change `passwordRef`, create that credential first and save the reference before updating its password.
 
 | Related setting | Quick | Token |
 |---|---|---|
 | Access password | Required and shared by both modes; updated separately through the write-only button | Required and shared by both modes; updated separately through the write-only button |
-| Tunnel Token | Not used | Required; `tokenRef` names the stored Token |
+| Tunnel Token | Not used | Required; paste it directly to store it under `tokenRef` |
 | Public hostname | Not used; a temporary `trycloudflare.com` URL is assigned | Required; enter the hostname bound in Cloudflare |
 | Gate port | Keep `0` for automatic allocation | Fixed `1–65535`, matching Cloudflare ingress |
 
@@ -91,7 +92,7 @@ Saved values apply automatically without restarting DeepSeek Harness. `passwordR
 
 Use token mode when the public hostname must remain stable. Create a named Cloudflare Tunnel, bind a hostname such as `gui.example.com`, and point its dashboard ingress at a fixed loopback gate such as `http://127.0.0.1:7677`.
 
-Store both credentials in `$DSH_HOME/.credentials.yaml`:
+Paste the Tunnel Token directly in the Web settings card, or pre-store both credentials in `$DSH_HOME/.credentials.yaml`:
 
 ```yaml
 DSH_WEB_PASSWORD: 'replace-with-a-long-random-password'
@@ -111,7 +112,7 @@ Override the bundle row in `$DSH_HOME/profiles/web/cordis.patch.yml`:
     gatePort: 7677
 ```
 
-`publicHostname` is only the DNS hostname: do not include `https://`, a port, or a path. Except for the Tunnel Token literal itself, the same configuration can be made and applied immediately through the Web settings card above. After changing `gatePort`, the Cloudflare Dashboard ingress must still point at the same port.
+`publicHostname` is only the DNS hostname: do not include `https://`, a port, or a path. The configuration and Tunnel Token can both be entered and applied immediately through the Web settings card; the Token only enters the credential service and is never stored in settings or echoed. After changing `gatePort`, the Cloudflare Dashboard ingress must still point at the same port.
 
 ### Configuration reference
 
@@ -122,7 +123,7 @@ Override the bundle row in `$DSH_HOME/profiles/web/cordis.patch.yml`:
 | `passwordRef` | string (credential-ref) | `DSH_WEB_PASSWORD` | Credential reference resolving to the shared access password; when unconfigured, the plugin stays mounted and starts automatically after the credential is added. |
 | `sessionTtlHours` | number ≥ 0.01 | `720` | Cookie lifetime in hours (30 days). |
 | `mode` | `quick` \| `token` | `quick` | Ephemeral quick tunnel or named token tunnel. |
-| `tokenRef` | string (credential-ref) | — | Tunnel Token reference; `token` mode only. |
+| `tokenRef` | string (credential-ref) | `DSH_TUNNEL_TOKEN` | Tunnel Token reference; `token` mode only. |
 | `publicHostname` | DNS hostname | — | Named-tunnel hostname without scheme, port, or path; `token` mode only. |
 | `gatePort` | integer 0…65535 | `0` | Loopback gate port; `token` mode requires a fixed non-zero value. |
 | `executable` | string | `cloudflared` | `cloudflared` PATH name or absolute path. |
@@ -133,7 +134,7 @@ Override the bundle row in `$DSH_HOME/profiles/web/cordis.patch.yml`:
 - **Shared password, single-user administrator trust**: every password holder is treated as an administrator and receives the whole Web GUI, including the Auth Tunnel card, its write-only password input, and Language preference by default. Disabling `allowRemoteSettings` removes those plugin-owned controls, but does not restrict the core Host configuration plane (settings, credentials, LLM catalog), which is proxied to the Host for every authenticated public page. Responses are redacted and a secret travels only inside a write payload. There is no rate limiting, lockout, per-user session, or server-side revocation list. Do not share this password with less-trusted viewers; stronger deployments should use Cloudflare Access or another identity-aware proxy. Password rotation invalidates every session.
 - **Single tunnel, no automatic restart**: an unexpected `cloudflared` exit is logged and shown in settings, but the tunnel does not restart automatically; toggle it off and on to recover.
 - **Quick URLs change on every start**: use token mode and a domain when a stable URL is required.
-- **Loopback remains unauthenticated**: the password protects the tunnel path only. Local browsers and processes can still reach the original Web GUI directly.
+- **Local DSH authentication remains enabled**: the shared password protects the tunnel path. Direct access to the original Web GUI uses the token-bearing URL printed by `dsh web` and DSH's browser session.
 - **Minimal child environment**: the child inherits only `PATH`, `HOME`, and `TMPDIR`. A corporate proxy must be configured for `cloudflared` outside this plugin.
 - **Loopback HTTP is plaintext**: the gate and upstream WebServer communicate over same-host loopback HTTP; TLS terminates at Cloudflare.
 - **One directory-picker interaction per boot**: enabling the bundle uses the in-app browser picker for local clients too because the Web app cannot select native and browser pickers per connection.
@@ -150,13 +151,17 @@ public client
 
 ### Password gate and proxy
 
-The plugin requires the `webServer` and `credentials` services. It starts its own loopback `node:http` gate, resolves the configured password reference, and points `cloudflared` at that gate. The original WebServer and every route contributed by other plugins remain unchanged behind it.
+The plugin requires the `webServer`, `credentials`, `settings`, and Host `connection` services. It starts its own loopback `node:http` gate, resolves the configured password reference, and points `cloudflared` at that gate. The original WebServer and every route contributed by other plugins remain unchanged behind it.
 
 Unauthenticated browser navigation is redirected to `/dsh-auth-tunnel/login`; other unauthenticated requests receive a small 401 response. A successful login mints the `HttpOnly; SameSite=Strict` `dsh_auth_tunnel` cookie, signed with an HMAC key derived from the password. Authenticated navigations also refresh a readable `dsh_auth_tunnel_surface=1` marker used only to classify the client before settings plugins activate; it grants no access, and the Gate still verifies the HttpOnly cookie on every request. The credential is resolved on every request, so rotating it immediately invalidates existing sessions. `GET` or `POST /dsh-auth-tunnel/logout` clears both cookies.
 
 The gate caps login bodies at 16 KiB and proxies authenticated HTTP and WebSocket traffic. It rewrites `Host` and a matching browser `Origin` to the loopback upstream authority so the WebServer's DNS-rebinding and same-origin checks continue to see their trusted address. Foreign or opaque origins remain unchanged. HTTP hop-by-hop headers are removed on both proxy legs and regenerated per connection; upgrade handshakes retain their required fields. Client disconnects cancel the corresponding upstream request.
 
+After checking the public password cookie, the gate obtains a private DSH browser cookie through the Host connection's token-exchange API and supplies it on upstream HTTP and WebSocket requests. The DSH launch token and browser cookie stay on the server; any matching upstream `Set-Cookie` is removed from public responses. Expired DSH cookies are renewed independently of the public session.
+
 The only unauthenticated upstream application route is read-only `GET`/`HEAD /manifest.webmanifest`. Browsers fetch this metadata without credentials unless the page opts into credentialed manifest requests, and the file contains only public application metadata.
+
+Installing or upgrading the client plugin requires a page reload so it can classify the tunnel before the settings scopes initialize. Reloading the Host connection service also restarts the dependent tunnel plugin; Quick mode can receive a new URL.
 
 ### Directory picker
 
