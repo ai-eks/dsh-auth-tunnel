@@ -26,7 +26,7 @@ dsh plugin --profile web add dsh-auth-tunnel@next
 dsh plugin --profile web add github:ai-eks/dsh-auth-tunnel
 ```
 
-当前源码分支适配 DeepSeek Harness `0.1.2-rc.1`,并支持 `0.1.3-alpha.2`。Harness `0.1.1-rc.2` 及更早版本必须固定安装兼容的包版本、不可变 tag 或 revision:
+当前源码分支适配 DeepSeek Harness `0.1.5-rc.1`,同时支持 `0.1.2-rc.1` 和 `0.1.3-alpha.2`。Harness `0.1.1-rc.2` 及更早版本必须固定安装兼容的包版本、不可变 tag 或 revision:
 
 ```sh
 dsh plugin --profile web add dsh-auth-tunnel@0.1.1-rc.2.1 # Harness 0.1.1-rc.2

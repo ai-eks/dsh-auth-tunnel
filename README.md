@@ -26,7 +26,7 @@ Or install the current sources from Git:
 dsh plugin --profile web add github:ai-eks/dsh-auth-tunnel
 ```
 
-This source branch targets DeepSeek Harness `0.1.2-rc.1` and supports `0.1.3-alpha.2`. Harness `0.1.1-rc.2` and earlier must pin a compatible package version, immutable tag, or revision:
+This source branch targets DeepSeek Harness `0.1.5-rc.1` and also supports `0.1.2-rc.1` and `0.1.3-alpha.2`. Harness `0.1.1-rc.2` and earlier must pin a compatible package version, immutable tag, or revision:
 
 ```sh
 dsh plugin --profile web add dsh-auth-tunnel@0.1.1-rc.2.1 # Harness 0.1.1-rc.2
