@@ -3,7 +3,7 @@
 import { useState, useSyncExternalStore, type CSSProperties } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
 import type {
-  SettingsScope, SettingsScopeSnapshot,
+  ConfigForm, ConfigFormSnapshot,
 } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {
   ClientRemote, ConnectionHandle, SettingsNamespaceView, SettingsPathOpView,
@@ -13,7 +13,7 @@ import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots
 // Cordis services, so the lazy client bundle imports no plugin implementation.
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
-import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
+import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 
 const SETTINGS_NAMESPACE = 'auth-tunnel'
 const LOCALE_NAMESPACE = 'settings.auth-tunnel'
@@ -244,7 +244,7 @@ export interface RemoteSettingsCommitRequest {
 }
 
 interface RemoteSettingsDocument {
-  snapshot: SettingsScopeSnapshot<AuthTunnelSettings>
+  snapshot: ConfigFormSnapshot<AuthTunnelSettings>
   locale?: 'zh' | 'en'
 }
 
@@ -426,12 +426,12 @@ function display(value: unknown): string {
   return value === undefined ? '' : String(value)
 }
 
-function inherited(snapshot: SettingsScopeSnapshot<AuthTunnelSettings>, field: FieldKey): unknown {
+function inherited(snapshot: ConfigFormSnapshot<AuthTunnelSettings>, field: FieldKey): unknown {
   const base = record(snapshot.base)
   return Object.hasOwn(base, field) ? base[field] : DEFAULT_VALUES[field]
 }
 
-function initialDraft(snapshot: SettingsScopeSnapshot<AuthTunnelSettings>): Draft {
+function initialDraft(snapshot: ConfigFormSnapshot<AuthTunnelSettings>): Draft {
   const resolved = record(snapshot.value)
   const values = {} as Record<FieldKey, string>
   for (const field of FIELD_KEYS) {
@@ -595,7 +595,7 @@ export async function persistRemoteLocale(locale: 'zh' | 'en'): Promise<void> {
   if (!response.ok) throw new Error(`auth-tunnel locale returned ${String(response.status)}`)
 }
 
-const INITIAL_REMOTE_SETTINGS_SNAPSHOT: SettingsScopeSnapshot<AuthTunnelSettings> = {
+const INITIAL_REMOTE_SETTINGS_SNAPSHOT: ConfigFormSnapshot<AuthTunnelSettings> = {
   status: 'loading',
   value: undefined,
   base: undefined,
@@ -624,7 +624,7 @@ export class RemoteSettingsStore {
     commit: commitRemoteSettings,
   }) {}
 
-  readonly getSnapshot = (): SettingsScopeSnapshot<AuthTunnelSettings> => this.snapshot
+  readonly getSnapshot = (): ConfigFormSnapshot<AuthTunnelSettings> => this.snapshot
 
   readonly getDocument = (): RemoteSettingsDocument | undefined => this.document
 
@@ -657,7 +657,7 @@ export class RemoteSettingsStore {
           }
         } else {
           if (this.snapshot.status !== 'unavailable') {
-            const snapshot: SettingsScopeSnapshot<AuthTunnelSettings> = {
+            const snapshot: ConfigFormSnapshot<AuthTunnelSettings> = {
               ...this.snapshot,
               status: 'unavailable',
               writable: false,
@@ -699,7 +699,7 @@ export class RemoteSettingsStore {
     this.listeners.clear()
   }
 
-  private publish(snapshot: SettingsScopeSnapshot<AuthTunnelSettings>): void {
+  private publish(snapshot: ConfigFormSnapshot<AuthTunnelSettings>): void {
     if (Object.is(this.snapshot, snapshot)) return
     this.snapshot = snapshot
     for (const listener of this.listeners) listener()
@@ -872,7 +872,7 @@ const styles: Record<string, CSSProperties> = {
   },
 }
 
-type CardProps = PropsRuntime<'settings.plugin.item'> & PropsLocale<typeof LOCALE_NAMESPACE>
+type CardProps = PropsRuntime<'plugins.bundle.config'> & PropsLocale<typeof LOCALE_NAMESPACE>
 
 interface FieldProps {
   t: CardProps['t']
@@ -917,7 +917,7 @@ function Field(props: FieldProps) {
 
 interface FormProps {
   t: CardProps['t']
-  snapshot: SettingsScopeSnapshot<AuthTunnelSettings>
+  snapshot: ConfigFormSnapshot<AuthTunnelSettings>
   dirty: boolean
   saving: SaveKind | undefined
   failed: SaveKind | undefined
@@ -1178,7 +1178,7 @@ interface ShellState {
 }
 
 function AuthTunnelCard(props: CardProps & {
-  scope: Pick<SettingsScope<AuthTunnelSettings>, 'getSnapshot' | 'subscribe'>
+  scope: Pick<ConfigForm<AuthTunnelSettings>, 'getSnapshot' | 'subscribe'>
   commit: CardCommit
   runtime: RuntimeStatusStore
 }) {
@@ -1242,8 +1242,8 @@ function AuthTunnelCard(props: CardProps & {
   }
 
   return (
-    <li style={styles.card}>
-      <details>
+    <div style={styles.card}>
+      <details open>
         <summary style={styles.summary}>
           <span style={styles.heading}>
             <span style={styles.title}>{props.t('title')}</span>
@@ -1286,7 +1286,7 @@ function AuthTunnelCard(props: CardProps & {
           />
         </div>
       </details>
-    </li>
+    </div>
   )
 }
 
@@ -1310,7 +1310,7 @@ export function promoteTunnelConnection(
   if (connection.isLoopback || !tunneled) return false
   // The shared handle owns connection classification. The tunnel publishes
   // its stronger transport boundary there
-  // before settings scopes snapshot it during their own plugin activation.
+  // before configuration forms snapshot it during their own plugin activation.
   ;(connection as { isLoopback: boolean }).isLoopback = true
   return true
 }
@@ -1375,24 +1375,24 @@ export function apply(ctx: Context): void {
   const remoteTunnel = promoteTunnelConnection(connection)
   if (remoteTunnel) {
     // Gateway may already have cached the carrier's initial classification.
-    // Keep that published fact aligned before settings scopes choose storage.
+    // Keep that published fact aligned before configuration forms choose storage.
     const remote = ctx.get('remote')
     if (remote !== undefined) {
       ;(remote.$host as { isLoopback: boolean }).isLoopback = true
     }
   }
-  ctx.inject(['slots', 'locale', 'remote', 'remote.settings', 'remote.credentials', 'settingsScope'], (uiCtx: Context) => {
+  ctx.inject(['slots', 'locale', 'remote', 'remote.settings', 'remote.credentials', 'configForms'], (uiCtx: Context) => {
     mountSettingsCard(uiCtx, remoteTunnel)
   })
 }
 
 /** Mount the keyed card after its presentation and settings services activate. */
 function mountSettingsCard(ctx: Context, remoteTunnel: boolean): void {
-  let scope: Pick<SettingsScope<AuthTunnelSettings>, 'getSnapshot' | 'subscribe'>
+  let scope: Pick<ConfigForm<AuthTunnelSettings>, 'getSnapshot' | 'subscribe'>
   let commit: CardCommit
   if (!remoteTunnel) {
-    const source = ctx.settingsScope.bind<AuthTunnelSettings>({ namespace: SETTINGS_NAMESPACE })
-    // Methods on the scope controller use `this`; stable wrappers are also the
+    const source = ctx.configForms.get<AuthTunnelSettings>(SETTINGS_NAMESPACE)
+    // Methods on the form controller use `this`; stable wrappers are also the
     // stable subscribe/getSnapshot pair required by useSyncExternalStore.
     scope = {
       getSnapshot: () => source.getSnapshot(),
@@ -1412,9 +1412,9 @@ function mountSettingsCard(ctx: Context, remoteTunnel: boolean): void {
   ctx.effect(() => () => { runtime.dispose() }, 'auth-tunnel: runtime status')
   ctx.effect(() => ctx.locale.register(LOCALE_NAMESPACE, { zh, en }), 'auth-tunnel: settings dictionaries')
   const Card = (props: CardProps) => <AuthTunnelCard {...props} scope={scope} commit={commit} runtime={runtime} />
-  ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
-    name: 'settings.plugin.item',
-    key: SETTINGS_NAMESPACE,
+  ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+    name: 'plugins.bundle.config',
+    key: 'dsh-auth-tunnel',
     locale: LOCALE_NAMESPACE,
   }, Card))
 }

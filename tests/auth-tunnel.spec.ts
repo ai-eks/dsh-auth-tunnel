@@ -8,7 +8,7 @@
  * diagnostics, and cloudflared/gate teardown.
  */
 
-import { chmod, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises'
 import { once } from 'node:events'
 import { connect, connect as netConnect, createServer as createNetServer, type AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -20,8 +20,10 @@ import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
 import { credentialRef, type CredentialRecord } from '@deepseek-ai/dsh-credentials'
 import * as Connection from '@deepseek-ai/dsh-client-connection'
-import { SettingsProvider, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
-import z from '@deepseek-ai/schemastery'
+import SettingsForms from '@deepseek-ai/dsh-settings'
+import ConfigEditor from '@deepseek-ai/dsh-config-editor'
+import { mountRootInclude, readProfilePatches } from '@deepseek-ai/dsh-app-boot'
+import * as Locale from '@deepseek-ai/dsh-client-locale'
 import { Config } from '../src/index.ts'
 
 /** Minimal in-memory credentials service for the composition (rotate via set). */
@@ -138,39 +140,11 @@ class StubSystemPrompt extends Service {
   }
 }
 
-/** Writable in-memory settings provider exercising the real service definition. */
-class StubSettings extends SettingsProvider {
-  writable = true
-  failNextPersist = false
-  persistBarrier: Promise<void> | undefined
-  persistStarted: (() => void) | undefined
-  private document: Record<string, unknown>
-
-  constructor(ctx: Context, config?: { document?: Record<string, unknown> }) {
-    super(ctx)
-    this.document = structuredClone(config?.document ?? {})
-  }
-
-  protected load(): Promise<Record<string, unknown>> {
-    return Promise.resolve(structuredClone(this.document))
-  }
-
-  protected async persist(ns: SettingsNamespace, section: Record<string, unknown>): Promise<void> {
-    if (this.failNextPersist) {
-      this.failNextPersist = false
-      throw new Error('settings persistence failed')
-    }
-    this.persistStarted?.()
-    if (this.persistBarrier !== undefined) await this.persistBarrier
-    this.document = { ...this.document, [ns]: structuredClone(section) }
-  }
-}
-
 interface StubbedContext {
   loaded: Context
   connection: () => Connection.HostConnectionHandle
   credentials: () => StubCredentials
-  settings: () => StubSettings
+  settings: () => SettingsForms
   shellEnv: () => StubShellEnv
   systemPrompt: () => StubSystemPrompt
   gateBase: () => Promise<string>
@@ -248,11 +222,11 @@ interface CompositionOptions {
   credentialsAfterWebServer?: boolean
   /** Register no shell-env/system-prompt stub rows. */
   withShell?: boolean
-  /** Register no settings provider row. */
+  /** Register no settings form service. */
   withSettings?: boolean
   /** Make the settings row activate after the tunnel row. */
   settingsAfterTunnel?: boolean
-  /** Initial raw settings document. */
+  /** Initial profile configuration overrides. */
   settingsDocument?: Record<string, unknown>
   /** Seed no DSH_WEB_PASSWORD. */
   withPassword?: boolean
@@ -266,46 +240,77 @@ interface CompositionOptions {
 
 async function loadComposition(tunnelConfig: Record<string, unknown>, options?: CompositionOptions): Promise<StubbedContext> {
   const configPath = join(root!, 'cordis.yml')
+  const patchPath = join(root!, 'cordis.patch.yml')
+  const bundleDir = join(root!, 'node_modules', 'test-bundle')
   const seeds: Record<string, string> = {
     ...(options?.withPassword === false ? {} : { DSH_WEB_PASSWORD: 's3kret-passw0rd' }),
     ...options?.seeds,
   }
   const credentialRows = options?.withCredentials === false ? [] : [
-    "- name: '@deepseek-ai/dsh-credentials'",
+    "- id: credentials",
+    "  name: '@deepseek-ai/dsh-credentials'",
     '  config:',
     `    seeds: ${JSON.stringify(seeds)}`,
   ]
   const tunnelRows = [
-    "- name: 'dsh-auth-tunnel'",
+    "- id: auth-tunnel",
+    "  name: 'dsh-auth-tunnel'",
     '  config:',
     ...Object.entries(tunnelConfig).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`),
   ]
   const settingsRows = options?.withSettings === false ? [] : [
-    "- name: '@deepseek-ai/dsh-settings'",
-    '  config:',
-    `    document: ${JSON.stringify(options?.settingsDocument ?? {})}`,
+    "- id: settings",
+    "  name: '@deepseek-ai/dsh-settings'",
   ]
   const rows: string[] = [
-    "- name: '@deepseek-ai/dsh-host-webserver'",
+    "- id: webserver",
+    "  name: '@deepseek-ai/dsh-host-webserver'",
     '  config:',
     "    host: '127.0.0.1'",
     '    port: 0',
+    "- id: config-editor",
+    "  name: '@deepseek-ai/dsh-config-editor'",
+    "- id: locale",
+    "  name: '@deepseek-ai/dsh-client-locale'",
     ...(options?.settingsAfterTunnel === true ? [] : settingsRows),
     ...(options?.credentialsAfterWebServer === true ? [] : credentialRows),
-    "- name: '@deepseek-ai/dsh-client-connection'",
+    "- id: connection",
+    "  name: '@deepseek-ai/dsh-client-connection'",
     ...(options?.withShell === false ? [] : [
-      "- name: '@deepseek-ai/dsh-shell-env'",
-      "- name: '@deepseek-ai/dsh-system-prompt'",
+      "- id: shell-env",
+      "  name: '@deepseek-ai/dsh-shell-env'",
+      "- id: system-prompt",
+      "  name: '@deepseek-ai/dsh-system-prompt'",
     ]),
     ...tunnelRows,
     ...(options?.settingsAfterTunnel === true ? settingsRows : []),
     ...(options?.credentialsAfterWebServer === true ? credentialRows : []),
     '',
   ]
-  await writeFile(configPath, rows.join('\n'))
+  await mkdir(bundleDir, { recursive: true })
+  await mkdir(join(root!, 'home'), { recursive: true })
+  await writeFile(join(bundleDir, 'package.json'), JSON.stringify({
+    name: 'test-bundle', dsh: { bundle: { patch: './cordis.patch.yml' } },
+  }))
+  const bundlePatch = `- insert:\n${rows.filter(Boolean).map(row => `    ${row}`).join('\n')}\n`
+  await writeFile(join(bundleDir, 'cordis.patch.yml'), bundlePatch)
+  await writeFile(join(root!, 'package.json'), JSON.stringify({
+    private: true, dependencies: { 'test-bundle': 'file:node_modules/test-bundle' },
+    dsh: { profile: { bundles: ['test-bundle'] } },
+  }))
+  const overrides = Object.entries(options?.settingsDocument ?? {}).map(([id, config]) => ({
+    id, config: { ...(id === 'auth-tunnel' ? tunnelConfig : {}), ...config as object },
+  }))
+  await writeFile(patchPath, JSON.stringify(overrides))
+  await writeFile(configPath, '[]\n')
 
   context = new Context()
   context.baseUrl = pathToFileURL(root!).href + '/'
+  context.provide('profileContext', {
+    name: 'test', dir: root!, home: join(root!, 'home'), patchPath,
+    installAnchor: join(root!, 'package.json'), cwd: root!,
+    startedBundles: ['test-bundle'], overlays: [], telemetryDisabledEnv: undefined,
+  })
   await context.plugin(Loader)
   context.loader.builtins.include = Include
   const shellEnvPlugin = (ctx2: Context): void => { void ctx2.plugin(StubShellEnv) }
@@ -326,7 +331,9 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
     ['@deepseek-ai/dsh-credentials', credentialsPlugin],
     ['@deepseek-ai/dsh-shell-env', shellEnvPlugin],
     ['@deepseek-ai/dsh-system-prompt', systemPromptPlugin],
-    ['@deepseek-ai/dsh-settings', StubSettings],
+    ['@deepseek-ai/dsh-settings', SettingsForms],
+    ['@deepseek-ai/dsh-config-editor', ConfigEditor],
+    ['@deepseek-ai/dsh-client-locale', Locale],
     ['dsh-auth-tunnel', tunnel],
   ])
   context.loader.internal = {
@@ -336,17 +343,14 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
       return modules.get(specifier)
     },
   } as unknown as NonNullable<typeof context.loader.internal>
-  await context.loader.create({
-    name: 'cordis:include',
-    config: { path: pathToFileURL(configPath).href },
-  })
+  await mountRootInclude(context, configPath, readProfilePatches('dsh', context.profileContext))
   if (options?.wait !== false) await context.loader.await()
   const loaded = context
   return {
     loaded,
     connection: () => loaded.get('connection') as Connection.HostConnectionHandle,
     credentials: () => loaded.get('credentials')! as unknown as StubCredentials,
-    settings: () => loaded.get('settings')! as unknown as StubSettings,
+    settings: () => loaded.get('settings')!,
     shellEnv: () => loaded.get('shellEnv')! as unknown as StubShellEnv,
     systemPrompt: () => loaded.get('systemPrompt')! as unknown as StubSystemPrompt,
     async gateBase(): Promise<string> {
@@ -366,6 +370,18 @@ async function loadComposition(tunnelConfig: Record<string, unknown>, options?: 
       return response.json() as Promise<RuntimeStatus>
     },
   }
+}
+
+/** Loader settlement no longer throws optional-plugin failures; inspect the tunnel fiber. */
+async function awaitTunnel(composition: StubbedContext): Promise<void> {
+  await composition.loaded.loader.await()
+  const entry = [...composition.loaded.loader.entries()].find(entry => entry.options.id === 'auth-tunnel')
+  await entry!.fiber!.await()
+}
+
+/** Read resolved values from the actual Config-derived settings form. */
+function settingsValue(composition: StubbedContext, namespace: string): Record<string, unknown> {
+  return composition.settings().describe().find(entry => entry.ns === namespace)!.value as Record<string, unknown>
 }
 
 /** Boot one quick-mode composition with the password seeded. */
@@ -549,9 +565,6 @@ describe('password gate over the loopback webserver', () => {
         },
       })
     }
-    composition.settings().register('locale', z.object({
-      preference: z.union(['zh', 'en']).required(false),
-    }))
     const base = await composition.gateBase()
     const cookie = (await login(base)).get('set-cookie')!.split(';', 1)[0]!
     const rpc = (method: string, payload: object = {}): RequestInit => ({
@@ -618,7 +631,7 @@ describe('password gate over the loopback webserver', () => {
       settings: { revision: number; value: { sessionTtlHours: number } }
     }
     expect(committed.settings.value.sessionTtlHours).toBe(24)
-    expect(composition.settings().get('auth-tunnel')).toMatchObject({ sessionTtlHours: 24 })
+    expect(settingsValue(composition, 'auth-tunnel')).toMatchObject({ sessionTtlHours: 24 })
 
     await waitForStatus(composition, status => status.phase === 'running')
 
@@ -628,7 +641,7 @@ describe('password gate over the loopback webserver', () => {
       body: JSON.stringify({ locale: 'en' }),
     })
     expect(locale.status).toBe(200)
-    expect(composition.settings().get('locale')).toEqual({ preference: 'en' })
+    expect(settingsValue(composition, 'locale')).toEqual({ preference: 'en' })
 
     const beforeDisable = await composition.runtimeStatus()
     const disabled = await fetch(`${base}/dsh-auth-tunnel/settings`, {
@@ -697,7 +710,7 @@ describe('password gate over the loopback webserver', () => {
     expect(await response.text()).not.toContain('direct-tunnel-token')
     expect(await composition.credentials().resolve('DSH_TUNNEL_TOKEN'))
       .toMatchObject({ value: 'direct-tunnel-token' })
-    expect(composition.settings().get('auth-tunnel')).toMatchObject({
+    expect(settingsValue(composition, 'auth-tunnel')).toMatchObject({
       enabled: false,
       mode: 'token',
       tokenRef: 'DSH_TUNNEL_TOKEN',
@@ -777,7 +790,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(200)
-    expect(composition.settings().get('auth-tunnel').sessionTtlHours).toBe(24)
+    expect(settingsValue(composition, 'auth-tunnel').sessionTtlHours).toBe(24)
   })
 
   it('rejects a remote Quick route change before replacing its discoverable URL', { timeout: 60_000 }, async () => {
@@ -800,7 +813,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
-    expect(composition.settings().get('auth-tunnel').gatePort).toBe(0)
+    expect(settingsValue(composition, 'auth-tunnel').gatePort).toBe(0)
     expect(await composition.runtimeStatus()).toMatchObject({
       phase: 'running',
       publicUrl: before.publicUrl,
@@ -840,7 +853,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
-    expect(composition.settings().get('auth-tunnel')).toMatchObject({
+    expect(settingsValue(composition, 'auth-tunnel')).toMatchObject({
       executable: replacementExecutable,
       sessionTtlHours: 720,
     })
@@ -883,7 +896,7 @@ describe('password gate over the loopback webserver', () => {
     releaseResolve()
 
     expect((await pendingSave).status).toBe(409)
-    expect(composition.settings().get('auth-tunnel')).toMatchObject({
+    expect(settingsValue(composition, 'auth-tunnel')).toMatchObject({
       enabled: false,
       passwordRef: 'DSH_WEB_PASSWORD',
     })
@@ -909,7 +922,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
-    expect(composition.settings().get('auth-tunnel').gatePort).toBe(0)
+    expect(settingsValue(composition, 'auth-tunnel').gatePort).toBe(0)
     expect(await composition.credentials().resolve('DSH_WEB_PASSWORD'))
       .toMatchObject({ value: 's3kret-passw0rd' })
   })
@@ -941,7 +954,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
-    expect(composition.settings().get('auth-tunnel').passwordRef).toBe('DSH_WEB_PASSWORD')
+    expect(settingsValue(composition, 'auth-tunnel').passwordRef).toBe('DSH_WEB_PASSWORD')
   })
 
   it('rejects a passwordless switch to an unconfigured access credential', { timeout: 60_000 }, async () => {
@@ -963,7 +976,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
-    expect(composition.settings().get('auth-tunnel').passwordRef).toBe('DSH_WEB_PASSWORD')
+    expect(settingsValue(composition, 'auth-tunnel').passwordRef).toBe('DSH_WEB_PASSWORD')
   })
 
   it('rejects a passwordless switch to an empty resolved access credential', { timeout: 60_000 }, async () => {
@@ -987,7 +1000,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
-    expect(composition.settings().get('auth-tunnel').passwordRef).toBe('DSH_WEB_PASSWORD')
+    expect(settingsValue(composition, 'auth-tunnel').passwordRef).toBe('DSH_WEB_PASSWORD')
   })
 
   it('rejects a remote password that cannot fit through the login endpoint', { timeout: 60_000 }, async () => {
@@ -1035,7 +1048,7 @@ describe('password gate over the loopback webserver', () => {
     })
 
     expect(response.status).toBe(409)
-    expect(composition.settings().get('auth-tunnel').sessionTtlHours).toBe(720)
+    expect(settingsValue(composition, 'auth-tunnel').sessionTtlHours).toBe(720)
   })
 
   it('rejects password-only remote saves while Host settings are read-only', { timeout: 60_000 }, async () => {
@@ -1045,7 +1058,7 @@ describe('password gate over the loopback webserver', () => {
     const opened = await (await fetch(`${base}/dsh-auth-tunnel/settings`, { headers: { cookie } })).json() as {
       settings: { revision: number }
     }
-    composition.settings().writable = false
+    vi.spyOn(composition.settings(), 'writable', 'get').mockReturnValue(false)
 
     const response = await fetch(`${base}/dsh-auth-tunnel/settings`, {
       method: 'POST',
@@ -1094,7 +1107,7 @@ describe('password gate over the loopback webserver', () => {
       expect(response.status).toBe(409)
       expect(await composition.credentials().resolve('DSH_TUNNEL_TOKEN')).toMatchObject({ value: 'tunnel-token' })
       expect(await composition.credentials().resolve('OTHER_HOST_SECRET')).toMatchObject({ value: 'other-secret' })
-      expect(composition.settings().get('auth-tunnel').passwordRef).toBe('DSH_WEB_PASSWORD')
+      expect(settingsValue(composition, 'auth-tunnel').passwordRef).toBe('DSH_WEB_PASSWORD')
     },
   )
 
@@ -1825,11 +1838,11 @@ describe('tunnel lifecycle', () => {
 
 describe('configuration defaults', () => {
   it('allows authenticated public settings management by default', () => {
-    expect(Config({}).allowRemoteSettings).toBe(true)
+    expect(Config({}).get().allowRemoteSettings).toBe(true)
   })
 
   it('uses the conventional Tunnel Token credential by default', () => {
-    expect(Config({}).tokenRef).toBe('DSH_TUNNEL_TOKEN')
+    expect(Config({}).get().tokenRef).toBe('DSH_TUNNEL_TOKEN')
   })
 })
 
@@ -1837,7 +1850,7 @@ describe('activation dependencies and boot failures', () => {
   type BootFailureOptions = { withPassword?: boolean; seeds?: Record<string, string> }
   const expectBootFailure = async (config: Record<string, unknown>, pattern: RegExp, options?: BootFailureOptions): Promise<void> => {
     const composition = await loadComposition(config, { wait: false, ...options })
-    const pending = composition.loaded.loader.await() as Promise<unknown>
+    const pending = awaitTunnel(composition) as Promise<unknown>
     await expect(pending).rejects.toThrow(pattern)
     await sleep(100)
   }
@@ -1906,7 +1919,7 @@ describe('activation dependencies and boot failures', () => {
       executable: await fixtureExecutable('fake-cloudflared-crash.sh'),
       startupTimeoutMs: 15_000,
     }, { wait: false })
-    const pending = composition.loaded.loader.await() as Promise<unknown>
+    const pending = awaitTunnel(composition) as Promise<unknown>
     await expect(pending).rejects.toSatisfy((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error)
       return message.includes('exited before the tunnel came up')
@@ -1924,7 +1937,7 @@ describe('activation dependencies and boot failures', () => {
       startupTimeoutMs: 15_000,
     }, { wait: false })
 
-    await expect(composition.loaded.loader.await()).rejects.toThrow(/exited before adoption/)
+    await expect(awaitTunnel(composition)).rejects.toThrow(/exited before adoption/)
     expect(composition.shellEnv().contributors).toEqual([])
     expect(composition.systemPrompt().sections).toEqual([])
     expect(await liveFixturePids()).toEqual([])
@@ -1940,7 +1953,7 @@ describe('activation dependencies and boot failures', () => {
       executable: await fixtureExecutable('fake-cloudflared-token-crash.sh'),
       startupTimeoutMs: 15_000,
     }, { wait: false, seeds: { DSH_TUNNEL_TOKEN: token } })
-    const pending = composition.loaded.loader.await() as Promise<unknown>
+    const pending = awaitTunnel(composition) as Promise<unknown>
     await expect(pending).rejects.toSatisfy((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error)
       return message.includes('[REDACTED]') && !message.includes(token)
@@ -2083,6 +2096,46 @@ describe('plugin settings', () => {
     expect(await liveFixturePids()).toEqual([])
     await expect(composition.settings().update(namespace, { enabled: true }))
       .rejects.toThrow(/token mode requires publicHostname/)
+  })
+
+  it('persists live edits and resets without remounting the gate', { timeout: 60_000 }, async () => {
+    const composition = await bootQuick()
+    const entry = [...composition.loaded.loader.entries()].find(entry => entry.options.id === namespace)!
+    const fiber = entry.fiber
+    const pids = await liveFixturePids()
+    const base = await composition.gateBase()
+    const before = await composition.runtimeStatus()
+    const opened = composition.settings().describe().find(entry => entry.ns === namespace)!
+
+    await composition.settings().mutate(namespace, [
+      { op: 'set', path: ['sessionTtlHours'], value: 24 },
+    ], opened.revision)
+    await waitForStatus(composition, status => status.revision > before.revision && status.phase === 'running')
+    expect(await readFile(composition.settings().documentPath, 'utf8')).toContain('sessionTtlHours: 24')
+    expect(settingsValue(composition, namespace).sessionTtlHours).toBe(24)
+    expect(entry.fiber).toBe(fiber)
+    expect(await liveFixturePids()).toEqual(pids)
+    expect(await composition.gateBase()).toBe(base)
+    await login(base)
+
+    const persisted = await readFile(composition.settings().documentPath, 'utf8')
+    await expect(composition.settings().update(namespace, { sessionTtlHours: 48 }, opened.revision))
+      .rejects.toThrow(/revision/)
+    await expect(composition.settings().update(namespace, { mode: 'token' }))
+      .rejects.toThrow(/publicHostname/)
+    expect(await readFile(composition.settings().documentPath, 'utf8')).toBe(persisted)
+
+    await composition.settings().mutate(namespace, [{ op: 'unset', path: ['sessionTtlHours'] }])
+    expect(settingsValue(composition, namespace).sessionTtlHours).toBe(720)
+    expect(entry.fiber).toBe(fiber)
+  })
+
+  it('releases its status route when the Loader restarts the plugin', async () => {
+    const composition = await loadComposition({ enabled: false })
+    const entry = [...composition.loaded.loader.entries()].find(entry => entry.options.id === namespace)!
+    await entry.fiber!.restart()
+    await entry.fiber!.await()
+    expect(await composition.runtimeStatus()).toMatchObject({ phase: 'stopped', running: false })
   })
 
   it('withholds remote settings when a password reference cannot be applied', { timeout: 60_000 }, async () => {
@@ -2315,7 +2368,7 @@ describe('plugin settings', () => {
       settingsDocument: { 'auth-tunnel': { enabled: false } },
     })
 
-    expect(composition.settings().get(namespace)).toMatchObject({ enabled: false })
+    expect(settingsValue(composition, namespace)).toMatchObject({ enabled: false })
     expect(await composition.runtimeStatus()).toMatchObject({ phase: 'stopped', running: false })
     expect(await liveFixturePids()).toEqual([])
     expect(consoleSpy).not.toHaveBeenCalledWith(expect.stringContaining('cloudflare tunnel:'))

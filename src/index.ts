@@ -17,13 +17,14 @@ import { createServer, request as httpRequest, type IncomingHttpHeaders, type In
 import { connect as netConnect } from 'node:net'
 import { type Duplex } from 'node:stream'
 import { spawn, type ChildProcess } from 'node:child_process'
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context, Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { SettingsDescriptor, SettingsPathOp } from '@deepseek-ai/dsh-settings'
 import type { HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
 // Pulls the Context augmentation typing `ctx.webServer`; no runtime import.
 import type {} from '@deepseek-ai/dsh-host-webserver'
+import type {} from '@deepseek-ai/cordis-plugin-loader'
 import type { ShellEnvRegistry } from '@deepseek-ai/dsh-shell-env'
 import type { SystemPrompt } from '@deepseek-ai/dsh-system-prompt'
 
@@ -92,7 +93,7 @@ const MAX_SESSION_TTL_HOURS = Math.floor((Number.MAX_SAFE_INTEGER - Date.now()) 
 const MAX_TIMER_DELAY_MS = 2_147_483_647
 const DEFAULT_TOKEN_REF = 'DSH_TUNNEL_TOKEN'
 
-export const Config: z<InternalConfig> = z.object({
+const ConfigValues: z<InternalConfig> = z.object({
   enabled: z.boolean().default(true),
   allowRemoteSettings: z.boolean().default(true),
   passwordRef: z.string().min(1).role('credential-ref').default('DSH_WEB_PASSWORD'),
@@ -104,6 +105,9 @@ export const Config: z<InternalConfig> = z.object({
   executable: z.string().min(1).default('cloudflared'),
   startupTimeoutMs: z.number().step(1).min(1).max(MAX_TIMER_DELAY_MS).default(15_000),
 })
+
+/** All tunnel settings update atomically without remounting the running gate. */
+export const Config = ConfigValues.required().volatile()
 
 /** Reject mode combinations that the field-level schema cannot express. */
 export function validateConfig(config: Config): void {
@@ -127,19 +131,22 @@ export function validateConfig(config: Config): void {
   }
 }
 
-/** Register the settings section and forward every live value. */
+/** Validate profile edits before persistence and forward accepted live values. */
 function settingsConfig(
   ctx: Context,
-  entry: Config,
+  config: Volatile<InternalConfig>,
   onChange: (next: InternalConfig) => void,
 ): InternalConfig {
-  const scope = ctx.settings.register(AUTH_TUNNEL_SETTINGS_NAMESPACE, Config, {
-    base: entry,
-    applies: 'live',
-    validate: validateConfig,
+  ctx.effect(() => ctx.settings.configure({ auto: false }), 'auth-tunnel: settings presentation')
+  ctx.on('internal/config', function (_raw, next) {
+    const resolved = next()
+    if (this === ctx.fiber) validateConfig(ConfigValues(resolved))
+    return resolved
   })
-  ctx.effect(() => scope.watch(next => { onChange(next) }), 'auth-tunnel: settings watcher')
-  return scope.get()
+  ctx.on('loader/volatile-update', () => { onChange(config.get()) })
+  const initial = config.get()
+  validateConfig(initial)
+  return initial
 }
 
 const AUTH_PREFIX = '/dsh-auth-tunnel'
@@ -511,7 +518,7 @@ function targetConfig(descriptor: SettingsDescriptor, writes: readonly RemoteSet
       delete target[write.field]
     }
   }
-  const parsed = Config(target as unknown as InternalConfig)
+  const parsed = ConfigValues(target as unknown as InternalConfig)
   validateConfig(parsed)
   return parsed
 }
@@ -681,7 +688,7 @@ class PasswordGate {
     if (!this.auth.allowRemoteSettings || this.auth.passwordRef !== passwordRef) return false
     try {
       const { descriptor } = descriptorFor(this.ctx, AUTH_TUNNEL_SETTINGS_NAMESPACE)
-      const config = Config(objectRecord(descriptor.value) as unknown as InternalConfig)
+      const config = ConfigValues(objectRecord(descriptor.value) as unknown as InternalConfig)
       return (!requireEnabled || config.enabled)
         && config.allowRemoteSettings
         && config.passwordRef === passwordRef
@@ -850,7 +857,7 @@ class PasswordGate {
       if (!openedSettings.writable) throw new Error('settings provider is read-only')
       const opened = openedSettings.descriptor
       if (request.expectedRevision !== opened.revision) throw new Error('settings revision changed')
-      const current = Config(objectRecord(opened.value) as unknown as InternalConfig)
+      const current = ConfigValues(objectRecord(opened.value) as unknown as InternalConfig)
       const target = targetConfig(opened, request.writes)
       if ((current.mode === 'token' && target.passwordRef === current.tokenRef)
         || (target.mode === 'token' && target.passwordRef === target.tokenRef)) {
@@ -1884,10 +1891,10 @@ class AuthTunnelRuntime {
  * @param ctx - plugin context.
  * @param config - validated {@link Config}.
  */
-export async function apply(ctx: Context, config: Config): Promise<void> {
+export async function apply(ctx: Context, config: Volatile<InternalConfig>): Promise<void> {
   const runtime = new AuthTunnelRuntime(ctx)
   ctx.effect(() => async () => { await runtime.dispose() }, 'auth-tunnel: runtime')
-  ctx.webServer.register({
+  ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: AUTH_TUNNEL_STATUS_PATH,
     handler: (req, res) => {
@@ -1900,7 +1907,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
       res.end(req.method === 'HEAD' ? undefined : body)
     },
-  })
+  }), 'auth-tunnel: status route')
   ctx.inject(['shellEnv'], (injected) => {
     injected.effect(() => runtime.attachShellEnv(injected.shellEnv), 'auth-tunnel: shell publication')
   })
