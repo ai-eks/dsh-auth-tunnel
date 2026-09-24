@@ -26,9 +26,10 @@ Or install the current sources from Git:
 dsh plugin --profile web add github:ai-eks/dsh-auth-tunnel
 ```
 
-This source branch targets DeepSeek Harness `0.1.5-rc.1` and also supports `0.1.2-rc.1` and `0.1.3-alpha.2`. Harness `0.1.1-rc.2` and earlier must pin a compatible package version, immutable tag, or revision:
+This source branch targets DeepSeek Harness `0.1.7-rc.1`, using its volatile Config fields, configuration forms, and Plugins bundle page. Older Harness versions must pin a compatible package version, immutable tag, or revision:
 
 ```sh
+dsh plugin --profile web add dsh-auth-tunnel@0.1.5-rc.1 # Harness 0.1.2-rc.1 / 0.1.3-alpha.2 / 0.1.5-rc.1
 dsh plugin --profile web add dsh-auth-tunnel@0.1.1-rc.2.1 # Harness 0.1.1-rc.2
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#v0.1.0-rc.8' # Harness rc.8
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#b4baea7c47f5c245da789d3553d41938df89b311' # Harness rc.7
@@ -69,13 +70,13 @@ After the tunnel is ready, the terminal prints:
 cloudflare tunnel: https://<random>.trycloudflare.com
 ```
 
-Open that URL and enter `DSH_WEB_PASSWORD` on the login page. Share the URL, not the password. The active row also appears in Web Settings → Plugins.
+Open that URL and enter `DSH_WEB_PASSWORD` on the login page. Share the URL, not the password. The active row also appears in Web Plugins.
 
 ### Web settings
 
-With the Loader `auth-tunnel` row enabled, open **Settings → Plugins → Plugin configuration → Auth Tunnel** to edit every option. Saving the **Enable public tunnel** switch immediately starts or stops the gate and `cloudflared` while keeping this card available. The card also shows applying, running, stopped, or failed state and the current public URL.
+With the Loader `auth-tunnel` row enabled, open **Plugins → dsh-auth-tunnel** to edit every option. Saving the **Enable public tunnel** switch immediately starts or stops the gate and `cloudflared` while keeping this card available. The card also shows applying, running, stopped, or failed state and the current public URL.
 
-**Allow remote pages to change settings** is enabled by default. The shared access password is an administrator credential: a signed-in public page can read and save the Auth Tunnel card and Language preference without local setup. Disable this switch if authenticated public pages should not manage the tunnel itself; enabling it again then requires a local page or the settings document. These writes use authenticated endpoints owned by this plugin, so they work with the unmodified DeepSeek Harness `0.1.2-rc.1`. The switch is a separate fence from the core Host configuration plane: the gate proxies `settings.*`, `credentials.*`, and `llm.*` straight to the Host for every authenticated public page, except that core settings writes targeting the `auth-tunnel` namespace are rejected and must use the fenced plugin endpoint. The bundle's immediate client entry publishes that authenticated route before settings scopes classify the browser. The public GUI therefore keeps full configuration parity with the local one — responses come back redacted, and a secret crosses the wire only inside a write payload. Only one remote write is accepted at a time, and writes attempted while a previous change is applying return a conflict so the page can reload and retry. A remote page cannot save a change that would allocate a new random Quick URL (switching to Quick, or changing the Quick gate port or executable); make that change locally so the new URL remains discoverable. Turning the switch off remotely completes that save before access closes.
+**Allow remote pages to change settings** is enabled by default. The shared access password is an administrator credential: a signed-in public page can read and save the Auth Tunnel card and Language preference without local setup. Disable this switch if authenticated public pages should not manage the tunnel itself; enabling it again then requires a local page or the settings document. These writes use authenticated endpoints owned by this plugin. Configuration changes persist in the active profile’s `cordis.patch.yml`. The switch is a separate fence from the core Host configuration plane: the gate proxies `settings.*`, `credentials.*`, and `llm.*` straight to the Host for every authenticated public page, except that core settings writes targeting the `auth-tunnel` namespace are rejected and must use the fenced plugin endpoint. The bundle's immediate client entry publishes that authenticated route before configuration forms classify the browser. The public GUI therefore keeps full configuration parity with the local one — responses come back redacted, and a secret crosses the wire only inside a write payload. Only one remote write is accepted at a time, and writes attempted while a previous change is applying return a conflict so the page can reload and retry. A remote page cannot save a change that would allocate a new random Quick URL (switching to Quick, or changing the Quick gate port or executable); make that change locally so the new URL remains discoverable. Turning the switch off remotely completes that save before access closes.
 
 The card updates the credential named by the currently saved `passwordRef` through a separate **Update password** button. Access-password and configuration changes are never submitted together. In Token mode, paste a Tunnel Token directly and **Save configuration** writes it one-way to the credential named by `tokenRef`, which defaults to `DSH_TUNNEL_TOKEN`. Both secret inputs clear after a successful write, and neither the Host nor the page returns or displays the literal. To change `passwordRef`, create that credential first and save the reference before updating its password.
 
@@ -161,7 +162,7 @@ After checking the public password cookie, the gate obtains a private DSH browse
 
 The only unauthenticated upstream application route is read-only `GET`/`HEAD /manifest.webmanifest`. Browsers fetch this metadata without credentials unless the page opts into credentialed manifest requests, and the file contains only public application metadata.
 
-Installing or upgrading the client plugin requires a page reload so it can classify the tunnel before the settings scopes initialize. Reloading the Host connection service also restarts the dependent tunnel plugin; Quick mode can receive a new URL.
+Installing or upgrading the client plugin requires a page reload so it can classify the tunnel before the configuration forms initialize. Reloading the Host connection service also restarts the dependent tunnel plugin; Quick mode can receive a new URL.
 
 ### Directory picker
 

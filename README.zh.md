@@ -26,9 +26,10 @@ dsh plugin --profile web add dsh-auth-tunnel@next
 dsh plugin --profile web add github:ai-eks/dsh-auth-tunnel
 ```
 
-当前源码分支适配 DeepSeek Harness `0.1.5-rc.1`,同时支持 `0.1.2-rc.1` 和 `0.1.3-alpha.2`。Harness `0.1.1-rc.2` 及更早版本必须固定安装兼容的包版本、不可变 tag 或 revision:
+当前源码分支适配 DeepSeek Harness `0.1.7-rc.1`,使用新版实时 Config、配置表单和插件详情页接口。更早的 Harness 版本必须固定安装兼容的包版本、不可变 tag 或 revision:
 
 ```sh
+dsh plugin --profile web add dsh-auth-tunnel@0.1.5-rc.1 # Harness 0.1.2-rc.1 / 0.1.3-alpha.2 / 0.1.5-rc.1
 dsh plugin --profile web add dsh-auth-tunnel@0.1.1-rc.2.1 # Harness 0.1.1-rc.2
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#v0.1.0-rc.8' # Harness rc.8
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#b4baea7c47f5c245da789d3553d41938df89b311' # Harness rc.7
@@ -69,13 +70,13 @@ dsh web
 cloudflare tunnel: https://<random>.trycloudflare.com
 ```
 
-打开这个 URL,在登录页输入 `DSH_WEB_PASSWORD` 对应的密码。只分享 URL,不要分享密码。启用的行也会显示在 Web Settings → Plugins 中。
+打开这个 URL,在登录页输入 `DSH_WEB_PASSWORD` 对应的密码。只分享 URL,不要分享密码。启用的行也会显示在 Web Plugins 中。
 
 ### Web 设置
 
-保持 Loader 的 `auth-tunnel` 行启用后,打开 **Settings → Plugins → 插件配置 → Auth Tunnel** 即可编辑全部配置。页面中的 **启用公网隧道** 开关保存后会立即启动或停止密码门和 `cloudflared`,并保留这张设置卡片。页面同时显示应用中、运行中、已停止或失败状态以及当前公网 URL。
+保持 Loader 的 `auth-tunnel` 行启用后,打开 **插件 → dsh-auth-tunnel** 即可编辑全部配置。页面中的 **启用公网隧道** 开关保存后会立即启动或停止密码门和 `cloudflared`,并保留这张设置卡片。页面同时显示应用中、运行中、已停止或失败状态以及当前公网 URL。
 
-**允许远程页面修改设置** 默认开启。共享访问密码是管理员凭据:通过密码登录的公网页面无需本地设置,即可读取和保存 Auth Tunnel 卡片及语言偏好。如果不希望已认证公网页面管理隧道本身,可关闭该开关;之后重新开启必须使用本机页面或设置文件。这些写入走插件自有的鉴权接口,因此兼容未修改的 DeepSeek Harness `0.1.2-rc.1`。该开关与核心 Host 配置面是两道独立的围栏:gate 把 `settings.*`、`credentials.*` 与 `llm.*` 对每个已认证公网页面直接代理到 Host,但会拒绝核心 settings API 对 `auth-tunnel` namespace 的写入,这类写入必须经过有围栏的插件接口;bundle 的立即启动客户端会在设置 scope 判断浏览器类型前发布这条已认证路径。公网 GUI 因此与本机 GUI 保持完整的配置面一致性——响应只返回脱敏值,密钥只随写入载荷单向流出。同一时刻只接受一个远程写入;前一项配置仍在应用时,新的写入会返回冲突,页面重新读取后即可重试。远程页面不能保存会分配全新随机 Quick URL 的变更(切换到 Quick,或修改 Quick 的 Gate 端口或可执行文件);请在本机页面完成这类修改,以便获取新地址。从远程页面关闭该开关时,本次保存会完整返回后再关闭访问。
+**允许远程页面修改设置** 默认开启。共享访问密码是管理员凭据:通过密码登录的公网页面无需本地设置,即可读取和保存 Auth Tunnel 卡片及语言偏好。如果不希望已认证公网页面管理隧道本身,可关闭该开关;之后重新开启必须使用本机页面或设置文件。这些写入走插件自有的鉴权接口,配置变更保存到当前 profile 的 `cordis.patch.yml`。该开关与核心 Host 配置面是两道独立的围栏:gate 把 `settings.*`、`credentials.*` 与 `llm.*` 对每个已认证公网页面直接代理到 Host,但会拒绝核心 settings API 对 `auth-tunnel` namespace 的写入,这类写入必须经过有围栏的插件接口;bundle 的立即启动客户端会在配置表单判断浏览器类型前发布这条已认证路径。公网 GUI 因此与本机 GUI 保持完整的配置面一致性——响应只返回脱敏值,密钥只随写入载荷单向流出。同一时刻只接受一个远程写入;前一项配置仍在应用时,新的写入会返回冲突,页面重新读取后即可重试。远程页面不能保存会分配全新随机 Quick URL 的变更(切换到 Quick,或修改 Quick 的 Gate 端口或可执行文件);请在本机页面完成这类修改,以便获取新地址。从远程页面关闭该开关时,本次保存会完整返回后再关闭访问。
 
 页面通过独立的 **更新密码** 按钮写入当前已保存的 `passwordRef` 凭据,访问密码与配置不会放在同一次提交里。Token 模式可直接粘贴 Tunnel Token,它会随 **保存配置** 单向写入 `tokenRef` 指向的凭据;默认引用为 `DSH_TUNNEL_TOKEN`。两种密钥输入成功后都会立即清空,Host 和页面都不会回传或展示明文。若要更换 `passwordRef`,请先创建目标凭据并保存引用,再单独更新密码。
 
@@ -161,7 +162,7 @@ public client
 
 唯一不需要认证的上游应用路由是只读的 `GET`/`HEAD /manifest.webmanifest`。除非页面明确要求带凭据获取 manifest,否则浏览器不会为这类请求携带凭据;该文件只包含公开的应用元数据。
 
-安装或升级客户端插件后需要刷新页面,以便在设置 scope 初始化前识别隧道。重新加载 Host connection 服务也会重启依赖它的隧道插件;Quick 模式可能获得新地址。
+安装或升级客户端插件后需要刷新页面,以便在配置表单初始化前识别隧道。重新加载 Host connection 服务也会重启依赖它的隧道插件;Quick 模式可能获得新地址。
 
 ### 目录选择器
 

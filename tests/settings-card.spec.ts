@@ -443,7 +443,7 @@ describe('auth-tunnel settings card contract', () => {
     store.dispose()
   })
 
-  it('registers its browser card under the Host settings namespace', () => {
+  it('registers its browser card on its bundle configuration page', () => {
     let registeredNamespace = ''
     let registeredLocale = ''
     let dictionaryNamespace = ''
@@ -464,7 +464,7 @@ describe('auth-tunnel settings card contract', () => {
         ? { isLoopback: true }
         : undefined,
       remote: { settings: {}, credentials: {} },
-      settingsScope: { bind: () => scope },
+      configForms: { get: () => scope },
       inject: (_services: string[], install: (child: unknown) => unknown) => install(ctx),
       effect: (install: () => unknown) => install(),
       locale: {
@@ -484,12 +484,12 @@ describe('auth-tunnel settings card contract', () => {
     }
 
     apply(ctx as never)
-    expect(registeredNamespace).toBe('auth-tunnel')
+    expect(registeredNamespace).toBe('dsh-auth-tunnel')
     expect(registeredLocale).toBe('settings.auth-tunnel')
     expect(dictionaryNamespace).toBe('settings.auth-tunnel')
   })
 
-  it('promotes only a non-loopback tunnel connection before settings scopes bind', () => {
+  it('promotes only a non-loopback tunnel connection before configuration forms bind', () => {
     const remote = { isLoopback: false } as never
     const unrelatedRemote = { isLoopback: false } as never
     const local = { isLoopback: true } as never
@@ -506,7 +506,7 @@ describe('auth-tunnel settings card contract', () => {
     const bind = vi.fn()
     const connection = { isLoopback: false }
     const child = {
-      settingsScope: { bind },
+      configForms: { get: bind },
       effect: vi.fn(),
       locale: { register: vi.fn() },
       slots: {
@@ -531,7 +531,7 @@ describe('auth-tunnel settings card contract', () => {
 
     expect(bind).not.toHaveBeenCalled()
     expect(child.slots.register).toHaveBeenCalledWith(
-      expect.objectContaining({ key: 'auth-tunnel' }),
+      expect.objectContaining({ name: 'plugins.bundle.config', key: 'dsh-auth-tunnel' }),
       expect.any(Function),
     )
   })
