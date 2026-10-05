@@ -14,13 +14,19 @@ Expose the DeepSeek Harness Web GUI through a password-protected Cloudflare Tunn
 
 ### Install
 
-Install the current sources from Git:
+Install the latest published prerelease bundle from npm:
+
+```sh
+dsh plugin --profile web add dsh-auth-tunnel@next
+```
+
+Or install the current sources from Git:
 
 ```sh
 dsh plugin --profile web add github:ai-eks/dsh-auth-tunnel
 ```
 
-This source branch targets DeepSeek Harness `0.2.0-rc.2` (the `0.2.0` prerelease), using its volatile Config fields, configuration forms, and Plugins bundle page. Build a local checkout to use unpublished changes. Older Harness versions must pin a compatible package version, immutable tag, or revision:
+This release targets DeepSeek Harness `0.2.0-rc.2` (the `0.2.0` prerelease), using its volatile Config fields, configuration forms, and Plugins bundle page. Older Harness versions must pin a compatible package version, immutable tag, or revision:
 
 ```sh
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#6e521da3a4899849937411dd1c341369205c96d6' # Harness 0.1.7-rc.2

@@ -14,13 +14,19 @@
 
 ### 安装
 
-从 Git 安装当前源码:
+从 npm 安装最新发布的预览版 bundle:
+
+```sh
+dsh plugin --profile web add dsh-auth-tunnel@next
+```
+
+也可以从 Git 安装当前源码:
 
 ```sh
 dsh plugin --profile web add github:ai-eks/dsh-auth-tunnel
 ```
 
-当前源码分支适配 DeepSeek Harness `0.2.0-rc.2`(`0.2.0` 预发布版),使用实时 Config、配置表单和插件详情页接口。未发布的改动需要构建本地 checkout 使用。更早的 Harness 版本必须固定安装兼容的包版本、不可变 tag 或 revision:
+当前版本适配 DeepSeek Harness `0.2.0-rc.2`(`0.2.0` 预发布版),使用实时 Config、配置表单和插件详情页接口。更早的 Harness 版本必须固定安装兼容的包版本、不可变 tag 或 revision:
 
 ```sh
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#6e521da3a4899849937411dd1c341369205c96d6' # Harness 0.1.7-rc.2
