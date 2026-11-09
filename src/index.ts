@@ -138,9 +138,9 @@ function settingsConfig(
   onChange: (next: InternalConfig) => void,
 ): InternalConfig {
   ctx.effect(() => ctx.settings.configure({ auto: false }), 'auth-tunnel: settings presentation')
-  ctx.on('internal/config', function (_raw, next) {
+  ctx.on('internal/config', (fiber, next) => {
     const resolved = next()
-    if (this === ctx.fiber) validateConfig(ConfigValues(resolved))
+    if (fiber === ctx.fiber) validateConfig(ConfigValues(resolved))
     return resolved
   })
   ctx.on('loader/volatile-update', () => { onChange(config.get()) })
@@ -1727,10 +1727,12 @@ class AuthTunnelRuntime {
       }
       gateConfig = latest
     }
+    const upstreamPort = this.ctx.webServer.port
+    if (upstreamPort === undefined) throw new Error('auth-tunnel: upstream WebServer is not listening')
     const gate = new PasswordGate(
       this.ctx,
       gateConfig,
-      this.ctx.webServer.port,
+      upstreamPort,
       this.remoteMutations,
       () => this.active?.config,
     )

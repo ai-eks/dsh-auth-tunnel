@@ -8,7 +8,7 @@ Expose the DeepSeek Harness Web GUI through a password-protected Cloudflare Tunn
 
 ### Prerequisites
 
-- The `dsh` CLI and pnpm are available on `PATH`; the plugin command creates the Web profile when it is missing.
+- Node.js `>=24.9.0`, the `dsh` CLI, and pnpm are available on `PATH`; the plugin command creates the Web profile when it is missing.
 - `cloudflared` available on `PATH`, or an absolute `executable` configured for the plugin.
 - A long, random shared password stored as a DSH credential.
 
@@ -26,9 +26,10 @@ Or install the current sources from Git:
 dsh plugin --profile web add github:ai-eks/dsh-auth-tunnel
 ```
 
-This release targets DeepSeek Harness `0.2.0-rc.2` (the `0.2.0` prerelease), using its volatile Config fields, configuration forms, and Plugins bundle page. Older Harness versions must pin a compatible package version, immutable tag, or revision:
+The current sources target DeepSeek Harness `0.2.2-rc.1`, using Cordis `4.1` live configuration validation, configuration forms, and the Plugins bundle page. Older Harness versions must pin a compatible package version, immutable tag, or revision:
 
 ```sh
+dsh plugin --profile web add dsh-auth-tunnel@0.2.0-rc.2 # Harness 0.2.0-rc.2
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#6e521da3a4899849937411dd1c341369205c96d6' # Harness 0.1.7-rc.2
 dsh plugin --profile web add dsh-auth-tunnel@0.1.7-rc.1 # Harness 0.1.7-rc.1
 dsh plugin --profile web add dsh-auth-tunnel@0.1.5-rc.1 # Harness 0.1.2-rc.1 / 0.1.3-alpha.2 / 0.1.5-rc.1
@@ -37,6 +38,8 @@ dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#v0.1.0-rc.8' # Harne
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#b4baea7c47f5c245da789d3553d41938df89b311' # Harness rc.7
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#v0.1.0-rc.6' # Harness rc.6
 ```
+
+Newer Harness versions removed runtime invariant companions. This plugin no longer exports `dsh-auth-tunnel/invariant`; remove any manually mounted companion row from your profile or overlays.
 
 Git installs build the checked-out sources through `prepare`. pnpm 10 and later may first ask you to allow that build in the profile's `pnpm-workspace.yaml`; follow the path and exact package key printed by `dsh` and then rerun the command.
 

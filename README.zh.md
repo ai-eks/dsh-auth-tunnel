@@ -8,7 +8,7 @@
 
 ### 前置条件
 
-- `dsh` CLI 和 pnpm 已加入 `PATH`;Web profile 不存在时,插件命令会自动创建。
+- Node.js `>=24.9.0`,`dsh` CLI 和 pnpm 已加入 `PATH`;Web profile 不存在时,插件命令会自动创建。
 - `cloudflared` 已加入 `PATH`,或在插件中配置其绝对 `executable` 路径。
 - 一个以 DSH 凭据保存的长随机共享密码。
 
@@ -26,9 +26,10 @@ dsh plugin --profile web add dsh-auth-tunnel@next
 dsh plugin --profile web add github:ai-eks/dsh-auth-tunnel
 ```
 
-当前版本适配 DeepSeek Harness `0.2.0-rc.2`(`0.2.0` 预发布版),使用实时 Config、配置表单和插件详情页接口。更早的 Harness 版本必须固定安装兼容的包版本、不可变 tag 或 revision:
+当前源码适配 DeepSeek Harness `0.2.2-rc.1`,使用 Cordis `4.1` 的实时配置校验、配置表单和插件详情页接口。更早的 Harness 版本必须固定安装兼容的包版本、不可变 tag 或 revision:
 
 ```sh
+dsh plugin --profile web add dsh-auth-tunnel@0.2.0-rc.2 # Harness 0.2.0-rc.2
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#6e521da3a4899849937411dd1c341369205c96d6' # Harness 0.1.7-rc.2
 dsh plugin --profile web add dsh-auth-tunnel@0.1.7-rc.1 # Harness 0.1.7-rc.1
 dsh plugin --profile web add dsh-auth-tunnel@0.1.5-rc.1 # Harness 0.1.2-rc.1 / 0.1.3-alpha.2 / 0.1.5-rc.1
@@ -37,6 +38,8 @@ dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#v0.1.0-rc.8' # Harne
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#b4baea7c47f5c245da789d3553d41938df89b311' # Harness rc.7
 dsh plugin --profile web add 'github:ai-eks/dsh-auth-tunnel#v0.1.0-rc.6' # Harness rc.6
 ```
+
+新版 Harness 已移除运行时 invariant 扩展,本插件也不再导出 `dsh-auth-tunnel/invariant`;若曾手动挂载该扩展,请从 profile 或 overlay 中删除对应行。
 
 Git 安装通过 `prepare` 构建检出的源码。pnpm 10 及以上版本可能先要求允许该构建;按照 `dsh` 打印的 profile `pnpm-workspace.yaml` 路径和准确包名配置后,重新执行命令。
 

@@ -555,7 +555,6 @@ export function parseRemoteSettingsDocument(input: unknown): RemoteSettingsDocum
       user: section.user,
       revision: section.revision as number,
       writable: section.writable,
-      mode: 'host',
     },
     ...(root.locale === 'zh' || root.locale === 'en' ? { locale: root.locale } : {}),
   }
@@ -602,7 +601,6 @@ const INITIAL_REMOTE_SETTINGS_SNAPSHOT: ConfigFormSnapshot<AuthTunnelSettings> =
   user: undefined,
   revision: undefined,
   writable: false,
-  mode: 'host',
 }
 
 interface RemoteSettingsTransport {
