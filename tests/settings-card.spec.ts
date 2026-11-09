@@ -455,7 +455,6 @@ describe('auth-tunnel settings card contract', () => {
         user: undefined,
         revision: undefined,
         writable: false,
-        mode: 'host' as const,
       }),
       subscribe: () => () => {},
     }
@@ -544,7 +543,7 @@ describe('auth-tunnel settings card contract', () => {
         return cordis
       })
     }
-    const source = readFileSync(new URL(import.meta.resolve('@deepseek-ai/dsh-api-gateway/client')), 'utf8')
+    const source = readFileSync(new URL('./client.browser.js', import.meta.resolve('@deepseek-ai/dsh-api-gateway/client')), 'utf8')
     new Function('window', source)({ __ModuleLoader__: { load } })
     if (gateway === undefined) throw new Error('Gateway client bundle was not loaded')
 
